@@ -1,10 +1,15 @@
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from pip_processor import PIPProcessor
 
+
 # Ruta de imagen local (ajusta esto con el path real en tu máquina)
-image_path = r"C:\Users\salos\Downloads\photo_4963257537629630187_y.jpg"
+image_path = r"D:\Downloads\Formulas Medicas\Formula Carolina2.jpeg"
 
 # Simulamos un session_id cualquiera
-session_id = "demo-session-001"
+session_id = "demo-session-002"
 
 # Crear instancia del procesador
 processor = PIPProcessor()
