@@ -159,7 +159,7 @@ def insert_or_update_patient_data(paciente: Dict[str, Any]) -> None:
             "{presc.get("id_session", "")}",
             "{presc.get("url_prescripcion", "")}",
             CAST(NULL AS STRING),
-            CAST(NULL AS DATE),
+            CAST(NULL AS STRING),
             "{presc.get("diagnostico", "")}",
             "{presc.get("IPS", "")}",
             [{meds_array}]

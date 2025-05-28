@@ -7,12 +7,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
+import re
 from bigquery_pip import insert_or_update_patient_data
 from cloud_storage_pip import upload_image_to_bucket
-from llm_core.openai_service import encode_image_to_base64
+#from llm_core.openai_service import encode_image_to_base64
+from llm_core import LLMCore
+llm_core = LLMCore()
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
 
 
 class PIPProcessorError(RuntimeError):
@@ -30,8 +34,15 @@ def _clean_text_encoding(text: str) -> str:
         with_charmap = text.encode("latin-1").decode("utf-8")
     except UnicodeDecodeError:
         pass
-    return with_charmap.replace("�", "")
+    return with_charmap.replace("�", "").replace("\n", " ")
 
+_CODE_FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
+
+def _strip_code_fence(text: str) -> str:
+    match = _CODE_FENCE.search(text)
+    if match:
+        return match.group(1)
+    return text.strip()
 
 def _convert_date(date_str: str | None) -> str | None:
     if not date_str or not isinstance(date_str, str):
@@ -85,20 +96,28 @@ class PIPProcessor:
 
             prompt = self.prompt_path.read_text(encoding="utf-8")
             logger.info("📝 Extrayendo datos con LLM…")
-            llm_response = _extract_prescription_with_openai(image_path, prompt)
+            llm_response = llm_core.ask_image(prompt, image_path)
+            print(llm_response)
+            logger.info("🧠 Respuesta LLM:\n%s", llm_response)
 
-            if isinstance(llm_response, str) and "fórmula médica válida" in llm_response:
-                logger.warning("Imagen no contiene prescripción reconocible.")
-                return llm_response
+            if isinstance(llm_response, str) and (
+                "fórmula médica válida" in llm_response
+                or "no contiene una fórmula" in llm_response.lower()
+            ):
+                logger.warning("⚠️ Imagen no contiene prescripción reconocible.")
+                return "Imagen no contiene una fórmula médica válida."
 
             try:
-                raw = json.loads(llm_response)["datos"]
+                json_text = _strip_code_fence(llm_response)
+                raw = json.loads(json_text)["datos"]
             except (json.JSONDecodeError, KeyError) as exc:
                 raise PIPProcessorError("La respuesta del modelo no es JSON válido.") from exc
 
             clean_data: Dict[str, Any] = _recursive_clean(raw)
+
             if not _validate_minimum_fields(clean_data):
-                raise PIPProcessorError("Datos insuficientes para identificar al paciente.")
+                logger.warning("❌ Faltan campos clave como tipo_documento o numero_documento. Imagen probablemente inválida.")
+                return "Imagen no contiene una fórmula médica válida."
 
             paciente_clave = f"CO{clean_data['tipo_documento']}{clean_data['numero_documento']}"
             logger.info("☁️ Subiendo imagen a Cloud Storage…")
