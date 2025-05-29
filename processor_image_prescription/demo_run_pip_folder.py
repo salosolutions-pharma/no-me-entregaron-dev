@@ -5,10 +5,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from pip_processor import PIPProcessor
 
 # Ruta de la carpeta con las imágenes
-folder_path = r"D:\Downloads\Formulas Medicas"
+folder_path = r"G:\Mi unidad\No me entregaron\Formulas Medicas"
 
 # Simulamos un session_id cualquiera
-session_id = "claude"
+session_id = "gemini-2.0-flash"
 
 # Crear instancia del procesador
 processor = PIPProcessor()

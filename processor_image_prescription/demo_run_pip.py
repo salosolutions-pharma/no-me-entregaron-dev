@@ -6,7 +6,7 @@ from pip_processor import PIPProcessor
 
 
 # Ruta de imagen local (ajusta esto con el path real en tu máquina)
-image_path = r"D:\Downloads\Formulas Medicas\formula-wilmarlondoño.jpg"
+image_path = r"G:\Mi unidad\No me entregaron\Formulas Medicas\Formula Carolina Salazar.jpg"
 
 # Simulamos un session_id cualquiera
 session_id = "demo-session-002"

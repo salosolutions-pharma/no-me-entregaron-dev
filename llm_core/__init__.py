@@ -19,8 +19,8 @@ class LLMCore:
     * ask_image() → (imagen + prompt) ↦ texto
     """
     def __init__(self,
-                default_model: str = "gemini",
-                fallback_priority: list[str] = ["gemini", "gemini"]):
+                default_model: str = "openai",
+                fallback_priority: list[str] = ["gemini", "claude"]):
         self.default_model = default_model
         self.fallback_priority = fallback_priority
         print(f"[LLMCore] default_model={self.default_model!r}, fallback_priority={self.fallback_priority!r}") #Eliminar en producción

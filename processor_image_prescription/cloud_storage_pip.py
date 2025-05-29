@@ -64,7 +64,7 @@ def generate_blob_name(paciente_clave: str, original_filename: str) -> str:
     colombia_tz = pytz.timezone('America/Bogota') # Obtener la zona horaria de Colombia
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S") # Si se quiere cambiar utc por Colombia, ingresar utcnow(colombia_tz)
     extension = Path(original_filename).suffix
-    return f"{paciente_clave}{timestamp}{extension}"
+    return f"{paciente_clave}_{timestamp}{extension}"
 
 
 # --------------------------------------------------------------------------- #
