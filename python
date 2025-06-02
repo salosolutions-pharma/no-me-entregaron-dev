@@ -1,0 +1,3 @@
+      PID    PPID    PGID     WINPID   TTY         UID    STIME COMMAND
+      259       1     259      11228  cons0     197609 11:43:46 /usr/bin/bash
+      308     259     308       7744  cons0     197609 11:43:51 /usr/bin/PS
