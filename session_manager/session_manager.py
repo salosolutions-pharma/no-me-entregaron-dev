@@ -1,15 +1,15 @@
 import os
 import logging
-import json
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any, Dict, List
 import pytz
-
+import json
 from dotenv import load_dotenv
-from google.cloud import bigquery
+from google.cloud import firestore
 from google.oauth2.service_account import Credentials
-from google.cloud.exceptions import GoogleCloudError, NotFound
-from typing_extensions import Dict, Any
+from google.api_core.exceptions import GoogleAPIError # Para errores generales de Google Cloud
+
 # --- Excepciones personalizadas ---
 class SessionManagerError(Exception):
     """Excepción base para errores en el SessionManager."""
@@ -24,88 +24,37 @@ logger = logging.getLogger(__name__)
 # --- Cargar variables de entorno ---
 load_dotenv()
 
-# Variables de entorno para BigQuery
+# Variables de entorno para Firestore
 PROJECT_ID = os.getenv("PROJECT_ID")
-DATASET_ID = os.getenv("DATASET_ID")
-TABLE_ID_HISTORY = os.getenv("TABLE_ID_H")  # historial_conversacion
+# Para Firestore, la "tabla" de historial de conversaciones activas es una colección.
+FIRESTORE_COLLECTION_SESSIONS_ACTIVE = "sesiones_activas" # Nombre de la colección en Firestore [cite: 1, 4]
 
 
 class SessionManager:
     """
-    Gestiona las sesiones de conversación, registrando la fila inicial de la sesión
-    y eventos adicionales (incluido el consentimiento) como nuevas filas.
-    Utiliza la API de Streaming para todas las inserciones.
+    Gestiona las sesiones de conversación como documentos en la colección 'sesiones_activas' de Firestore.
+    Cada documento representa una sesión activa y contiene todo el historial de conversación en un array.
     """
 
     def __init__(self):
-        """Inicializa el gestor de sesiones, estableciendo la conexión con BigQuery."""
-        if not all([PROJECT_ID, DATASET_ID, TABLE_ID_HISTORY]):
+        """Inicializa el gestor de sesiones, estableciendo la conexión con Firestore."""
+        if not PROJECT_ID:
             raise ValueError(
-                "Las variables de entorno de BigQuery (PROJECT_ID, DATASET_ID, TABLE_ID_H) "
-                "no están configuradas correctamente."
+                "La variable de entorno PROJECT_ID no está configurada para Firestore."
             )
-        self.client = self._get_bigquery_client()
-        self.table_ref = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID_HISTORY}"
+        self.db = self._get_firestore_client()
+        self.sessions_collection_ref = self.db.collection(FIRESTORE_COLLECTION_SESSIONS_ACTIVE)
         self.colombia_tz = pytz.timezone('America/Bogota')
-        logger.info(f"SessionManager inicializado. Conectado a BigQuery tabla: {self.table_ref}")
+        logger.info(f"SessionManager inicializado. Conectado a Firestore colección: '{FIRESTORE_COLLECTION_SESSIONS_ACTIVE}'.")
 
+    def _get_firestore_client(self) -> firestore.Client:
+        """Crea y retorna una instancia del cliente de Firestore."""
+        # firestore.Client detecta automáticamente las credenciales si GOOGLE_APPLICATION_CREDENTIALS está configurado
         try:
-            table_schema = self.client.get_table(self.table_ref).schema
-            field_names = [field.name for field in table_schema]
-            required_fields = ["id_sesion", "conversacion", "consentimiento", "timestamp_consentimiento"]
-            if not all(field in field_names for field in required_fields):
-                logger.warning(
-                    f"La tabla BigQuery '{self.table_ref}' no tiene todos los campos esperados: {required_fields}. "
-                    "Asegúrate de que los tipos coincidan: 'conversacion' (STRING), 'consentimiento' (BOOL), "
-                    "y 'timestamp_consentimiento' (TIMESTAMP)."
-                )
-        except NotFound:
-            logger.error(f"La tabla BigQuery '{self.table_ref}' no existe. Por favor, créala con el esquema adecuado.")
-            raise SessionManagerError(f"La tabla BigQuery '{self.table_ref}' no existe.")
+            return firestore.Client(project=PROJECT_ID, database="historia")
         except Exception as e:
-            logger.error(f"Error al verificar el esquema de la tabla BigQuery '{self.table_ref}': {e}")
-
-
-    def _get_bigquery_client(self) -> bigquery.Client:
-        """Crea y retorna una instancia del cliente de BigQuery."""
-        creds = self._get_credentials()
-        return bigquery.Client(credentials=creds, project=PROJECT_ID)
-
-    def _get_credentials(self) -> Credentials:
-        """
-        Obtiene las credenciales de servicio de Google Cloud.
-        Prioriza GOOGLE_APPLICATION_CREDENTIALS, luego rutas comunes, finalmente credenciales por defecto.
-        """
-        path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        if path and Path(path).exists():
-            logger.info("Usando credenciales desde GOOGLE_APPLICATION_CREDENTIALS: %s", path)
-            return Credentials.from_service_account_file(path)
-
-        common_paths = [
-            "./credentials/no-me-entregaron-5d051d4e8784.json",
-            "./credentials.json",
-            "./key.json",
-            "./service-account.json"
-        ]
-
-        for p in common_paths:
-            if Path(p).exists():
-                logger.info("Usando credenciales desde ruta común: %s", p)
-                return Credentials.from_service_account_file(p)
-
-        try:
-            import google.auth
-            credentials, _ = google.auth.default()
-            logger.info("Usando credenciales por defecto de la aplicación (ADC).")
-            return credentials
-        except Exception as e:
-            logger.error(f"No se pudieron obtener las credenciales por defecto de la aplicación: {e}")
-            raise SessionManagerError(
-                "No se encontraron credenciales válidas para Google Cloud. "
-                "Por favor, configura GOOGLE_APPLICATION_CREDENTIALS, "
-                "asegúrate de que el archivo JSON esté en una ruta accesible, "
-                "o ejecuta 'gcloud auth application-default login'."
-            ) from e
+            logger.exception(f"Error al inicializar el cliente de Firestore: {e}")
+            raise SessionManagerError(f"Fallo al crear cliente de Firestore: {e}") from e
 
     def generate_session_id(self, user_identifier: str, channel: str) -> str:
         """
@@ -113,17 +62,22 @@ class SessionManager:
         Formato: CANAL_IDENTIFICADOR_YYYYMMDD_HHmmss
 
         Args:
-            user_identifier (str): Identificador único del usuario (ej: número de teléfono 573XXXXXXXXX, o user_id de Telegram).
+            user_identifier (str): Identificador único del usuario (número de celular).
             channel (str): Canal de comunicación ("WA", "TL", etc.).
 
         Returns:
             str: ID de sesión.
         """
-        clean_identifier = user_identifier.replace(" ", "").replace("-", "").strip()
-        if len(clean_identifier) == 10 and clean_identifier.startswith("3"):
+        # Limpiar cualquier caracter no numérico del identificador y asegurar formato
+        clean_identifier = "".join(filter(str.isdigit, user_identifier))
+        
+        # Formato de número de teléfono colombiano con +57 o sin si ya tiene 10 dígitos y empieza con 3
+        if not clean_identifier.startswith("57") and len(clean_identifier) == 10 and clean_identifier.startswith("3"):
             normalized_identifier = f"57{clean_identifier}"
-        else:
-            normalized_identifier = clean_identifier
+        elif clean_identifier.startswith("57") and len(clean_identifier) == 12: # Ya tiene 57
+             normalized_identifier = clean_identifier
+        else: # Otros casos, usar tal cual o manejar error si se espera un formato estricto
+             normalized_identifier = clean_identifier
 
         now = datetime.now(self.colombia_tz)
         timestamp_str = now.strftime("%Y%m%d_%H%M%S")
@@ -151,6 +105,7 @@ class SessionManager:
                 raise ValueError("Formato de session_id incompleto.")
             
             timestamp_part = f"{parts[-2]}_{parts[-1]}"
+            # Devuelve un datetime naive para facilitar comparaciones si no hay tz en el otro lado
             return datetime.strptime(timestamp_part, "%Y%m%d_%H%M%S")
         except (ValueError, IndexError) as exc:
             logger.error(f"Error extrayendo timestamp de session_id '{session_id}': {exc}")
@@ -158,7 +113,7 @@ class SessionManager:
 
     def extract_user_identifier_from_session_id(self, session_id: str) -> str:
         """
-        Extrae el identificador de usuario (número de teléfono o ID de Telegram) de un ID de sesión.
+        Extrae el identificador de usuario (número de teléfono) de un ID de sesión.
         """
         try:
             parts = session_id.split('_')
@@ -168,72 +123,64 @@ class SessionManager:
         except IndexError:
             return "unknown_identifier"
             
-    def _insert_row_via_streaming(self, row_data: Dict[str, Any]) -> bool:
-        """
-        Inserta una fila directamente en BigQuery usando la API de Streaming.
-        """
-        try:
-            table = self.client.get_table(self.table_ref)
-            errors = self.client.insert_rows_json(table, [row_data])
-
-            if errors:
-                for error in errors:
-                    logger.error(f"Error en fila al insertar en BigQuery (Streaming): {error}")
-                return False
-            return True
-        except GoogleCloudError as e:
-            logger.exception(f"Error de BigQuery al insertar fila (Streaming): {e}")
-            return False
-        except Exception as e:
-            logger.exception(f"Error inesperado al insertar fila (Streaming): {e}")
-            return False
-
 
     def create_session(self, user_identifier: str, channel: str = "WA") -> str:
         """
-        Crea una nueva sesión insertando la fila inicial en BigQuery
-        con la conversación de inicio y los campos de consentimiento nulos.
+        Crea un nuevo documento de sesión en Firestore para una sesión activa.
+        La sesión se inicializa con un mensaje de sistema y campos de consentimiento nulos.
 
         Args:
-            user_identifier (str): Identificador único del usuario.
+            user_identifier (str): Identificador único del usuario (número de celular).
             channel (str): Canal de comunicación (ej. "WA", "TL").
 
         Returns:
             str: El ID de la sesión creada.
 
         Raises:
-            SessionManagerError: Si falla al guardar la sesión en BigQuery.
+            SessionManagerError: Si falla al crear la sesión en Firestore.
         """
         session_id = self.generate_session_id(user_identifier, channel)
-        current_time = datetime.now(self.colombia_tz).isoformat()
+        current_time_iso = datetime.now(self.colombia_tz).isoformat()
 
-        initial_conversation_data = [] # Esto se llenaría si quisieras un historial aquí
+        initial_conversation_data = []
         initial_system_message = {
-            "timestamp": current_time,
+            "timestamp": current_time_iso,
             "sender": "system",
             "message": "Sesión iniciada.",
             "event_type": "session_started",
-            "user_id": user_identifier
+            "user_id": user_identifier # Aquí se guarda el número de celular
         }
-        initial_conversation_data.append(initial_system_message) # Añadir el mensaje de inicio
+        initial_conversation_data.append(initial_system_message)
 
-        row_data = {
+        session_data = {
             "id_sesion": session_id,
-            "conversacion": json.dumps(initial_conversation_data, ensure_ascii=False), # JSON con mensaje de inicio
-            "consentimiento": None, # En la fila inicial, estos son NULL
-            "timestamp_consentimiento": None # En la fila inicial, estos son NULL
+            "user_identifier": user_identifier, # Campo para consultas directas por usuario
+            "channel": channel,
+            "created_at": firestore.SERVER_TIMESTAMP, # Firestore gestiona timestamps nativamente
+            "last_activity_at": firestore.SERVER_TIMESTAMP, # Para seguimiento de inactividad
+            "conversation": initial_conversation_data, # Lista de objetos mensaje
+            "consentimiento": None, # Valor inicial nulo
+            "timestamp_consentimiento": None, # Valor inicial nulo
+            "estado_sesion": "activa" # Campo clave para la Cloud Function [cite: 8]
         }
         
-        if not self._insert_row_via_streaming(row_data):
-            raise SessionManagerError(f"Error al guardar la sesión inicial en BigQuery para {session_id}")
-            
-        logger.info(f"Sesión '{session_id}' creada y guardada en BigQuery.")
-        return session_id
+        try:
+            doc_ref = self.sessions_collection_ref.document(session_id)
+            doc_ref.set(session_data) # set() crea el documento si no existe, o lo sobrescribe
+            logger.info(f"Sesión '{session_id}' creada en Firestore.")
+            return session_id
+        except GoogleAPIError as e:
+            logger.exception(f"Error de Firestore al crear sesión {session_id}: {e}")
+            raise SessionManagerError(f"Error al crear sesión en Firestore: {e}") from e
+        except Exception as e:
+            logger.exception(f"Error inesperado al crear sesión {session_id}: {e}")
+            raise SessionManagerError(f"Error inesperado al crear sesión en Firestore: {e}") from e
+
 
     def add_message_to_session(self, session_id: str, message_content: str, sender: str = "user", message_type: str = "conversation") -> None:
         """
-        Agrega un mensaje/evento al historial de conversación de una sesión.
-        Crea una nueva fila para cada mensaje/evento.
+        Agrega un mensaje/evento al array 'conversation' del documento de sesión en Firestore.
+        También actualiza 'last_activity_at'.
 
         Args:
             session_id (str): ID de la sesión.
@@ -241,77 +188,80 @@ class SessionManager:
             sender (str): Quién envía el mensaje ("user", "bot", "system").
             message_type (str): Tipo de mensaje (e.g., "conversation", "consent_response", "event").
         """
-        current_time = datetime.now(self.colombia_tz).isoformat()
+        current_time_iso = datetime.now(self.colombia_tz).isoformat()
         user_identifier = self.extract_user_identifier_from_session_id(session_id)
 
-        message_entry = {
-            "timestamp": current_time,
+        new_message_entry = {
+            "timestamp": current_time_iso,
             "sender": sender,
             "message": message_content,
-            "message_type": message_type,
-            "user_id": user_identifier
+            "event_type": message_type,
+            "user_id": user_identifier # Aquí se guarda el número de celular
         }
         
-        row_data = {
-            "id_sesion": session_id,
-            "conversacion": json.dumps([message_entry], ensure_ascii=False), # JSON con un solo mensaje/evento
-            "consentimiento": None, # Sigue siendo NULL aquí, solo se llena en la fila de consentimiento
-            "timestamp_consentimiento": None # Sigue siendo NULL aquí
-        }
-
-        if not self._insert_row_via_streaming(row_data):
-            logger.error(f"Fallo al agregar mensaje a sesión {session_id}. Mensaje: {message_content[:50]}...")
-        else:
+        try:
+            doc_ref = self.sessions_collection_ref.document(session_id)
+            doc_ref.update({
+                'conversation': firestore.ArrayUnion([new_message_entry]), # Añadir al array [cite: 5]
+                'last_activity_at': firestore.SERVER_TIMESTAMP # Actualizar actividad
+            })
             logger.info(f"Mensaje agregado a sesión {session_id} [{sender}]: {message_content[:50]}...")
+        except GoogleAPIError as e:
+            logger.exception(f"Error de Firestore al agregar mensaje a sesión {session_id}: {e}")
+        except Exception as e:
+            logger.exception(f"Error inesperado al agregar mensaje a sesión {session_id}: {e}")
 
 
-    def record_consent_event(self, session_id: str, consent_status: str, user_telegram_id: int) -> bool:
+    def update_consent_for_session(self, session_id: str, consent_status: str) -> bool:
         """
-        Registra el evento de consentimiento en una NUEVA FILA separada en BigQuery.
-        Esta fila contendrá los campos `consentimiento` y `timestamp_consentimiento` llenos.
+        Actualiza los campos 'consentimiento' y 'timestamp_consentimiento'
+        del documento de sesión en Firestore, y añade un evento de consentimiento al historial de conversación.
 
         Args:
-            session_id (str): El ID de la sesión.
+            session_id (str): El ID de la sesión cuya información de consentimiento se actualizará.
             consent_status (str): El estado del consentimiento ('autorizado', 'no autorizado').
-            user_telegram_id (int): El ID de usuario de Telegram para el log interno.
 
         Returns:
-            bool: True si la inserción fue exitosa, False en caso contrario.
+            bool: True si la actualización fue exitosa, False en caso contrario.
         """
-        current_time = datetime.now(self.colombia_tz).isoformat()
+        current_time_iso = datetime.now(self.colombia_tz).isoformat()
         consent_bool_value = True if consent_status == "autorizado" else False
-        user_identifier_from_session = self.extract_user_identifier_from_session_id(session_id)
 
-        # Crear una entrada de conversación para este evento
-        consent_event_data = {
-            "timestamp": current_time,
-            "sender": "user", # El usuario da el consentimiento
-            "message": f"Consentimiento de datos: {consent_status}",
-            "event_type": "consent_response",
-            "consent_status": consent_status, # Registrar el status dentro del JSON también
-            "user_id": str(user_telegram_id)
-        }
+        try:
+            doc_ref = self.sessions_collection_ref.document(session_id)
+            doc_ref.update({
+                "consentimiento": consent_bool_value,
+                "timestamp_consentimiento": firestore.SERVER_TIMESTAMP,
+                "last_activity_at": firestore.SERVER_TIMESTAMP # También actualizar actividad
+            })
+            logger.info(f"Consentimiento de sesión {session_id} actualizado a '{consent_status}' en Firestore.")
+            
+            # --- AÑADIR ESTE BLOQUE ---
+            # También añadir el evento de consentimiento al array 'conversation'
+            consent_event_data = {
+                "timestamp": current_time_iso,
+                "sender": "system", # O "user" si el bot es el que registra la acción del usuario
+                "message": f"Consentimiento de datos: {consent_status}",
+                "event_type": "consent_response",
+                "consent_status": consent_status,
+                "user_id": self.extract_user_identifier_from_session_id(session_id)
+            }
+            # Llamamos a add_message_to_session para que lo agregue al array 'conversation'
+            self.add_message_to_session(session_id, json.dumps(consent_event_data), "system", "consent_response")
+            logger.info(f"Evento de consentimiento también añadido al array 'conversation' para sesión {session_id}.")
+            # --- FIN DEL BLOQUE AÑADIDO ---
 
-        # La fila a insertar tendrá los campos de consentimiento llenos
-        row_data = {
-            "id_sesion": session_id,
-            "conversacion": json.dumps([consent_event_data], ensure_ascii=False), # El evento como un JSON
-            "consentimiento": consent_bool_value, # Este sí se llena
-            "timestamp_consentimiento": current_time # Este sí se llena
-        }
-
-        if not self._insert_row_via_streaming(row_data):
-            logger.error(f"Fallo al registrar evento de consentimiento para sesión {session_id}.")
+            return True
+        except GoogleAPIError as e:
+            logger.exception(f"Error de Firestore al actualizar consentimiento para sesión {session_id}: {e}")
             return False
-        
-        logger.info(f"Evento de consentimiento '{consent_status}' registrado en nueva fila para sesión {session_id}.")
-        return True
-
+        except Exception as e:
+            logger.exception(f"Error inesperado al actualizar consentimiento para sesión {session_id}: {e}")
+            return False
 
     def get_conversation_history(self, session_id: str) -> list:
         """
-        Obtiene todo el historial de conversación para una sesión dada,
-        uniendo los eventos de la columna 'conversacion' de todas las filas con ese session_id.
+        Obtiene el historial de conversación de un documento de sesión de Firestore.
 
         Args:
             session_id (str): ID de la sesión.
@@ -320,43 +270,19 @@ class SessionManager:
             list: Lista de mensajes/eventos ordenados por su timestamp interno.
         """
         try:
-            # Seleccionamos 'conversacion' (JSON) y el 'timestamp_consentimiento'
-            # para ordenar correctamente y poder decidir la fila principal.
-            query = f"""
-                SELECT conversacion, timestamp_consentimiento
-                FROM `{self.table_ref}`
-                WHERE id_sesion = @id_sesion
-                ORDER BY timestamp_consentimiento ASC NULLS FIRST, id_sesion ASC
-            """
-
-            job_config = bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ScalarQueryParameter("id_sesion", "STRING", session_id)
-                ]
-            )
-
-            logger.info(f"Consultando historial de conversación para sesión {session_id}...")
-            results = self.client.query(query, job_config=job_config).result()
-
-            all_messages = []
-            for row in results:
-                if row.conversacion:
-                    try:
-                        messages_in_row = json.loads(row.conversacion)
-                        if isinstance(messages_in_row, list):
-                            all_messages.extend(messages_in_row)
-                        elif isinstance(messages_in_row, dict):
-                             all_messages.append(messages_in_row)
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Error decodificando JSON en fila de conversación para {session_id}: {e}. Contenido: {row.conversacion[:100]}")
-                        continue
-            
-            all_messages.sort(key=lambda x: x.get("timestamp", ""))
-            logger.info(f"Historial de conversación recuperado para sesión {session_id}. Total mensajes: {len(all_messages)}")
-            return all_messages
-
-        except GoogleCloudError as e:
-            logger.exception(f"Error de BigQuery al obtener historial de sesión {session_id}: {e}")
+            doc_ref = self.sessions_collection_ref.document(session_id)
+            doc = doc_ref.get()
+            if doc.exists:
+                session_data = doc.to_dict()
+                conversation_list = session_data.get('conversation', [])
+                # Asegurar orden por timestamp, aunque Firestore tiende a mantener el orden de inserción en arrays
+                conversation_list.sort(key=lambda x: x.get("timestamp", "")) 
+                logger.info(f"Historial de conversación recuperado para sesión {session_id}. Total mensajes: {len(conversation_list)}")
+                return conversation_list
+            logger.info(f"Sesión {session_id} no encontrada en Firestore.")
+            return []
+        except GoogleAPIError as e:
+            logger.exception(f"Error de Firestore al obtener historial de sesión {session_id}: {e}")
             return []
         except Exception as e:
             logger.exception(f"Error inesperado al obtener historial de sesión {session_id}: {e}")
@@ -364,80 +290,63 @@ class SessionManager:
 
     def get_previous_sessions_by_phone(self, user_identifier: str) -> list:
         """
-        Obtiene sesiones previas de un identificador de usuario.
-        Busca la fila inicial de cada sesión y su fila de consentimiento (si existe y tiene campos llenos).
+        Obtiene sesiones previas de un identificador de usuario (número de celular)
+        de la colección de sesiones activas en Firestore.
 
         Args:
-            user_identifier (str): Identificador único del usuario (ej: número de teléfono o ID de Telegram).
+            user_identifier (str): Identificador único del usuario (número de celular).
 
         Returns:
             list: Lista de diccionarios con información de sesiones previas.
         """
         try:
-            clean_identifier = user_identifier.replace(" ", "").replace("-", "").strip()
-            if len(clean_identifier) == 10 and clean_identifier.startswith("3"):
+            # Normalizar el identificador para la consulta
+            clean_identifier = "".join(filter(str.isdigit, user_identifier))
+            if not clean_identifier.startswith("57") and len(clean_identifier) == 10 and clean_identifier.startswith("3"):
                 normalized_identifier = f"57{clean_identifier}"
+            elif clean_identifier.startswith("57") and len(clean_identifier) == 12:
+                 normalized_identifier = clean_identifier
             else:
-                normalized_identifier = clean_identifier
+                 normalized_identifier = clean_identifier
             
-            # Queremos encontrar la fila de la sesión principal (la que tiene el mensaje de inicio)
-            # y la fila del consentimiento (la que tiene el consentimiento y timestamp llenos).
-            # Agruparemos por id_sesion y obtendremos los metadatos relevantes.
-            query = f"""
-                SELECT
-                    id_sesion,
-                    ARRAY_AGG(STRUCT(conversacion, consentimiento, timestamp_consentimiento)) AS session_data
-                FROM `{self.table_ref}`
-                WHERE id_sesion LIKE '%_{normalized_identifier}_%'
-                GROUP BY id_sesion
-                ORDER BY id_sesion DESC
-                LIMIT 10
-            """
+            # Consultar Firestore por sesiones de este usuario, ordenadas por actividad reciente
+            query = (
+                self.sessions_collection_ref
+                .where('user_identifier', '==', normalized_identifier) # Filtra por el campo user_identifier
+                .where('estado_sesion', '==', 'activa') # Solo sesiones activas
+                .order_by('last_activity_at', direction=firestore.Query.DESCENDING) # Ordena por la última actividad
+                .limit(10)
+            )
             
-            logger.info(f"Consultando sesiones previas para {user_identifier}...")
-            results = self.client.query(query).result()
+            logger.info(f"Consultando sesiones activas previas para {user_identifier} en Firestore...")
+            results = query.stream()
             
             previous_sessions = []
-            for row in results:
-                session_id = row.id_sesion
-                created_at_str = None
-                
-                try:
-                    created_at_dt = self.extract_timestamp_from_session_id(session_id)
-                    created_at_str = created_at_dt.isoformat()
-                except ValueError:
-                    logger.warning(f"No se pudo extraer timestamp de session_id '{session_id}'.")
+            for doc in results:
+                data = doc.to_dict()
+                session_id = doc.id # El ID del documento es el id_sesion
+                created_at_dt = data.get('created_at')
+                created_at_str = created_at_dt.isoformat() if created_at_dt else None # Firestore Timestamp a ISO string
 
-                # Buscar el estado de consentimiento y su timestamp
-                consent_status = None
-                consent_timestamp = None
-                has_conversation_data = False
-
-                for data_entry in row.session_data:
-                    if data_entry.get("consentimiento") is not None:
-                        consent_status = data_entry.get("consentimiento")
-                        consent_timestamp = data_entry.get("timestamp_consentimiento").isoformat() if data_entry.get("timestamp_consentimiento") else None
-                    if data_entry.get("conversacion"):
-                        try:
-                            if json.loads(data_entry.get("conversacion")):
-                                has_conversation_data = True
-                        except json.JSONDecodeError:
-                            pass
+                consent_status = data.get('consentimiento')
+                consent_timestamp_dt = data.get('timestamp_consentimiento')
+                consent_timestamp_str = consent_timestamp_dt.isoformat() if consent_timestamp_dt else None
 
                 previous_sessions.append({
                     "session_id": session_id,
-                    "user_identifier": normalized_identifier,
+                    "user_identifier": data.get('user_identifier'),
+                    "channel": data.get('channel'),
                     "created_at": created_at_str,
-                    "has_conversation": has_conversation_data,
+                    "has_conversation": bool(data.get('conversation')),
                     "consentimiento_status": consent_status,
-                    "timestamp_consentimiento": consent_timestamp
+                    "timestamp_consentimiento": consent_timestamp_str
                 })
             
-            logger.info("Encontradas %d sesiones previas para %s", len(previous_sessions), normalized_identifier)
+            logger.info("Encontradas %d sesiones activas previas para %s en Firestore.", len(previous_sessions), user_identifier)
             return previous_sessions
             
-        except GoogleCloudError as e:
-            logger.exception(f"Error de BigQuery buscando sesiones previas para {user_identifier}: {e}")
+        except GoogleAPIError as e:
+            logger.exception(f"Error de Firestore buscando sesiones previas para {user_identifier}: {e}")
             return []
         except Exception as e:
             logger.exception(f"Error inesperado buscando sesiones previas para {user_identifier}: {e}")
@@ -445,43 +354,92 @@ class SessionManager:
 
     def create_session_with_history_check(self, user_identifier: str, channel: str = "WA") -> dict:
         """
-        Crea una nueva sesión, pero verifica si hay historial previo para el identificador de usuario.
-        Si la sesión ya existe (determinada por el ID), simplemente la retorna.
-        Si no, crea una nueva.
+        Crea una nueva sesión para el identificador de usuario si no existe una activa y no expirada,
+        o devuelve la existente.
 
         Args:
-            user_identifier (str): Identificador único del usuario.
+            user_identifier (str): Identificador único del usuario (número de celular).
             channel (str): Canal de comunicación.
 
         Returns:
-            dict: Información de la sesión (existente o nueva), incluyendo historial previo.
+            dict: Información de la sesión (existente o nueva).
         """
-        previous_sessions = self.get_previous_sessions_by_phone(user_identifier)
-        new_session_id = self.create_session(user_identifier, channel)
-
-        if previous_sessions:
-            history_message = (
-                f"Usuario tiene {len(previous_sessions)} sesiones previas. "
-                f"Última iniciada: {previous_sessions[0]['created_at']}."
-            )
-            self.add_message_to_session(new_session_id, history_message, "system", "event")
-            logger.info("Historial previo encontrado para el nuevo usuario y mensaje añadido.")
+        normalized_identifier = "".join(filter(str.isdigit, user_identifier))
+        if not normalized_identifier.startswith("57") and len(normalized_identifier) == 10 and normalized_identifier.startswith("3"):
+            normalized_identifier = f"57{normalized_identifier}"
+        elif normalized_identifier.startswith("57") and len(normalized_identifier) == 12:
+             normalized_identifier = normalized_identifier
         else:
-            logger.info("Usuario nuevo sin historial previo.")
+             normalized_identifier = normalized_identifier
+        
+        # Buscar una sesión activa existente para este identificador
+        query_active_session = (
+            self.sessions_collection_ref
+            .where('user_identifier', '==', normalized_identifier)
+            .where('estado_sesion', '==', 'activa')
+            .order_by('last_activity_at', direction=firestore.Query.DESCENDING)
+            .limit(1)
+        )
+        logger.info(f"Buscando sesión activa existente para {normalized_identifier} en Firestore...")
+        
+        try:
+            active_session_doc = None
+            for doc in query_active_session.stream():
+                active_session_doc = doc
+                break
 
-        return {
-            "new_session_id": new_session_id,
-            "user_identifier": user_identifier,
-            "channel": channel,
-            "has_previous_history": len(previous_sessions) > 0,
-            "previous_sessions_count": len(previous_sessions),
-            "previous_sessions": previous_sessions[:3]
-        }
+            if active_session_doc:
+                session_data = active_session_doc.to_dict()
+                session_id = active_session_doc.id
+                # Aquí podrías añadir lógica para comprobar si la sesión activa está expirada por inactividad
+                # Si lo está, podrías cerrarla aquí y crear una nueva.
+                # Por simplicidad, si está activa, la reutilizamos.
+                logger.info(f"Sesión activa encontrada y reutilizada para {normalized_identifier}: {session_id}.")
+                return {
+                    "new_session_id": session_id,
+                    "user_identifier": user_identifier,
+                    "channel": session_data.get('channel'),
+                    "has_previous_history": True,
+                    "previous_sessions_count": 1, # Simplificado
+                    "previous_sessions": [] # Simplificado
+                }
+            
+            logger.info(f"No se encontró sesión activa para {normalized_identifier}. Creando una nueva.")
+            # Si no hay sesión activa, creamos una nueva
+            new_session_id = self.create_session(user_identifier, channel)
+            
+            # Obtener detalles de sesiones previas (cerradas o inactivas)
+            previous_sessions_details = self.get_previous_sessions_by_phone(user_identifier)
+            if previous_sessions_details:
+                history_message = (
+                    f"Usuario tiene {len(previous_sessions_details)} sesiones previas. "
+                    f"Última iniciada: {previous_sessions_details[0]['created_at']}."
+                )
+                self.add_message_to_session(new_session_id, history_message, "system", "event")
+                logger.info("Mensaje de historial previo añadido a la nueva sesión.")
+            else:
+                logger.info("Usuario nuevo sin historial previo.")
+
+            return {
+                "new_session_id": new_session_id,
+                "user_identifier": user_identifier,
+                "channel": channel,
+                "has_previous_history": len(previous_sessions_details) > 0,
+                "previous_sessions_count": len(previous_sessions_details),
+                "previous_sessions": previous_sessions_details[:3]
+            }
+
+        except GoogleAPIError as e:
+            logger.exception(f"Error de Firestore al buscar/crear sesión para {user_identifier}: {e}")
+            raise SessionManagerError(f"Error al gestionar sesión: {e}") from e
+        except Exception as e:
+            logger.exception(f"Error inesperado al gestionar sesión para {user_identifier}: {e}")
+            raise SessionManagerError(f"Error inesperado al gestionar sesión: {e}") from e
+
 
     def is_session_expired(self, session_id: str, expiration_seconds: int = 24 * 3600) -> bool:
         """
-        Verifica si una sesión ha expirado basándose en el timestamp del ID de sesión
-        y un tiempo de inactividad configurable.
+        Verifica si una sesión ha expirado basándose en su 'last_activity_at' en Firestore.
 
         Args:
             session_id (str): ID de la sesión.
@@ -491,38 +449,56 @@ class SessionManager:
             bool: True si la sesión ha expirado, False si sigue activa.
         """
         try:
-            session_start_time = self.extract_timestamp_from_session_id(session_id)
-            current_time = datetime.now(self.colombia_tz).replace(tzinfo=None)
-            session_start_time_naive = session_start_time.replace(tzinfo=None)
+            doc_ref = self.sessions_collection_ref.document(session_id)
+            doc = doc_ref.get(['last_activity_at', 'estado_sesion']) # Obtener solo los campos necesarios
 
-            expiration_time = session_start_time_naive + timedelta(seconds=expiration_seconds)
+            if not doc.exists:
+                logger.warning(f"Sesión {session_id} no encontrada para verificar expiración. Considerada expirada.")
+                return True
             
-            is_expired = current_time > expiration_time
+            session_data = doc.to_dict()
+            estado_sesion = session_data.get('estado_sesion')
+            if estado_sesion == "cerrado":
+                logger.info(f"Sesión {session_id} ya está marcada como 'cerrado'. Considerada expirada.")
+                return True # Ya está cerrada, entonces expirada para el propósito del check
 
-            age_seconds = (current_time - session_start_time_naive).total_seconds()
+            last_activity_at = session_data.get('last_activity_at')
+            if not last_activity_at:
+                logger.warning(f"Sesión {session_id} sin 'last_activity_at'. Considerada expirada.")
+                return True # Si no hay actividad, consideramos expirada.
+
+            # Convertir Firestore Timestamp a datetime nativo (naive para comparación)
+            last_activity_datetime_naive = last_activity_at.astimezone(self.colombia_tz).replace(tzinfo=None)
+            current_time_naive = datetime.now(self.colombia_tz).replace(tzinfo=None)
+
+            expiration_time_naive = last_activity_datetime_naive + timedelta(seconds=expiration_seconds)
+            
+            is_expired = current_time_naive > expiration_time_naive
+
+            age_seconds = (current_time_naive - last_activity_datetime_naive).total_seconds()
             
             if is_expired:
                 logger.info(
-                    "Sesión %s expirada. Creada: %s, Expira: %s, Edad: %.1f segundos.",
+                    "Sesión %s expirada. Última actividad: %s, Expira: %s, Edad: %.1f segundos.",
                     session_id,
-                    session_start_time.strftime("%Y-%m-%d %H:%M:%S"),
-                    expiration_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    last_activity_datetime_naive.strftime("%Y-%m-%d %H:%M:%S"),
+                    expiration_time_naive.strftime("%Y-%m-%d %H:%M:%S"),
                     age_seconds
                 )
             else:
-                time_left = (expiration_time - current_time).total_seconds()
+                time_left = (expiration_time_naive - current_time_naive).total_seconds()
                 logger.debug(
-                    "Sesión %s activa. Creada: %s, Expira: %s, Quedan: %.1f segundos.",
+                    "Sesión %s activa. Última actividad: %s, Expira: %s, Quedan: %.1f segundos.",
                     session_id,
-                    session_start_time.strftime("%Y-%m-%d %H:%M:%S"),
-                    expiration_time.strftime("%Y-%m-%d %H:%M:%S"),
+                    last_activity_datetime_naive.strftime("%Y-%m-%d %H:%M:%S"),
+                    expiration_time_naive.strftime("%Y-%m-%d %H:%M:%S"),
                     time_left
                 )
             
             return is_expired
             
-        except ValueError as exc:
-            logger.error(f"Error verificando expiración de sesión {session_id}: {exc}. Considerada expirada por seguridad.")
+        except GoogleAPIError as exc:
+            logger.exception(f"Error de Firestore verificando expiración de sesión {session_id}: {exc}. Considerada expirada por seguridad.")
             return True
         except Exception as exc:
             logger.exception(f"Error inesperado al verificar expiración de sesión {session_id}: {exc}")
@@ -530,24 +506,28 @@ class SessionManager:
 
     def close_session(self, session_id: str, reason: str = "completed") -> None:
         """
-        Cierra una sesión agregando un evento de cierre al historial como una nueva fila.
+        Cierra una sesión en Firestore marcando el campo 'estado_sesion' como "cerrado".
+        Esta acción activará la Cloud Function para migrar a BigQuery.
 
         Args:
             session_id (str): ID de la sesión a cerrar.
             reason (str): Motivo del cierre ("completed", "expired", "manual", etc.).
         """
-        current_time = datetime.now(self.colombia_tz).isoformat()
-
-        close_message = {
-            "timestamp": current_time,
-            "sender": "system",
-            "message": f"Sesión cerrada por: {reason}",
-            "event_type": "session_closed",
-            "reason": reason
-        }
+        current_time_iso = datetime.now(self.colombia_tz).isoformat()
         
-        self.add_message_to_session(session_id, json.dumps(close_message), "system", "event")
-        logger.info("Sesión '%s' marcada como cerrada por: '%s'.", session_id, reason)
+        try:
+            doc_ref = self.sessions_collection_ref.document(session_id)
+            doc_ref.update({
+                "estado_sesion": "cerrado", # Marcamos la sesión como cerrada para la Cloud Function [cite: 8]
+                "closed_at": firestore.SERVER_TIMESTAMP,
+                "close_reason": reason,
+                "last_activity_at": firestore.SERVER_TIMESTAMP # Última actividad al cerrar
+            })
+            logger.info("Sesión '%s' marcada como cerrada por: '%s' en Firestore. Esto debería disparar la Cloud Function.", session_id, reason)
+        except GoogleAPIError as e:
+            logger.exception(f"Error de Firestore al cerrar sesión {session_id}: {e}")
+        except Exception as e:
+            logger.exception(f"Error inesperado al cerrar sesión {session_id}: {e}")
 
     def check_and_expire_session(self, session_id: str, expiration_seconds: int = 24 * 3600) -> bool:
         """
@@ -562,40 +542,56 @@ class SessionManager:
         """
         if self.is_session_expired(session_id, expiration_seconds):
             self.close_session(session_id, "expired")
-            logger.info("Sesión '%s' expirada y cerrada automáticamente.", session_id)
+            logger.info("Sesión '%s' expirada y marcada como cerrada en Firestore.", session_id)
             return True
         return False
     
     def get_session_info(self, session_id: str) -> dict:
         """
-        Obtiene información detallada de una sesión.
+        Obtiene información detallada de una sesión directamente de Firestore.
 
         Args:
             session_id (str): ID de sesión.
 
         Returns:
-            dict: Información de la sesión (ID, identificador, canal, creación, edad, expiración).
+            dict: Información de la sesión.
         """
         try:
-            session_time = self.extract_timestamp_from_session_id(session_id)
-            current_time = datetime.now(self.colombia_tz).replace(tzinfo=None)
-            session_time_naive = session_time.replace(tzinfo=None)
-            
-            age_seconds = (current_time - session_time_naive).total_seconds()
-            expiration_time_naive = session_time_naive + timedelta(seconds=24 * 3600)
-            
-            return {
-                "session_id": session_id,
-                "user_identifier": self.extract_user_identifier_from_session_id(session_id),
-                "channel": session_id.split('_')[0] if len(session_id.split('_')) > 0 else "N/A",
-                "created_at": session_time.isoformat(),
-                "age_seconds": round(age_seconds, 2),
-                "is_expired": self.is_session_expired(session_id),
-                "expires_at": expiration_time_naive.isoformat()
-            }
-        except ValueError as exc:
-            logger.error(f"Error obteniendo información de sesión {session_id}: {exc}")
+            doc_ref = self.sessions_collection_ref.document(session_id)
+            doc = doc_ref.get()
+            if doc.exists:
+                data = doc.to_dict()
+                created_at_dt = data.get('created_at')
+                created_at_str = created_at_dt.isoformat() if created_at_dt else None
+
+                last_activity_dt = data.get('last_activity_at')
+                last_activity_str = last_activity_dt.isoformat() if last_activity_dt else None
+                
+                # Calcular edad y expiración basado en created_at o last_activity_at
+                session_start_time = self.extract_timestamp_from_session_id(session_id)
+                current_time_naive = datetime.now(self.colombia_tz).replace(tzinfo=None)
+                session_start_time_naive = session_start_time.replace(tzinfo=None)
+                age_seconds = (current_time_naive - session_start_time_naive).total_seconds()
+                expiration_time_naive = session_start_time_naive + timedelta(seconds=24 * 3600) # Default 24h
+                
+                return {
+                    "session_id": session_id,
+                    "user_identifier": data.get('user_identifier'),
+                    "channel": data.get('channel'),
+                    "created_at": created_at_str,
+                    "last_activity_at": last_activity_str,
+                    "estado_sesion": data.get('estado_sesion'),
+                    "consentimiento": data.get('consentimiento'),
+                    "timestamp_consentimiento": data.get('timestamp_consentimiento').isoformat() if data.get('timestamp_consentimiento') else None,
+                    "age_seconds": round(age_seconds, 2),
+                    "is_expired": self.is_session_expired(session_id), # Llama a la función para verificar
+                    "expires_at": expiration_time_naive.isoformat()
+                }
+            logger.warning(f"Sesión {session_id} no encontrada en Firestore para get_session_info.")
+            return {"error": "Sesión no encontrada", "session_id": session_id}
+        except GoogleAPIError as exc:
+            logger.exception(f"Error de Firestore obteniendo info de sesión {session_id}: {exc}")
             return {"error": str(exc), "session_id": session_id}
         except Exception as exc:
-            logger.exception(f"Error inesperado al obtener información de sesión {session_id}: {exc}")
-            return {"error": "Error interno al obtener información de sesión.", "session_id": session_id}
+            logger.exception(f"Error inesperado al obtener info de sesión {session_id}: {exc}")
+            return {"error": "Error interno al obtener info de sesión.", "session_id": session_id}
