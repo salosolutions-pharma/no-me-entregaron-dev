@@ -1,5 +1,3 @@
-# llm_core/openai_service.py
-
 import os
 import logging
 import requests

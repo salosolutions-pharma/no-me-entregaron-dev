@@ -1,160 +1,222 @@
-from __future__ import annotations
-
-import json
 import logging
 import os
+import json
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Union, Final
 
-import re
-from bigquery_pip import insert_or_update_patient_data
-from cloud_storage_pip import upload_image_to_bucket
-#from llm_core.openai_service import encode_image_to_base64
-from llm_core import LLMCore
-llm_core = LLMCore()
+# Importaciones de módulos locales (asumiendo que están en la misma estructura de proyecto)
+from .cloud_storage_pip import upload_image_to_bucket, CloudStorageServiceError
+from .bigquery_pip import insert_or_update_patient_data
+from llm_core import LLMCore # Asumiendo que llm_core es una clase importable
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-
+# Prefijo (carpeta) para todas las prescripciones en Cloud Storage
+_PRESCRIPTION_PREFIX: Final[str] = "" 
 
 class PIPProcessorError(RuntimeError):
     """Excepción base para errores de PIPProcessor."""
+    pass
 
+# --- Funciones auxiliares de limpieza y validación ---
 
-# --------------------------------------------------------------------------- #
-#  Auxiliares de limpieza / validación
-# --------------------------------------------------------------------------- #
 def _clean_text_encoding(text: str) -> str:
+    """Limpia la codificación del texto y elimina caracteres problemáticos."""
     if not isinstance(text, str):
         return text
-    with_charmap = text
     try:
-        with_charmap = text.encode("latin-1").decode("utf-8")
+        # Intenta decodificar de latin-1 a utf-8 para manejar caracteres especiales
+        cleaned_text = text.encode("latin-1", errors="ignore").decode("utf-8")
     except UnicodeDecodeError:
-        pass
-    return with_charmap.replace("�", "").replace("\n", " ")
+        # Si ya está en UTF-8 o no se puede decodificar, lo mantiene
+        cleaned_text = text
+    return cleaned_text.replace("�", "").replace("\n", " ")
 
-_CODE_FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
+_CODE_FENCE_REGEX = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.S)
 
-def _strip_code_fence(text: str) -> str:
-    match = _CODE_FENCE.search(text)
+def _extract_json_from_code_fence(text: str) -> str:
+    """Extrae el contenido JSON de una valla de código Markdown."""
+    match = _CODE_FENCE_REGEX.search(text)
     if match:
         return match.group(1)
+    logger.warning("No se encontró JSON dentro de vallas de código. Retornando texto original.")
     return text.strip()
 
-def _convert_date(date_str: str | None) -> str | None:
+def _format_date_string(date_str: str | None) -> str | None:
+    """
+    Convierte una cadena de fecha a formato 'YYYY-MM-DD'.
+    Soporta 'DD/MM/YYYY' o asume 'YYYY-MM-DD' si contiene guiones.
+    """
     if not date_str or not isinstance(date_str, str):
         return None
     try:
         if "/" in date_str:
             return datetime.strptime(date_str, "%d/%m/%Y").strftime("%Y-%m-%d")
         if "-" in date_str:
-            return date_str
+            # Asume que ya está en formato YYYY-MM-DD si contiene guiones
+            # Podría añadirse una validación más estricta si es necesario
+            return date_str 
     except ValueError:
         logger.debug("Formato de fecha no reconocido: %s", date_str)
     return None
 
-
-def _recursive_clean(data: Any) -> Any:
+def _recursive_clean_and_format_data(data: Any) -> Any:
+    """
+    Limpia recursivamente strings (codificación) y formatea fechas
+    en estructuras de datos anidadas (diccionarios y listas).
+    """
     if isinstance(data, dict):
-        cleaned: Dict[str, Any] = {}
-        for k, v in data.items():
-            cleaned[k] = _convert_date(v) if k == "fecha_atencion" else _recursive_clean(v)
-        return cleaned
+        cleaned_dict: Dict[str, Any] = {}
+        for key, value in data.items():
+            if key == "fecha_atencion": # Asumiendo este es el único campo de fecha a formatear recursivamente
+                cleaned_dict[key] = _format_date_string(value)
+            else:
+                cleaned_dict[key] = _recursive_clean_and_format_data(value)
+        return cleaned_dict
     if isinstance(data, list):
-        return [_recursive_clean(i) for i in data]
+        return [_recursive_clean_and_format_data(item) for item in data]
     if isinstance(data, str):
         return _clean_text_encoding(data)
     return data
 
-
-def _validate_minimum_fields(data: Dict[str, Any]) -> bool:
+def _validate_patient_data(data: Dict[str, Any]) -> bool:
+    """
+    Valida que los datos extraídos contengan los campos mínimos requeridos
+    para identificar a un paciente.
+    """
     return bool(data.get("tipo_documento") and data.get("numero_documento"))
 
-
 class PIPProcessor:
+    """
+    Clase para procesar imágenes de prescripciones:
+    1. Extrae información usando un modelo de lenguaje (LLM).
+    2. Sube la imagen procesada a Google Cloud Storage.
+    3. Guarda los datos extraídos y la URL de la imagen en BigQuery.
+    """
+
     def __init__(self,
                  bucket_name: str | None = None,
-                 prompt_path: str | os.PathLike[str] = r"G:\Mi unidad\No me entregaron\Repositorios\no-me-entregaron-dev\processor_image_prescription\prompt_PIP.txt"):
-        self.bucket_name: str | None = bucket_name or os.getenv("BUCKET_PRESCRIPCIONES")
-        self.prompt_path = Path(prompt_path)
+                 prompt_path: str | Path = ""):
+        """
+        Inicializa el procesador.
+        
+        Args:
+            bucket_name: Nombre del bucket de GCS para almacenar imágenes.
+                         Si es None, se intentará cargar de la variable de entorno BUCKET_PRESCRIPCIONES.
+            prompt_path: Ruta al archivo de prompt para el LLM.
+                         Si es una cadena vacía, se intentará cargar de PIP_PROMPT_PATH o usará 'prompt_PIP.txt'.
+        
+        Raises:
+            PIPProcessorError: Si BUCKET_PRESCRIPCIONES no está configurado.
+        """
+        self.bucket_name: str = bucket_name or os.getenv("BUCKET_PRESCRIPCIONES", "")
+        self.prompt_path: Path = Path(prompt_path) if prompt_path else Path(os.getenv("PIP_PROMPT_PATH", "prompt_PIP.txt"))
+        self.llm_core_instance = LLMCore() # Instancia de LLMCore, mejor aquí para encapsulación
 
         if not self.bucket_name:
-            raise PIPProcessorError("Variable BUCKET_PRESCRIPCIONES no configurada.")
-
+            logger.critical("Variable BUCKET_PRESCRIPCIONES no configurada. El procesador no puede operar.")
+            raise PIPProcessorError("BUCKET_PRESCRIPCIONES no configurado.")
+        
         if not self.prompt_path.is_file():
-            raise PIPProcessorError(f"Prompt no encontrado en {self.prompt_path}")
+            logger.warning(f"Archivo de prompt no encontrado en {self.prompt_path}. Asegúrate de que la ruta es correcta.")
+            # Dependiendo de la criticidad, aquí podrías decidir lanzar una excepción si el prompt es indispensable
+            # raise PIPProcessorError(f"Archivo de prompt no encontrado: {self.prompt_path}")
 
-        logger.debug("PIPProcessor inicializado con bucket='%s' y prompt='%s'",
-                     self.bucket_name, self.prompt_path)
+        logger.info(f"PIPProcessor inicializado con bucket='{self.bucket_name}' y prompt='{self.prompt_path}'.")
 
-    def process_image(self, image_path: str | os.PathLike[str], session_id: str) -> Union[str, Dict[str, Any]]:
+    def process_image(self, image_path: str | Path, session_id: str) -> Union[str, Dict[str, Any]]:
+        """
+        Orquesta el procesamiento de una imagen de fórmula médica.
+        
+        Args:
+            image_path: Ruta local de la imagen a procesar.
+            session_id: ID de la sesión asociada al procesamiento.
+            
+        Returns:
+            Dict[str, Any]: Un diccionario con los datos extraídos y la URL de la imagen si el
+                            procesamiento fue exitoso.
+            str: Un mensaje de error descriptivo si el procesamiento falló en alguna etapa.
+        """
         try:
-            logger.info("🚀 Procesando imagen '%s' (session=%s)", image_path, session_id)
+            logger.info(f"🚀 Iniciando procesamiento de imagen '{image_path}' para sesión '{session_id}'.")
 
-            prompt = self.prompt_path.read_text(encoding="utf-8")
-            logger.info("📝 Extrayendo datos con LLM…")
-            llm_response = llm_core.ask_image(prompt, image_path)
-            print(llm_response)
-            logger.info("🧠 Respuesta LLM:\n%s", llm_response)
+            # 1. Cargar prompt y extraer datos con LLM
+            prompt_content = self.prompt_path.read_text(encoding="utf-8")
+            logger.info("📝 Solicitando extracción de datos a LLM...")
+            llm_response = self.llm_core_instance.ask_image(prompt_content, image_path)
+            logger.debug(f"🧠 Respuesta completa del LLM:\n{llm_response}")
 
-            if isinstance(llm_response, str) and (
-                "fórmula médica válida" in llm_response
-                or "no contiene una fórmula" in llm_response.lower()
-            ):
-                logger.warning("⚠️ Imagen no contiene prescripción reconocible.")
-                return "Imagen no contiene una fórmula médica válida."
+            if "fórmula médica válida" in llm_response.lower() or "no contiene una fórmula" in llm_response.lower():
+                logger.warning("⚠️ La imagen no contiene una prescripción médica reconocible según el LLM.")
+                return "La imagen no contiene una fórmula médica válida o legible."
 
+            # 2. Parsear y limpiar datos del LLM
             try:
-                json_text = _strip_code_fence(llm_response)
-                raw = json.loads(json_text)["datos"]
+                json_text = _extract_json_from_code_fence(llm_response)
+                raw_extracted_data = json.loads(json_text)["datos"]
             except (json.JSONDecodeError, KeyError) as exc:
-                raise PIPProcessorError("La respuesta del modelo no es JSON válido.") from exc
+                logger.error(f"Error al parsear la respuesta JSON del LLM. Respuesta LLM: {llm_response[:500]}", exc_info=True)
+                return "No se pudo extraer información válida de la imagen (formato JSON inválido)."
+            except Exception as exc:
+                logger.error(f"Error inesperado al procesar la respuesta del LLM: {exc}", exc_info=True)
+                return "Ocurrió un error al interpretar la respuesta del modelo de inteligencia artificial."
 
-            clean_data: Dict[str, Any] = _recursive_clean(raw)
+            cleaned_data: Dict[str, Any] = _recursive_clean_and_format_data(raw_extracted_data)
 
-            if not _validate_minimum_fields(clean_data):
-                logger.warning("❌ Faltan campos clave como tipo_documento o numero_documento. Imagen probablemente inválida.")
-                return "Imagen no contiene una fórmula médica válida."
+            if not _validate_patient_data(cleaned_data):
+                logger.warning("❌ Los datos extraídos no contienen campos mínimos de paciente (tipo_documento o numero_documento).")
+                return "La imagen no contiene los datos mínimos requeridos de un paciente."
 
-            paciente_clave = f"CO{clean_data['tipo_documento']}{clean_data['numero_documento']}"
-            logger.info("☁️ Subiendo imagen a Cloud Storage…")
-            image_url = upload_image_to_bucket(self.bucket_name, image_path, paciente_clave)
+            # 3. Subir imagen a Cloud Storage
+            patient_key = f"CO{cleaned_data['tipo_documento']}{cleaned_data['numero_documento']}"
+            logger.info("☁️ Subiendo imagen a Cloud Storage...")
+            image_url = upload_image_to_bucket(self.bucket_name, image_path, patient_key, _PRESCRIPTION_PREFIX)
+            cleaned_data["url_prescripcion_subida"] = image_url # Añadir URL a los datos de retorno
 
-            patient_record = self._build_patient_record(clean_data, image_url, session_id)
-
-            logger.info("💾 Guardando datos en BigQuery…")
+            # 4. Construir y guardar registro en BigQuery
+            patient_record = self._build_patient_record(cleaned_data, image_url, session_id)
+            logger.info("💾 Guardando datos de prescripción en BigQuery...")
             insert_or_update_patient_data(patient_record)
 
-            logger.info("✅ Procesamiento completado.")
-            return clean_data
+            logger.info("✅ Procesamiento de prescripción completado exitosamente.")
+            return cleaned_data # Devuelve el diccionario completo con la URL
 
+        except CloudStorageServiceError as exc:
+            logger.error(f"Error de Cloud Storage durante el procesamiento: {exc}", exc_info=True)
+            return f"Error al subir la imagen al almacenamiento en la nube: {exc}"
         except PIPProcessorError as exc:
-            logger.error("❌ %s", exc)
+            logger.error(f"Error específico de PIPProcessor: {exc}", exc_info=True)
             return str(exc)
         except Exception as exc:
-            logger.exception("❌ Error inesperado en process_image")
-            return "Error inesperado en el procesamiento."
+            logger.exception("❌ Error inesperado y no manejado en PIPProcessor.process_image.")
+            return "Ocurrió un error inesperado al procesar la imagen. Por favor, inténtalo de nuevo."
 
     @staticmethod
     def _build_patient_record(data: Dict[str, Any],
                               image_url: str,
                               session_id: str) -> Dict[str, Any]:
-        clave = f"CO{data['tipo_documento']}{data['numero_documento']}"
-        prescripcion = {
+        """
+        Construye el diccionario de registro de paciente para BigQuery a partir de los datos extraídos.
+        Asume que `data['medicamentos']` ya puede incluir el campo 'entregado' si ha sido modificado.
+        """
+        patient_unique_id = f"CO{data['tipo_documento']}{data['numero_documento']}"
+        
+        prescription_data = {
             "id_session": session_id,
             "url_prescripcion": image_url,
-            "categoria_riesgo": None,
+            "categoria_riesgo": data.get("categoria_riesgo"),
             "fecha_atencion": data.get("fecha_atencion"),
             "diagnostico": data.get("diagnostico"),
             "IPS": data.get("ips"),
-            "medicamentos": data.get("medicamentos", []),
+            "medicamentos": data.get("medicamentos", []), # Puede contener 'entregado'
         }
 
+        # Estructura del registro del paciente para BigQuery
         return {
-            "paciente_clave": clave,
+            "paciente_clave": patient_unique_id,
             "pais": "CO",
             "tipo_documento": data.get("tipo_documento"),
             "numero_documento": data.get("numero_documento"),
@@ -164,68 +226,15 @@ class PIPProcessor:
             "ciudad": data.get("ciudad"),
             "direccion": data.get("direccion"),
             "eps_cruda": data.get("eps"),
-            "prescripciones": [prescripcion],
+            # Campos que no se extraen directamente de la prescripción inicial
+            "fecha_nacimiento": None,
+            "correo": [],
+            "canal_contacto": None,
+            "operador_logistico": None,
+            "sede_farmacia": None,
+            "eps_estandarizada": None,
+            "informante": [],
+            "sesiones": [],
+            "prescripciones": [prescription_data], # La prescripción actual como un array
+            "reclamaciones": [],
         }
-
-
-def _extract_prescription_with_openai(
-    image_path: str | os.PathLike[str],
-    prompt: str,
-    *,
-    model: str = "gpt-4.1-mini",
-    max_tokens: int = 1500,
-    temperature: float = 0.0,
-    timeout: int = 60,
-) -> str:
-    import requests
-    import os
-
-    headers = {
-        "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
-        "Content-Type": "application/json; charset=utf-8",
-    }
-
-    image_b64 = encode_image_to_base64(image_path)
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": prompt},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
-                    }
-                ],
-            },
-        ],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-
-    try:
-        resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=timeout,
-        )
-    except requests.RequestException as exc:
-        logger.exception("❌ Error de red al llamar a OpenAI")
-        raise PIPProcessorError("Fallo de red al acceder a OpenAI") from exc
-
-    if resp.status_code != 200:
-        err = f"Error OpenAI {resp.status_code} – {resp.text}"
-        logger.error(err)
-        raise PIPProcessorError(err)
-
-    try:
-        data = resp.json()
-        content: str = data["choices"][0]["message"]["content"]
-        logger.info("✅ Respuesta de OpenAI procesada")
-        return content
-    except (KeyError, IndexError, ValueError) as exc:
-        logger.exception("❌ Formato inesperado en la respuesta de OpenAI")
-        raise PIPProcessorError("Formato de respuesta inesperado") from exc
-

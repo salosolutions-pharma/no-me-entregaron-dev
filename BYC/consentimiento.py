@@ -1,8 +1,5 @@
-# BYC/consentimiento.py
-
 import logging
-import json
-from datetime import datetime # Asegúrate de que datetime esté importado aquí
+from typing import Any
 from google.api_core.exceptions import GoogleAPIError
 
 from session_manager.session_manager import SessionManager, SessionManagerError
@@ -12,76 +9,73 @@ logger.setLevel(logging.INFO)
 
 class ConsentimientoManager:
     """
-    Gestiona el proceso de bienvenida y consentimiento del usuario.
-    Se integra con SessionManager para manejar sesiones y registrar el consentimiento en Firestore.
+    Gestiona el proceso de bienvenida y el manejo del consentimiento del usuario.
+    Se integra con SessionManager para crear, gestionar y actualizar sesiones,
+    así como para registrar las decisiones de consentimiento en Firestore.
     """
     def __init__(self):
+        """
+        Inicializa el ConsentimientoManager, creando una instancia de SessionManager.
+        
+        Raises:
+            SessionManagerError: Si hay un error al inicializar SessionManager,
+                                 lo cual es crítico para el funcionamiento.
+        """
         try:
             self.session_manager = SessionManager()
-            logger.info("ConsentimientoManager inicializado con SessionManager (Firestore).")
+            logger.info("ConsentimientoManager inicializado exitosamente con SessionManager.")
         except SessionManagerError as e:
-            logger.error(f"Error al inicializar SessionManager en ConsentimientoManager: {e}")
-            raise
+            logger.critical(f"Error fatal al inicializar SessionManager en ConsentimientoManager: {e}. "
+                            "El módulo de consentimiento no puede operar sin una conexión válida a la base de datos de sesiones.")
+            raise # Relanzar la excepción ya que es un error crítico de inicialización
 
-    # La función handle_consent_response ahora es síncrona, ya que sus llamadas al SessionManager son síncronas.
-    # No necesita ser 'async def' si no hace operaciones 'await' directas (fuera de otras llamadas síncronas).
     def handle_consent_response(self, user_telegram_id: int, user_identifier_for_session: str, consent_status: str) -> bool:
         """
-        Gestiona la respuesta del usuario al consentimiento y la registra en Firestore.
-        Actualiza los campos de consentimiento del documento de sesión activo y añade un evento al historial.
-
+        Procesa la respuesta del usuario respecto al consentimiento de datos.
+        
+        Esta función:
+        1. Obtiene o crea una sesión activa para el usuario.
+        2. Actualiza el estado de consentimiento en el documento de la sesión en Firestore.
+        3. Registra un evento de consentimiento en el historial de conversación de la sesión.
+        
         Args:
-            user_telegram_id (int): ID del usuario de Telegram.
-            user_identifier_for_session (str): Identificador único del usuario (número de celular)
-                                               que se usará para el session_id.
-            consent_status (str): 'autorizado' o 'no autorizado'.
-
+            user_telegram_id (int): El ID de usuario de Telegram.
+            user_identifier_for_session (str): El identificador único del usuario (ej. número de teléfono),
+                                                utilizado para gestionar la sesión en Firestore.
+            consent_status (str): La decisión del usuario, típicamente 'autorizado' o 'no autorizado'.
+            
         Returns:
-            bool: True si la operación fue exitosa, False en caso contrario.
+            bool: True si la operación de registro de consentimiento fue exitosa, False en caso contrario.
         """
+        session_id: str = "" # Inicializar para asegurar que siempre tenga un valor
+
         try:
-            # Eliminar 'await' aquí - la función de SessionManager es síncrona
+            # Paso 1: Obtener o crear una sesión activa para el usuario.
+            # Esta función de SessionManager ya es síncrona y robusta.
             session_info = self.session_manager.create_session_with_history_check(
                 user_identifier=user_identifier_for_session,
-                channel="TL"
+                channel="TL" # Asumiendo "TL" para Telegram
             )
             session_id = session_info["new_session_id"]
-            logger.info(f"Sesión activa obtenida/creada para el consentimiento: {session_id}.")
+            logger.info(f"Sesión activa obtenida/creada para el manejo de consentimiento: '{session_id}'.")
         except SessionManagerError as e:
-            logger.error(f"Error de SessionManager al gestionar sesión para consentimiento: {e}")
+            logger.error(f"Fallo de SessionManager al obtener/crear sesión para el consentimiento de '{user_identifier_for_session}': {e}", exc_info=True)
             return False
         except Exception as e:
-            logger.error(f"Error inesperado al gestionar sesión para consentimiento: {e}")
+            logger.error(f"Error inesperado al gestionar sesión para el consentimiento de '{user_identifier_for_session}': {e}", exc_info=True)
             return False
 
-        # 1. Actualizar los campos 'consentimiento' y 'timestamp_consentimiento' del documento de sesión en Firestore.
+        # Paso 2 y 3: Actualizar el estado de consentimiento y registrar el evento en el historial.
+        # La función `update_consent_for_session` del SessionManager ya se encarga de AMBAS cosas,
+        # lo que simplifica enormemente este método.
         try:
-            # Eliminar 'await' aquí - la función de SessionManager es síncrona
-            success_update_fields = self.session_manager.update_consent_for_session(session_id, consent_status)
-            if not success_update_fields:
-                logger.warning(f"No se pudieron actualizar los campos de consentimiento en Firestore para sesión {session_id}.")
+            success = self.session_manager.update_consent_for_session(session_id, consent_status)
+            if not success:
+                logger.warning(f"No se pudieron actualizar los campos de consentimiento en Firestore para la sesión '{session_id}'.")
+            return success
         except GoogleAPIError as e:
-            logger.error(f"Error de Firestore al actualizar campos de consentimiento para sesión {session_id}: {e}")
+            logger.error(f"Error de la API de Google Cloud al actualizar el consentimiento para la sesión '{session_id}': {e}", exc_info=True)
+            return False
         except Exception as e:
-            logger.error(f"Error inesperado al actualizar campos de consentimiento para sesión {session_id}: {e}")
-        return success_update_fields
-        # 2. Registrar el evento de la respuesta de consentimiento como un elemento en el array 'conversation'.
-        # consent_event_data = {
-        #     "timestamp": datetime.now(self.session_manager.colombia_tz).isoformat(),
-        #     "sender": "user",
-        #     "message": f"Respuesta de consentimiento: {consent_status}",
-        #     "event_type": "consent_response",
-        #     "consent_status": consent_status,
-        #     "user_id": str(user_telegram_id)
-        # }
-        
-        # try:
-        #     self.session_manager.add_message_to_session(session_id, json.dumps(consent_event_data), "user", "consent_response")
-        #     logger.info(f"Evento de consentimiento '{consent_status}' añadido al historial de sesión {session_id}.")
-        #     return True
-        # except GoogleAPIError as e:
-        #     logger.error(f"Error de Firestore al añadir evento de consentimiento al historial para sesión {session_id}: {e}")
-        #     return False
-        # except Exception as e:
-        #     logger.error(f"Error inesperado al añadir evento de consentimiento al historial para sesión {session_id}: {e}")
-        #     return False
+            logger.error(f"Error inesperado al actualizar el consentimiento para la sesión '{session_id}': {e}", exc_info=True)
+            return False
