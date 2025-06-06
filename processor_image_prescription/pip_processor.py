@@ -5,6 +5,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Union, Final
+from motor_eps.parser import EPSParser, EPSParserError
 
 # Importaciones de módulos locales (asumiendo que están en la misma estructura de proyecto)
 from .cloud_storage_pip import upload_image_to_bucket, CloudStorageServiceError
@@ -114,7 +115,14 @@ class PIPProcessor:
         """
         self.bucket_name: str = bucket_name or os.getenv("BUCKET_PRESCRIPCIONES", "")
         self.prompt_path: Path = Path(prompt_path) if prompt_path else Path(os.getenv("PIP_PROMPT_PATH", "prompt_PIP.txt"))
-        self.llm_core_instance = LLMCore() # Instancia de LLMCore, mejor aquí para encapsulación
+        self.llm_core_instance = LLMCore() 
+
+        try:
+            self.eps_parser = EPSParser()  
+            logger.info("EPSParser inicializado exitosamente en PIPProcessor.")
+        except EPSParserError as e:
+            logger.critical(f"Error fatal al inicializar EPSParser: {e}. El procesador de PIP podría no funcionar correctamente para EPS.")
+            
 
         if not self.bucket_name:
             logger.critical("Variable BUCKET_PRESCRIPCIONES no configurada. El procesador no puede operar.")
@@ -177,7 +185,7 @@ class PIPProcessor:
             cleaned_data["url_prescripcion_subida"] = image_url # Añadir URL a los datos de retorno
 
             # 4. Construir y guardar registro en BigQuery
-            patient_record = self._build_patient_record(cleaned_data, image_url, session_id)
+            patient_record = self._build_patient_record(cleaned_data, image_url, session_id, self.eps_parser)
             logger.info("💾 Guardando datos de prescripción en BigQuery...")
             insert_or_update_patient_data(patient_record)
 
@@ -197,13 +205,26 @@ class PIPProcessor:
     @staticmethod
     def _build_patient_record(data: Dict[str, Any],
                               image_url: str,
-                              session_id: str) -> Dict[str, Any]:
+                              session_id: str,
+                              eps_parser_instance: Any = None) -> Dict[str, Any]:
         """
         Construye el diccionario de registro de paciente para BigQuery a partir de los datos extraídos.
         Asume que `data['medicamentos']` ya puede incluir el campo 'entregado' si ha sido modificado.
         """
         patient_unique_id = f"CO{data['tipo_documento']}{data['numero_documento']}"
         
+        eps_cruda = data.get("eps")
+        eps_estandarizada = None
+
+        # Si hay una EPS cruda y se proporcionó una instancia del parser
+        if eps_cruda and eps_parser_instance:
+            try:
+                parse_result = eps_parser_instance.parse_eps_name(eps_cruda) # 
+                eps_estandarizada = parse_result.get("standardized_entity") # 
+                logger.info(f"EPS '{eps_cruda}' estandarizada a '{eps_estandarizada}'. Método: {parse_result.get('method_used')}")
+            except Exception as e:
+                logger.error(f"Error al estandarizar EPS '{eps_cruda}': {e}")
+
         prescription_data = {
             "id_session": session_id,
             "url_prescripcion": image_url,
@@ -225,14 +246,14 @@ class PIPProcessor:
             "regimen": data.get("regimen"),
             "ciudad": data.get("ciudad"),
             "direccion": data.get("direccion"),
-            "eps_cruda": data.get("eps"),
+            "eps_cruda": eps_cruda,
             # Campos que no se extraen directamente de la prescripción inicial
             "fecha_nacimiento": None,
             "correo": [],
             "canal_contacto": None,
             "operador_logistico": None,
             "sede_farmacia": None,
-            "eps_estandarizada": None,
+            "eps_estandarizada": eps_estandarizada,
             "informante": [],
             "sesiones": [],
             "prescripciones": [prescription_data], # La prescripción actual como un array
