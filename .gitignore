@@ -1,28 +1,31 @@
+# Crear o editar .gitignore
+cat >> .gitignore << EOL
 
+# Credenciales y configuraciones sensibles
+gcloud_config/
+credentials/
 .env
+*.key
 *.json
-no-me-entregaron-5d051d4e8784.json
+*.pem
+*credentials*
+
+# Archivos temporales
+temp_images/
+*.tmp
+*.log
+
+# Archivos de sistema Windows
+desktop.ini
+Thumbs.db
+
+# Archivos de Python
 __pycache__/
 *.pyc
 *.pyo
-*.pyd
-.Python
-venv/
-env/
-.venv/
-.vscode/
-.idea/
-*.log
-echo "" >> .gitignore
-echo "# Archivos de sistema Windows" >> .gitignore
-echo "desktop.ini" >> .gitignore
-echo "**/desktop.ini" >> .gitignore
-echo "" >> .gitignore
-echo "# Configuración de Google Cloud" >> .gitignore
-echo "gcloud_config/" >> .gitignore
-echo "" >> .gitignore
-echo "# Archivos de prueba y temporales" >> .gitignore
-echo "test_*.py" >> .gitignore
-echo "demo_*.py" >> .gitignore
-echo "**/temp_images/" >> .gitignore
-echo "credentials/" >> .gitignore
+*.egg-info/
+
+# Archivos de prueba temporales
+python
+versiones
+EOL
