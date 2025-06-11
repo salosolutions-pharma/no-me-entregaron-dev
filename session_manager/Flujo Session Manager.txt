@@ -1,0 +1,21 @@
+1. Mensaje inicial llega por Channels (WhatsApp / Telegram)
+   ↓
+2. API Recepcionista activa el Session Manager
+   ↓
+3. Session Manager genera un session_id único
+   ↓
+4. Guarda session_id en BD (conversation_history)
+   ↓
+5. Verifica existencia de historial previo y consentimiento
+   ↓
+6. Si es nuevo → activa módulo de Bienvenida y Consentimiento
+   ↓
+7. Luego del consentimiento:
+      ↳ Si es imagen → la PIP extrae información del paciente
+      ↳ Si ya hay paciente → se vincula con session_id actual
+   ↓
+8. Session Manager registra toda la interacción de principio a fin
+   ↓
+9. Cuando termina el proceso y el usuario dice "No necesito nada más":
+      → Session Manager expira sesión
+      → Historial se guarda en tabla `patients`
