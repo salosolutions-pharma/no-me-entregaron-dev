@@ -2,45 +2,60 @@ import json
 import logging
 import os
 from typing import Any, Dict, Optional
-
+from datetime import datetime
 import functions_framework
 import pytz
-from google.cloud import bigquery, firestore
+from google.cloud import firestore, bigquery
 from google.api_core.exceptions import GoogleAPIError
+
+# Importar funciones y cliente de BigQuery desde bigquery_pip para consistencia
+from processor_image_prescription.bigquery_pip import (
+    get_bigquery_client,
+    load_table_from_json_direct,
+    BigQueryServiceError,
+    PROJECT_ID, 
+    DATASET_ID,
+    TABLE_ID, 
+)
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-PROJECT_ID = os.getenv("GCP_PROJECT", "")
-DATASET_ID = os.getenv("BIGQUERY_DATASET_ID", "NME_dev")
-TABLE_ID_HISTORY = os.getenv("BIGQUERY_TABLE_ID", "historial_conversacion")
+TABLE_ID_HISTORY = os.getenv("BIGQUERY_TABLE_ID_HISTORY", "historial_conversacion")
 FIRESTORE_DATABASE_NAME = "historia"
 FIRESTORE_COLLECTION_NAME = "sesiones_activas"
 
-bigquery_client: Optional[bigquery.Client] = None
+# Cliente de Firestore, el de BigQuery se obtiene de bigquery_pip
 firestore_client: Optional[firestore.Client] = None
 
 try:
-    if not PROJECT_ID:
-        raise RuntimeError("La variable de entorno GCP_PROJECT no está configurada.")
+    if not PROJECT_ID: # Asegurar que PROJECT_ID se haya cargado (aunque sea de bigquery_pip)
+        raise RuntimeError("La variable de entorno PROJECT_ID no está configurada.")
 
-    bigquery_client = bigquery.Client(project=PROJECT_ID)
+    # Inicializar cliente de BigQuery a través de la función centralizada
+    # get_bigquery_client() ya maneja la inicialización
+    _ = get_bigquery_client() # Solo para asegurar que el cliente se inicialice si es necesario
+
     firestore_client = firestore.Client(database=FIRESTORE_DATABASE_NAME, project=PROJECT_ID)
-    logger.info("Clientes de BigQuery y Firestore inicializados correctamente.")
+    logger.info("Clientes de BigQuery (vía bigquery_pip) y Firestore inicializados correctamente.")
 except Exception as e:
     logger.critical(f"Error al inicializar los clientes de Google Cloud: {e}")
 
 COLOMBIA_TIMEZONE = pytz.timezone("America/Bogota")
+# La referencia de la tabla de BigQuery para el historial de conversaciones
+# es específica de esta Cloud Function, no la tabla general de pacientes de bigquery_pip.
 BIGQUERY_TABLE_REFERENCE = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID_HISTORY}"
 
 
 def _extract_session_id_from_resource(resource: str) -> Optional[str]:
-    """Extrae el session_id de la ruta del recurso del evento."""
+    """Extrae el session_id de la ruta del recurso del evento de Firestore."""
     if not resource:
         logger.warning("El campo 'resource' está vacío.")
         return None
 
     parts = resource.split("/")
+    # Ejemplo: projects/project_id/databases/(default)/documents/sesiones_activas/session_id
     if len(parts) >= 6 and parts[4] == "documents" and parts[5] == FIRESTORE_COLLECTION_NAME:
         return parts[-1]
 
@@ -76,64 +91,56 @@ def _get_session_data_from_firestore(session_id: str) -> Optional[Dict[str, Any]
 def _prepare_session_for_bigquery(session_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Prepara una fila única para BigQuery con toda la conversación.
+    Asegura que los objetos de fecha/hora se serialicen correctamente a ISO 8601.
     """
-    for field in ['created_at', 'last_activity_at', 'timestamp_consentimiento', 'closed_at']:
-        val = session_data.get(field)
-        if val and hasattr(val, "isoformat"):
-            try:
-                session_data[field] = val.isoformat()
-            except Exception as e:
-                logger.warning(f"No se pudo convertir el campo {field}: {e}")
-                session_data[field] = None
-
-    conversation_array = session_data.get('conversation', [])
-    conversation_json = json.dumps(conversation_array, ensure_ascii=False, default=str)
-
     record = {
         'id_sesion': session_data.get('id_sesion'),
-        'conversacion': conversation_json,
+        'user_identifier': session_data.get('user_identifier'),
+        'channel': session_data.get('channel'),
         'consentimiento': session_data.get('consentimiento'),
-        'timestamp_consentimiento': session_data.get('timestamp_consentimiento')
+        'timestamp_consentimiento': (
+            session_data['timestamp_consentimiento'].isoformat()
+            if isinstance(session_data.get('timestamp_consentimiento'), datetime)
+            else None
+        ),
+        'estado_sesion': session_data.get('estado_sesion'),
+        'created_at': (
+            session_data['created_at'].isoformat()
+            if isinstance(session_data.get('created_at'), datetime)
+            else None
+        ),
+        'last_activity_at': (
+            session_data['last_activity_at'].isoformat()
+            if isinstance(session_data.get('last_activity_at'), datetime)
+            else None
+        ),
+        'closed_at': (
+            session_data['closed_at'].isoformat()
+            if isinstance(session_data.get('closed_at'), datetime)
+            else None
+        ),
+        'close_reason': session_data.get('close_reason'),
+        # La conversación se serializa a JSON string
+        'conversacion': json.dumps(session_data.get('conversation', []), ensure_ascii=False, default=str),
     }
-    logger.info(f"Registro preparado para BigQuery: {record['id_sesion']} con {len(conversation_array)} eventos.")
+    logger.info(f"Registro preparado para BigQuery: {record.get('id_sesion')} con {len(session_data.get('conversation', []))} eventos.")
     return record
 
 
-def _insert_session_to_bigquery_direct(session_record: Dict[str, Any]) -> bool:
+def _insert_session_to_bigquery(session_record: Dict[str, Any]) -> bool:
     """
-    Carga datos directamente usando load_table_from_json sin un búfer de streaming.
+    Carga datos de sesión directamente usando `load_table_from_json` a la tabla de historial.
+    Reutiliza la función centralizada de `bigquery_pip`.
     """
-    if bigquery_client is None:
-        logger.error("Cliente de BigQuery no inicializado.")
-        return False
-
     try:
-        job_config = bigquery.LoadJobConfig(
-            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-            autodetect=False,
-            create_disposition=bigquery.CreateDisposition.CREATE_NEVER
-        )
-
-        job = bigquery_client.load_table_from_json(
-            json_rows=[session_record],
-            destination=BIGQUERY_TABLE_REFERENCE,
-            job_config=job_config
-        )
-        job.result()
-
-        if job.errors:
-            logger.error(f"Errores en la carga directa: {job.errors}")
-            return False
-
-        logger.info(f"Sesión {session_record['id_sesion']} insertada SIN BÚFER usando load_table_from_json.")
+        load_table_from_json_direct([session_record], BIGQUERY_TABLE_REFERENCE)
+        logger.info(f"Sesión {session_record['id_sesion']} insertada en BigQuery (historial).")
         return True
-
-    except GoogleAPIError as e:
-        logger.error(f"Error de la API de BigQuery: {e}")
+    except BigQueryServiceError as e:
+        logger.error(f"Error al insertar sesión en BigQuery (historial): {e}")
         return False
     except Exception as e:
-        logger.error(f"Error inesperado en BigQuery: {e}")
+        logger.error(f"Error inesperado al insertar sesión en BigQuery (historial): {e}")
         return False
 
 
@@ -154,10 +161,9 @@ def _delete_session_from_firestore(session_id: str) -> bool:
 
 def _check_if_session_exists_in_bigquery(session_id: str) -> bool:
     """
-    Verifica si la sesión ya existe en BigQuery para evitar duplicados.
+    Verifica si la sesión ya existe en la tabla de historial de BigQuery para evitar duplicados.
     """
-    if bigquery_client is None:
-        return False
+    client = get_bigquery_client() # Obtener el cliente centralizado
 
     try:
         query = f"""
@@ -169,28 +175,30 @@ def _check_if_session_exists_in_bigquery(session_id: str) -> bool:
         job_config = bigquery.QueryJobConfig(
             query_parameters=[bigquery.ScalarQueryParameter("session_id", "STRING", session_id)]
         )
-        results = bigquery_client.query(query, job_config=job_config).result()
+        results = client.query(query, job_config=job_config).result()
 
         for row in results:
             exists = row.count > 0
             if exists:
-                logger.info(f"Sesión {session_id} YA existe en BigQuery.")
+                logger.info(f"Sesión {session_id} YA existe en BigQuery (historial).")
             return exists
         return False
 
     except Exception as e:
-        logger.warning(f"Error al verificar la existencia de la sesión {session_id}: {e}")
+        logger.warning(f"Error al verificar la existencia de la sesión {session_id} en BigQuery: {e}")
         return False
 
 
 @functions_framework.cloud_event
 def migrate_session_to_bigquery(cloud_event: Any) -> None:
     """
-    Función de Cloud para migrar datos de sesión a BigQuery sin búfer de streaming usando load_table_from_json.
+    Función de Cloud para migrar datos de sesión de Firestore a BigQuery.
+    Se activa por cambios en documentos de la colección 'sesiones_activas' de Firestore.
+    Solo migra sesiones cuyo estado es 'cerrado'.
     """
-    logger.info("Iniciando la migración DIRECTA de la sesión a BigQuery.")
+    logger.info("Iniciando la migración de la sesión a BigQuery.")
 
-    if bigquery_client is None or firestore_client is None:
+    if firestore_client is None or get_bigquery_client() is None: # Asegurar que ambos clientes estén disponibles
         logger.critical("Clientes de Google Cloud no inicializados, abortando.")
         return
 
@@ -204,27 +212,29 @@ def migrate_session_to_bigquery(cloud_event: Any) -> None:
         logger.error("No se pudo extraer el session_id del evento.")
         return
 
+    # Verificar si la sesión ya fue migrada antes de intentar obtenerla de Firestore
     if _check_if_session_exists_in_bigquery(session_id):
-        logger.info(f"Sesión {session_id} ya migrada, eliminando de Firestore.")
+        logger.info(f"Sesión {session_id} ya migrada, procediendo a eliminar de Firestore si existe.")
         _delete_session_from_firestore(session_id)
         return
 
     session_data = _get_session_data_from_firestore(session_id)
     if not session_data:
-        logger.warning(f"No hay datos para la sesión {session_id}, eliminando el documento si existe.")
+        logger.warning(f"No hay datos para la sesión {session_id} en Firestore. Podría haber sido eliminada ya.")
+        # Intentar eliminar de Firestore si el documento no existe pero el evento llegó
         _delete_session_from_firestore(session_id)
         return
 
     if session_data.get("estado_sesion") != "cerrado":
-        logger.info(f"La sesión {session_id} no está cerrada, no se migrará ahora.")
+        logger.info(f"La sesión {session_id} no está cerrada ('{session_data.get('estado_sesion')}'). No se migrará ahora.")
         return
 
     logger.info(f"Procesando sesión cerrada: {session_id}.")
 
     session_record = _prepare_session_for_bigquery(session_data)
 
-    if _insert_session_to_bigquery_direct(session_record):
+    if _insert_session_to_bigquery(session_record):
         _delete_session_from_firestore(session_id)
-        logger.info(f"Migración SIN BÚFER completa: {session_id} → BigQuery.")
+        logger.info(f"Migración completa: Sesión {session_id} → BigQuery (historial).")
     else:
-        logger.error(f"La migración de {session_id} falló, se mantiene en Firestore.")
+        logger.error(f"La migración de {session_id} falló, se mantiene en Firestore para reintento manual o automático.")

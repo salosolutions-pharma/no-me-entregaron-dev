@@ -3,21 +3,23 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Union, Optional
+from typing import Any, Dict, List, Union, Optional
 from contextlib import suppress
 
 from dotenv import load_dotenv
-load_dotenv()
 
 from motor_eps.parser import EPSParser, EPSParserError
 from llm_core import LLMCore
 from manual_instrucciones.prompt_manager import prompt_manager
 from .cloud_storage_pip import upload_image_to_bucket, CloudStorageServiceError
-from .bigquery_pip import insert_or_update_patient_data
+from .bigquery_pip import insert_or_update_patient_data # Solo necesitamos esta función de escritura
 
+# Configuración de Logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+# Las variables de entorno son cargadas por el punto de entrada principal (ej. telegram_c.py)
+# Removido: load_dotenv()
 
 class PIPProcessorError(RuntimeError):
     """Excepción base para errores en PIPProcessor."""
@@ -25,11 +27,54 @@ class PIPProcessorError(RuntimeError):
 
 class PIPProcessor:
     """
-    Procesa imágenes de recetas médicas utilizando prompts dinámicos de BigQuery:
-    - Extrae datos utilizando LLM y prompts dinámicos de manual_instrucciones.
-    - Sube imágenes a Cloud Storage.
-    - Prepara y almacena datos en la tabla de pacientes de BigQuery.
+    Procesa imágenes de recetas médicas utilizando LLMs, sube imágenes
+    a Cloud Storage y almacena los datos en BigQuery.
     """
+
+    # Mensajes de error estandarizados para el usuario
+    ERROR_MESSAGES = {
+        "pip_prompt_not_found": "No se encontró el prompt para procesar la fórmula médica. Por favor, contacta con soporte.",
+        "invalid_prescription": "Por favor, envía una foto de una fórmula médica válida y legible para poder procesarla correctamente.",
+        "json_extraction_failed": "No pude extraer la información de tu fórmula correctamente. ¿Podrías enviar una foto más clara?",
+        "json_parse_failed": "Hubo un problema al entender la información de tu fórmula. ¿Podrías enviarla de nuevo?",
+        "extraction_error": "No pude extraer la información de tu fórmula. Asegúrate de que sea una imagen clara y legible.",
+        "no_data_extracted": "No pude encontrar los datos principales en tu fórmula. ¿Es una receta médica válida?",
+        "invalid_patient_data": "La fórmula médica no contiene datos esenciales del paciente (documento, nombre o medicamentos). Por favor verifica que sea una receta válida.",
+        "cloud_upload_error": "No se pudo guardar la imagen en la nube. Por favor, inténtalo de nuevo más tarde.",
+        "bigquery_save_error": "No se pudo guardar la información en nuestra base de datos. Inténtalo de nuevo.",
+        "unexpected_error": "Ocurrió un error inesperado al procesar tu fórmula. Por favor, inténtalo de nuevo.",
+    }
+
+    # Palabras clave para clasificación de riesgo
+    RISK_KEYWORDS = {
+        "vital": [
+            "cancer", "tumor", "oncolog", "quimio", "radio", "metasta",
+            "infarto", "cardiaco", "coronar", "angin", "arritmi",
+            "diabetes", "diabetic", "insulin", "glucos",
+            "hipertens", "presion", "antihipertens",
+            "renal", "dialisi", "trasplant", "riñon",
+            "hepatic", "higado", "cirros", "hepatit",
+            "respirator", "asma", "epoc", "pulmon", "bronc",
+            "neurologic", "epilep", "convuls", "parkins", "alzheim",
+            "psiquiatr", "antidepres", "antipsicoticos", "litio",
+        ],
+        "priorizado": [
+            "pediatr", "niño", "infant", "adolescent",
+            "embaraz", "gestant", "matern", "prenatal",
+            "adult mayor", "geriatr", "ancian",
+            "cronic", "chronic", "permanente", "vida",
+            "dolor", "analges", "morfin", "opioi",
+            "antibiot", "infeccion", "sepsi", "bacteri",
+        ],
+    }
+
+    # Mapeo de tipos de documento
+    DOCUMENT_TYPES_MAP = {
+        "cc": "CC", "cedula": "CC", "cédula": "CC",
+        "ti": "TI", "tarjetaidentidad": "TI",
+        "ce": "CE", "cedulaextranjeria": "CE",
+        "pp": "PP", "pasaporte": "PP",
+    }
 
     def __init__(self, bucket_name: Optional[str] = None):
         self.bucket_name = bucket_name or os.getenv("BUCKET_PRESCRIPCIONES", "")
@@ -38,13 +83,12 @@ class PIPProcessor:
             raise PIPProcessorError("BUCKET_PRESCRIPCIONES no configurado.")
 
         self.llm_core = LLMCore()
-
+        self.eps_parser: Optional[EPSParser] = None
         try:
             self.eps_parser = EPSParser()
             logger.info("EPSParser inicializado correctamente.")
         except EPSParserError as e:
-            logger.warning(f"No se pudo inicializar EPSParser: {e}")
-            self.eps_parser = None
+            logger.warning(f"No se pudo inicializar EPSParser: {e}. La estandarización de EPS no estará disponible.")
 
         if prompt_manager is None:
             logger.critical("PromptManager no disponible en PIPProcessor.")
@@ -52,152 +96,160 @@ class PIPProcessor:
 
     def process_image(self, image_path: Union[str, Path], session_id: str) -> Union[str, Dict[str, Any]]:
         """
-        Procesa una imagen de receta médica utilizando prompts dinámicos de BigQuery.
+        Procesa una imagen de receta médica de principio a fin, retornando los datos extraídos
+        o un mensaje de error.
 
         Args:
-            image_path (Union[str, Path]): Ruta al archivo de imagen.
-            session_id (str): El ID de la sesión de usuario actual.
+            image_path: La ruta del archivo de la imagen a procesar.
+            session_id: El ID de la sesión actual.
 
         Returns:
-            Union[str, Dict[str, Any]]: Un diccionario con los datos extraídos y procesados
-                                        o un mensaje de error en cadena.
+            Un diccionario con los datos extraídos y flags de procesamiento,
+            o un string con un mensaje de error si el procesamiento falla.
         """
+        temp_image_path: Path = Path(image_path) if isinstance(image_path, str) else image_path
         try:
             prompt_content = prompt_manager.get_prompt_by_keyword("PIP")
             if not prompt_content:
                 return self._get_error_message("pip_prompt_not_found")
 
-            logger.info(f"Procesando imagen {image_path} para la sesión {session_id}...")
-            llm_response = self.llm_core.ask_image(prompt_content, image_path)
-            logger.debug(f"Respuesta del LLM: {llm_response[:300]}")
+            logger.info(f"Procesando imagen {temp_image_path.name} para la sesión {session_id}...")
+            llm_response = self.llm_core.ask_image(prompt_content, str(temp_image_path))
+            logger.debug(f"Respuesta inicial del LLM (primeros 300 chars): {llm_response[:300]}")
 
             if self._is_invalid_prescription(llm_response):
                 return self._get_error_message("invalid_prescription")
 
-            json_text = self._extract_json_from_response(llm_response)
-            if not json_text or json_text == "{}":
-                logger.error("No se pudo extraer JSON válido de la respuesta del LLM.")
-                return self._get_error_message("json_extraction_failed")
+            parsed_data = self._parse_llm_response(llm_response)
+            if isinstance(parsed_data, str):  # Es un mensaje de error
+                return parsed_data
 
-            try:
-                parsed_response = json.loads(json_text)
-            except json.JSONDecodeError as e:
-                logger.error(f"Fallo al parsear JSON: {e}")
-                return self._get_error_message("json_parse_failed")
-
-            if "error" in parsed_response:
-                logger.error(f"Error de JSON del LLM: {parsed_response['error']}")
-                return self._get_error_message("extraction_error")
-
-            raw_data = parsed_response.get("datos")
-            if not raw_data:
-                logger.error("El campo 'datos' no se encontró en la respuesta del LLM.")
-                return self._get_error_message("no_data_extracted")
-
-            cleaned_data = self._clean_and_format_data(raw_data)
+            # Limpiar y formatear datos
+            cleaned_data = self._clean_and_format_data(parsed_data.get("datos", {}))
 
             if not self._validate_patient_data(cleaned_data):
                 return self._get_error_message("invalid_patient_data")
 
             patient_key = self._generate_patient_key(cleaned_data, session_id)
+            cleaned_data["patient_key"] = patient_key
+            cleaned_data["session_id"] = session_id
+
+            # Subir imagen a Cloud Storage
             try:
-                image_url = upload_image_to_bucket(self.bucket_name, image_path, patient_key, prefix="prescripciones")
+                image_url = upload_image_to_bucket(self.bucket_name, temp_image_path, patient_key, prefix="prescripciones")
                 cleaned_data["url_prescripcion_subida"] = image_url
             except CloudStorageServiceError as e:
-                logger.error(f"Error al subir a la nube: {e}")
+                logger.error(f"Error al subir imagen a Cloud Storage: {e}")
                 return self._get_error_message("cloud_upload_error")
 
-            if self.eps_parser and cleaned_data.get("eps"):
-                eps_result = self.eps_parser.parse_eps_name(cleaned_data["eps"])
-                cleaned_data["eps_cruda"] = eps_result["original_name"]
-                cleaned_data["eps_estandarizada"] = eps_result["standardized_entity"]
+            # Procesar EPS si el parser está disponible
+            self._process_eps(cleaned_data)
 
+            # Clasificar riesgo
+            cleaned_data["categoria_riesgo"] = self._classify_risk(cleaned_data)
+
+            # Determinar canal de contacto (por defecto Telegram si no se especifica)
+            cleaned_data["canal_contacto"] = cleaned_data.get("canal_contacto", "TL")
+
+            # Preparar y guardar en BigQuery
             bigquery_data = self._prepare_data_for_bigquery(cleaned_data, session_id, patient_key)
-
             try:
+                # `insert_or_update_patient_data` de bigquery_pip.py ya maneja el upsert completo
                 insert_or_update_patient_data(bigquery_data)
-                logger.info(f"Datos del paciente guardados correctamente para la clave: {patient_key}")
+                logger.info(f"Datos del paciente guardados/actualizados en BigQuery para clave: {patient_key}")
             except Exception as e:
-                logger.error(f"Error al guardar en BigQuery: {e}")
+                logger.error(f"Error al guardar datos en BigQuery: {e}")
                 return self._get_error_message("bigquery_save_error")
 
-            missing_fields = self._detect_missing_fields(cleaned_data)
-            cleaned_data["_requires_completion"] = bool(missing_fields)
-            cleaned_data["_missing_fields"] = missing_fields
+            # Añadir flags para el flujo del bot
+            cleaned_data["_requires_medication_selection"] = bool(cleaned_data.get("medicamentos"))
+            cleaned_data["_missing_fields"] = self._detect_missing_fields(cleaned_data)
+            cleaned_data["_requires_completion"] = bool(cleaned_data["_missing_fields"])
 
             logger.info("Procesamiento de receta médica completado correctamente.")
             return cleaned_data
 
         except Exception as e:
-            logger.error(f"Error inesperado: {e}")
+            logger.exception(f"Error inesperado durante el procesamiento de la imagen: {e}")
             return self._get_error_message("unexpected_error")
         finally:
-            if isinstance(image_path, Path) and image_path.exists():
+            # Asegurarse de que el archivo temporal se elimine
+            if temp_image_path and temp_image_path.exists():
                 with suppress(OSError):
-                    image_path.unlink()
+                    temp_image_path.unlink()
 
     def _get_error_message(self, error_type: str) -> str:
-        """
-        Obtiene mensajes de error utilizando fallbacks predefinidos.
-        """
-        error_prompts = {
-            "pip_prompt_not_found": "No se encontró el prompt para procesar la fórmula médica.",
-            "invalid_prescription": "Por favor, envía una foto de una fórmula médica válida y legible para poder procesarla correctamente.",
-            "json_extraction_failed": "No pude extraer la información de tu fórmula correctamente. ¿Podrías enviar una foto más clara?",
-            "json_parse_failed": "No pude extraer la información de tu fórmula correctamente. ¿Podrías enviar una foto más clara?",
-            "extraction_error": "No pude extraer la información de tu fórmula correctamente. ¿Podrías enviar una foto más clara?",
-            "no_data_extracted": "No pude extraer la información de tu fórmula correctamente. ¿Podrías enviar una foto más clara?",
-            "invalid_patient_data": "La fórmula médica no contiene datos válidos del paciente. Por favor verifica que sea una receta médica válida.",
-            "cloud_upload_error": "Error al subir la imagen. Por favor, inténtalo de nuevo.",
-            "bigquery_save_error": "Error al guardar la información. Por favor, inténtalo de nuevo.",
-            "unexpected_error": "Error inesperado procesando la fórmula. Por favor, inténtalo de nuevo."
-        }
-        return error_prompts.get(error_type, "Error procesando la fórmula médica.")
+        """Retorna un mensaje de error estandarizado para el usuario."""
+        return self.ERROR_MESSAGES.get(error_type, self.ERROR_MESSAGES["unexpected_error"])
 
     def _is_invalid_prescription(self, llm_response: str) -> bool:
-        """
-        Verifica si la respuesta del LLM indica que no es una receta médica válida.
-        """
+        """Verifica si la respuesta del LLM sugiere que la imagen no es una receta válida."""
         invalid_indicators = [
             "no contiene una fórmula médica válida", "no es una fórmula médica",
-            "imagen no válida", "no se puede procesar", "error", "invalid", "not a prescription"
+            "imagen no válida", "no se puede procesar", "error", "invalid", "not a prescription",
+            "no se encontraron datos"
         ]
         return any(indicator in llm_response.lower() for indicator in invalid_indicators)
 
     def _extract_json_from_response(self, text: str) -> str:
-        """
-        Extrae una cadena JSON de un texto dado, buscando patrones comunes.
-        """
-        code_fence_patterns = [
+        """Extrae una cadena JSON de un texto dado, buscando patrones comunes."""
+        patterns = [
             re.compile(r"```json\s*(\{.*?\})\s*```", re.S | re.I),
             re.compile(r"```(?:\w+)?\s*(\{.*?\})\s*```", re.S),
             re.compile(r"`(\{.*?\})`", re.S),
         ]
-
-        for pattern in code_fence_patterns:
+        for pattern in patterns:
             match = pattern.search(text)
             if match:
                 return match.group(1).strip()
 
+        # Fallback para JSON sin delimitadores de código
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
-            return text[start:end + 1].strip()
+            return text[start : end + 1].strip()
 
         logger.warning("No se encontró JSON válido en la respuesta del LLM.")
         return ""
 
+    def _parse_llm_response(self, llm_response: str) -> Union[Dict[str, Any], str]:
+        """Extrae y parsea el JSON de la respuesta del LLM."""
+        json_text = self._extract_json_from_response(llm_response)
+        if not json_text:
+            return self._get_error_message("json_extraction_failed")
+
+        try:
+            parsed_response = json.loads(json_text)
+        except json.JSONDecodeError as e:
+            logger.error(f"Fallo al parsear JSON de la respuesta del LLM: {e}. Texto JSON: {json_text[:200]}...")
+            return self._get_error_message("json_parse_failed")
+
+        if "error" in parsed_response:
+            logger.error(f"El LLM reportó un error: {parsed_response['error']}")
+            return self._get_error_message("extraction_error")
+
+        if not parsed_response.get("datos"):
+            logger.warning("El campo 'datos' no se encontró o está vacío en la respuesta parseada del LLM.")
+            return self._get_error_message("no_data_extracted")
+
+        return parsed_response
+
     def _clean_and_format_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Limpia y formatea recursivamente los valores de cadena en un diccionario."""
-        def clean_text(value: Any) -> Any:
+        cleaned = {}
+        for key, value in data.items():
             if isinstance(value, str):
-                return value.strip()
-            if isinstance(value, dict):
-                return {k: clean_text(v) for k, v in value.items()}
-            if isinstance(value, list):
-                return [clean_text(item) for item in value]
-            return value
-        return clean_text(data)
+                cleaned[key] = value.strip()
+            elif isinstance(value, dict):
+                cleaned[key] = self._clean_and_format_data(value)
+            elif isinstance(value, list):
+                cleaned[key] = [
+                    self._clean_and_format_data(item) if isinstance(item, dict) else (item.strip() if isinstance(item, str) else item)
+                    for item in value
+                ]
+            else:
+                cleaned[key] = value
+        return cleaned
 
     def _validate_patient_data(self, data: Dict[str, Any]) -> bool:
         """Valida si los datos esenciales del paciente están presentes."""
@@ -207,78 +259,106 @@ class PIPProcessor:
         return has_document and has_patient_name and has_medications
 
     def _generate_patient_key(self, data: Dict[str, Any], session_id: str) -> str:
-        """Genera una clave única para el paciente basándose en los datos disponibles."""
-        tipo = data.get("tipo_documento", "").upper()
-        numero = str(data.get("numero_documento", "")).strip()
+        """Genera una clave única para el paciente."""
+        doc_type = data.get("tipo_documento", "").upper().replace(".", "").replace(" ", "")
+        doc_number = str(data.get("numero_documento", "")).strip()
 
-        if tipo and numero:
-            tipo_clean = tipo.replace(".", "").replace(" ", "")
-            if tipo_clean in ["CC", "CEDULA", "CÉDULA"]:
-                tipo_clean = "CC"
-            elif tipo_clean in ["TI", "TARJETAIDENTIDAD"]:
-                tipo_clean = "TI"
-            elif tipo_clean in ["CE", "CEDULAEXTRANJERIA"]:
-                tipo_clean = "CE"
-            elif tipo_clean in ["PP", "PASAPORTE"]:
-                tipo_clean = "PP"
-            return f"CO{tipo_clean}{numero}"
+        standardized_doc_type = self.DOCUMENT_TYPES_MAP.get(doc_type, doc_type)
+
+        if standardized_doc_type and doc_number:
+            return f"CO{standardized_doc_type}{doc_number}"
         return f"UNKN_{session_id}"
 
+    def _process_eps(self, data: Dict[str, Any]) -> None:
+        """Procesa y estandariza la EPS si el parser está disponible."""
+        if self.eps_parser and data.get("eps"):
+            try:
+                eps_result = self.eps_parser.parse_eps_name(data["eps"])
+                data["eps_cruda"] = eps_result["original_name"]
+                data["eps_estandarizada"] = eps_result["standardized_entity"]
+            except EPSParserError as e:
+                logger.warning(f"Error al parsear EPS '{data['eps']}': {e}. Se guardará la EPS cruda.")
+                data["eps_cruda"] = data["eps"]
+                data["eps_estandarizada"] = None
+        elif data.get("eps"):
+            data["eps_cruda"] = data["eps"]
+            data["eps_estandarizada"] = None
+        else:
+            data["eps_cruda"] = None
+            data["eps_estandarizada"] = None
+
     def _prepare_data_for_bigquery(self, data: Dict[str, Any], session_id: str, patient_key: str) -> Dict[str, Any]:
-        """
-        Prepara los datos en el formato correcto para la tabla de pacientes de BigQuery.
-        """
-        medications = []
-        for med in data.get("medicamentos", []):
-            if isinstance(med, dict):
-                medications.append({
-                    "nombre": str(med.get("nombre", "")).strip(),
-                    "dosis": str(med.get("dosis", "")).strip(),
-                    "cantidad": str(med.get("cantidad", "")).strip(),
-                    "entregado": "pendiente"
+        """Prepara los datos en el formato correcto para la tabla de pacientes de BigQuery."""
+        medications_bq = []
+        for med_raw in data.get("medicamentos", []):
+            if isinstance(med_raw, dict):
+                medications_bq.append({
+                    "nombre": str(med_raw.get("nombre", "")).strip(),
+                    "dosis": str(med_raw.get("dosis", "")).strip(),
+                    "cantidad": str(med_raw.get("cantidad", "")).strip(),
+                    "entregado": "pendiente",  # Valor por defecto
                 })
-            elif isinstance(med, str):
-                medications.append({
-                    "nombre": med.strip(),
+            elif isinstance(med_raw, str): # En caso de que solo venga el nombre como string
+                medications_bq.append({
+                    "nombre": med_raw.strip(),
                     "dosis": "",
                     "cantidad": "",
-                    "entregado": "pendiente"
+                    "entregado": "pendiente",
                 })
 
-        prescription = {
+        prescription_bq = {
             "id_session": session_id,
             "url_prescripcion": data.get("url_prescripcion_subida", ""),
-            "categoria_riesgo": self._classify_risk(data),
+            "categoria_riesgo": data.get("categoria_riesgo", "No clasificado"),
             "fecha_atencion": data.get("fecha_atencion", ""),
             "diagnostico": data.get("diagnostico", ""),
             "IPS": data.get("ips", ""),
-            "medicamentos": medications
+            "medicamentos": medications_bq,
         }
+
+        # Asegurar que los campos de arrays de strings sean listas
+        correo = data.get("correo")
+        telefono_contacto = data.get("telefono_contacto")
+        if isinstance(correo, str):
+            correo = [c.strip() for c in correo.split(',') if c.strip()]
+        if isinstance(telefono_contacto, str):
+            telefono_contacto = [t.strip() for t in telefono_contacto.split(',') if t.strip()]
 
         return {
             "paciente_clave": patient_key,
-            "pais": "CO",
+            "pais": "CO",  # Asumido para este contexto
             "tipo_documento": data.get("tipo_documento", ""),
             "numero_documento": str(data.get("numero_documento", "")),
             "nombre_paciente": data.get("paciente") or data.get("nombre_paciente", ""),
-            "eps_cruda": data.get("eps_cruda", data.get("eps", "")),
-            "eps_estandarizada": data.get("eps_estandarizada"),
-            "prescripciones": [prescription]
+            "fecha_nacimiento": data.get("fecha_nacimiento", ""),
+            "genero": data.get("genero", ""), # Si el LLM extrae genero
+            "correo": correo if isinstance(correo, list) else [],
+            "telefono_contacto": telefono_contacto if isinstance(telefono_contacto, list) else [],
+            "canal_contacto": data.get("canal_contacto", ""),
+            "regimen": data.get("regimen", ""),
+            "ciudad": data.get("ciudad", ""),
+            "direccion": data.get("direccion", ""),
+            "eps_cruda": data.get("eps_cruda", ""),
+            "eps_estandarizada": data.get("eps_estandarizada", ""),
+            "operador_logistico": data.get("operador_logistico", ""),
+            "sede_farmacia": data.get("sede_farmacia", ""),
+            "medicamentos_no_entregados": [], # Se llenará en ClaimManager o se dejará vacío si no aplica
+            "informante": [], # Se llenará en ClaimManager o se dejará vacío si no aplica
+            "prescripciones": [prescription_bq],
         }
 
     def _classify_risk(self, data: Dict[str, Any]) -> str:
-        """
-        Classifica el riesgo basándose en el diagnóstico y los medicamentos, utilizando primero la clasificación del prompt PIP.
-        """
+        """Clasifica el riesgo basándose en el diagnóstico y los medicamentos."""
         existing_risk = data.get("categoria_riesgo")
         if existing_risk:
+            # Si el LLM ya proporcionó una categoría, intentamos normalizarla
             if "vital" in existing_risk.lower():
                 return "Riesgo Vital"
-            elif "priorizado" in existing_risk.lower():
+            if "priorizado" in existing_risk.lower():
                 return "Riesgo Priorizado"
-            elif "simple" in existing_risk.lower():
+            if "simple" in existing_risk.lower():
                 return "Riesgo Simple"
-            return existing_risk
+            return existing_risk  # Retornar tal cual si no coincide con categorías conocidas
 
         diagnostico = data.get("diagnostico", "").lower()
         medicamentos_text = " ".join([
@@ -286,86 +366,84 @@ class PIPProcessor:
             for med in data.get("medicamentos", [])
         ]).lower()
 
-        vital_keywords = [
-            "cancer", "tumor", "oncolog", "quimio", "radio", "metasta",
-            "infarto", "cardiaco", "coronar", "angin", "arritmi",
-            "diabetes", "diabetic", "insulin", "glucos",
-            "hipertens", "presion", "antihipertens",
-            "renal", "dialisi", "trasplant", "riñon",
-            "hepatic", "higado", "cirros", "hepatit",
-            "respirator", "asma", "epoc", "pulmon", "bronc",
-            "neurologic", "epilep", "convuls", "parkins", "alzheim",
-            "psiquiatr", "antidepres", "antipsicoticos", "litio"
-        ]
-
-        priority_keywords = [
-            "pediatr", "niño", "infant", "adolescent",
-            "embaraz", "gestant", "matern", "prenatal",
-            "adult mayor", "geriatr", "ancian",
-            "cronic", "chronic", "permanente", "vida",
-            "dolor", "analges", "morfin", "opioi",
-            "antibiot", "infeccion", "sepsi", "bacteri"
-        ]
-
         combined_text = f"{diagnostico} {medicamentos_text}"
 
-        if any(keyword in combined_text for keyword in vital_keywords):
+        if any(keyword in combined_text for keyword in self.RISK_KEYWORDS["vital"]):
             return "Riesgo Vital"
-        elif any(keyword in combined_text for keyword in priority_keywords):
+        if any(keyword in combined_text for keyword in self.RISK_KEYWORDS["priorizado"]):
             return "Riesgo Priorizado"
         return "Riesgo Simple"
 
     def _detect_missing_fields(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Detecta campos faltantes que podrían necesitar completarse interactivamente.
-        """
+        """Detecta campos que podrían necesitar completarse interactivamente."""
         missing_fields = {}
-        optional_fields = [
+        # Aquí se listan campos que el bot podría querer pedir si no se extrajeron
+        optional_fields_to_check = [
             "fecha_nacimiento", "correo", "telefono_contacto",
-            "canal_contacto", "regimen", "ciudad", "direccion",
+            "regimen", "ciudad", "direccion",
             "operador_logistico", "sede_farmacia"
         ]
-        for field in optional_fields:
-            if not data.get(field):
+        for field in optional_fields_to_check:
+            value = data.get(field)
+            if isinstance(value, list): # Si es una lista, verificar si está vacía o contiene solo elementos vacíos
+                if not any(v and str(v).strip() for v in value):
+                    missing_fields[field] = True
+            elif not value or (isinstance(value, str) and not value.strip()):
                 missing_fields[field] = True
         return missing_fields
 
-    def get_confirmation_message(self, extracted_data: Dict[str, Any]) -> str:
-        """
-        Genera un mensaje de confirmación para los datos extraídos.
-        """
+    def get_medication_selection_message(self, extracted_data: Dict[str, Any]) -> str:
+        """Genera el mensaje completo de confirmación con todos los datos extraídos."""
+
+        # Datos del paciente
         patient_name = extracted_data.get("paciente") or extracted_data.get("nombre_paciente", "")
-        document_info = f"{extracted_data.get('tipo_documento', '')} {extracted_data.get('numero_documento', '')}"
-        
-        # Obtener la lista de medicamentos
+        tipo_doc = extracted_data.get("tipo_documento", "")
+        num_doc = extracted_data.get("numero_documento", "")
+        document_info = f"{tipo_doc} {num_doc}" if tipo_doc and num_doc else "No especificado"
+
+        # EPS
+        eps = extracted_data.get("eps") or extracted_data.get("eps_cruda") or "No especificada"
+
+        # Diagnóstico
+        diagnostico = extracted_data.get("diagnostico", "No especificado")
+
+        # Categoría de riesgo
+        categoria_riesgo = extracted_data.get("categoria_riesgo", "No clasificado")
+
+        # Medicamentos
         medicamentos_list = extracted_data.get("medicamentos", [])
-        
-        # Formatear los medicamentos para la salida
-        if medicamentos_list:
-            # Crea una lista de cadenas, una para cada medicamento, incluyendo dosis si está disponible
-            formatted_meds = []
-            for med in medicamentos_list:
-                if isinstance(med, dict):
-                    med_name = med.get('nombre', 'Desconocido').strip()
-                    med_dosis = med.get('dosis', '').strip()
-                    if med_dosis:
-                        formatted_meds.append(f"- {med_name} ({med_dosis})")
-                    else:
-                        formatted_meds.append(f"- {med_name}")
-                elif isinstance(med, str):
-                    formatted_meds.append(f"- {med.strip()}")
-            
-            medicamentos_display = "\n" + "\n".join(formatted_meds)
+
+        if not medicamentos_list:
+            medicamentos_display = "No se encontraron medicamentos"
         else:
-            medicamentos_display = "Ninguno"
+            formatted_meds = []
+            for i, med in enumerate(medicamentos_list):
+                if isinstance(med, dict):
+                    med_name = med.get("nombre", "Desconocido").strip()
+                    med_dosis = med.get("dosis", "").strip()
+                    med_cantidad = med.get("cantidad", "").strip()
 
-        return f"""✅ He extraído la información de tu fórmula médica:
+                    display_line = f"{i+1}. {med_name}"
+                    if med_dosis:
+                        display_line += f" ({med_dosis})"
+                    if med_cantidad:
+                        display_line += f" - Cantidad: {med_cantidad}"
+                    formatted_meds.append(display_line)
+                elif isinstance(med, str):
+                    formatted_meds.append(f"{i+1}. {med.strip()}")
 
-👤 **Paciente:** {patient_name}
-🆔 **Documento:** {document_info}
-🏥 **EPS:** {extracted_data.get("eps", "No especificada")}
-💊 **Medicamentos:**{medicamentos_display}
-🏥 **Diagnóstico:** {extracted_data.get("diagnostico", "No especificado")}
-⚡ **Categoría de riesgo:** {extracted_data.get("categoria_riesgo", "No clasificado")}
+            medicamentos_display = "\n".join(formatted_meds)
 
-¿Es correcta esta información? Si es así, podemos continuar con tu reclamación."""
+        return f"""✅ **Fórmula procesada correctamente**
+
+    👤 **Paciente:** {patient_name}
+    🆔 **Documento:** {document_info}
+    🏥 **EPS:** {eps}
+    🩺 **Diagnóstico:** {diagnostico}
+    ⚡ **Categoría de riesgo:** {categoria_riesgo}
+
+    💊 **Medicamentos encontrados:**
+    {medicamentos_display}
+
+    🔴 **Por favor, selecciona los medicamentos que NO te han entregado** de la lista anterior.
+    Los medicamentos que NO selecciones se marcarán como ya entregados."""
