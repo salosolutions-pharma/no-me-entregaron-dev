@@ -6,23 +6,19 @@ from session_manager.session_manager import SessionManager
 from llm_core import LLMCore
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 
 class ConsentManager:
-    """
-    Gestiona el flujo de consentimiento y bienvenida usando prompts dinámicos.
-    """
+    """Gestiona el flujo de consentimiento y bienvenida usando prompts dinámicos."""
 
     def __init__(self):
         self.session_manager = SessionManager()
         self.llm_core = LLMCore()
         logger.info("ConsentManager inicializado con LLM Core.")
 
-    def get_bot_response(self, user_message: str = "", session_context: Dict[str, Any] = None) -> str:
-        """
-        Genera la respuesta del bot usando el prompt BYC.
-        """
+    def get_bot_response(self, user_message: str = "", 
+                        session_context: Dict[str, Any] = None) -> str:
+        """Genera la respuesta del bot usando el prompt BYC."""
         try:
             byc_prompt = prompt_manager.get_prompt_by_keyword("BYC")
             if not byc_prompt:
@@ -30,8 +26,11 @@ class ConsentManager:
                 return "Lo siento, hay un problema técnico. Por favor intenta más tarde."
 
             context_info = self._build_session_context(session_context or {})
-
-            farewell_keywords = ["hasta luego", "adiós", "chao", "bye", "gracias", "no necesito nada más", "ya no necesito ayuda"]
+            
+            farewell_keywords = [
+                "hasta luego", "adiós", "chao", "bye", "gracias", 
+                "no necesito nada más", "ya no necesito ayuda"
+            ]
             is_farewell = any(keyword in user_message.lower() for keyword in farewell_keywords)
 
             full_prompt = f"""
@@ -65,9 +64,7 @@ Responde ahora como el asistente "No Me Entregaron":
             return "Disculpa, hubo un error técnico. Por favor intenta nuevamente."
 
     def _build_session_context(self, session_context: Dict[str, Any]) -> str:
-        """
-        Construye una descripción del contexto de la sesión actual para el LLM.
-        """
+        """Construye una descripción del contexto de la sesión actual para el LLM."""
         context_lines = []
 
         if session_context.get("phone_shared"):
@@ -94,12 +91,9 @@ Responde ahora como el asistente "No Me Entregaron":
 
         return "\n".join(context_lines)
 
-    def handle_consent_response(
-        self, user_telegram_id: int, user_identifier_for_session: str, consent_status: str, session_id: str
-    ) -> bool:
-        """
-        Procesa la respuesta de consentimiento.
-        """
+    def handle_consent_response(self, user_telegram_id: int, user_identifier_for_session: str, 
+                               consent_status: str, session_id: str) -> bool:
+        """Procesa la respuesta de consentimiento."""
         try:
             success = self.session_manager.update_consent_for_session(session_id, consent_status)
             if not success:
@@ -109,10 +103,9 @@ Responde ahora como el asistente "No Me Entregaron":
             logger.error(f"Error al actualizar el consentimiento: {e}", exc_info=True)
             return False
 
-    def get_consent_response_message(self, consent_granted: bool, session_context: Dict[str, Any] = None) -> str:
-        """
-        Genera el mensaje de respuesta de consentimiento usando el prompt BYC.
-        """
+    def get_consent_response_message(self, consent_granted: bool, 
+                                   session_context: Dict[str, Any] = None) -> str:
+        """Genera el mensaje de respuesta de consentimiento usando el prompt BYC."""
         context = session_context or {}
         context.update({
             "phone_shared": True,
@@ -121,13 +114,12 @@ Responde ahora como el asistente "No Me Entregaron":
             "prescription_uploaded": False
         })
 
-        user_message = "Sí, autorizo el tratamiento de mis datos" if consent_granted else "No autorizo el tratamiento de mis datos"
+        user_message = ("Sí, autorizo el tratamiento de mis datos" if consent_granted 
+                       else "No autorizo el tratamiento de mis datos")
         return self.get_bot_response(user_message, context)
 
     def should_close_session(self, user_message: str, session_context: Dict[str, Any] = None) -> bool:
-        """
-        Determina si la sesión debe cerrarse basándose en el mensaje del usuario.
-        """
+        """Determina si la sesión debe cerrarse basándose en el mensaje del usuario."""
         farewell_keywords = [
             "hasta luego", "adiós", "chao", "bye", "gracias",
             "no necesito nada más", "ya no necesito ayuda",

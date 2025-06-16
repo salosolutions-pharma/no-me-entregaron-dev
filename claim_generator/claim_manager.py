@@ -1,28 +1,23 @@
 import logging
 import re
-import json
-from datetime import datetime
 from typing import Any, Dict, List, Optional
-from google.cloud import firestore, bigquery
-from google.api_core.exceptions import GoogleAPIError
 
+from google.api_core.exceptions import GoogleAPIError
+from google.cloud import bigquery
 from manual_instrucciones.prompt_manager import prompt_manager
 from llm_core import LLMCore
 from processor_image_prescription.bigquery_pip import (
     get_bigquery_client,
     insert_or_update_patient_data,
     _convert_bq_row_to_dict_recursive,
-    load_table_from_json_direct,
     BigQueryServiceError,
-    update_patient_medications_no_buffer, # Asegurarse de que esta función exista y se use
-    PROJECT_ID, # Utilizado para construir la referencia de la tabla
-    DATASET_ID, # Utilizado para construir la referencia de la tabla
-    TABLE_ID, # Utilizado para construir la referencia de la tabla
+    update_patient_medications_no_buffer,
+    PROJECT_ID,
+    DATASET_ID,
+    TABLE_ID,
 )
 
-# Configuración de Logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 
 class ClaimManagerError(Exception):
@@ -30,15 +25,11 @@ class ClaimManagerError(Exception):
 
 
 class ClaimManager:
-    """
-    Gestiona la recopilación de información adicional para generar una reclamación,
-    consultando y actualizando la tabla de pacientes en BigQuery usando prompts dinámicos.
-    """
+    """Gestiona la recopilación de información adicional para generar una reclamación."""
 
-    # Definición de campos requeridos y su orden de prioridad
     REQUIRED_FIELDS_ORDER = [
         "tipo_documento",
-        "numero_documento",
+        "numero_documento", 
         "nombre_paciente",
         "fecha_nacimiento",
         "correo",
@@ -47,12 +38,11 @@ class ClaimManager:
         "ciudad",
         "direccion",
         "eps_estandarizada",
-        "operador_logistico",
+        "farmacia",
         "sede_farmacia",
         "informante",
     ]
 
-    # Mapeo de nombres de campos técnicos a nombres amigables para el usuario
     FIELD_DISPLAY_NAMES = {
         "tipo_documento": "tipo de documento",
         "numero_documento": "número de documento",
@@ -65,21 +55,9 @@ class ClaimManager:
         "direccion": "dirección de residencia",
         "eps_estandarizada": "EPS",
         "eps_confirmacion": "confirmación de tu EPS",
-        "operador_logistico": "operador logístico o farmacia donde recoges medicamentos",
+        "farmacia": "farmacia donde recoges medicamentos",
         "sede_farmacia": "sede o punto de entrega específico",
         "informante": "información sobre quién está haciendo esta solicitud",
-    }
-
-    OPERATOR_STANDARDIZATION_MAP = {
-        "audifarma": "Audifarma",
-        "cruz verde": "Cruz Verde",
-        "copidrogas": "Copidrogas",
-        "colsubsidio": "Colsubsidio",
-        "farmacia de la eps": "Farmacia de la EPS",
-        "no sé": "No especificado",
-        "no se": "No especificado",
-        "mi eps": "EPS directamente",
-        "eps directamente": "EPS directamente",
     }
 
     PHARMACY_STANDARDIZATION_MAP = {
@@ -95,7 +73,7 @@ class ClaimManager:
         try:
             self.bq_client = get_bigquery_client()
             if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
-                raise ValueError("Variables de entorno de BigQuery (PROJECT_ID, DATASET_ID, TABLE_ID) no configuradas.")
+                raise ValueError("Variables de entorno de BigQuery no configuradas.")
             self.table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
             self.llm_core = LLMCore()
             logger.info("ClaimManager inicializado con conexión a BigQuery y LLM Core.")
@@ -129,10 +107,7 @@ class ClaimManager:
             raise ClaimManagerError(f"Error inesperado al obtener datos del paciente: {e}") from e
 
     def get_next_missing_field_prompt(self, patient_key: str) -> Dict[str, Optional[str]]:
-        """
-        Genera dinámicamente un prompt para el siguiente campo faltante usando el LLM Core
-        y el prompt CLAIM de manual_instrucciones.
-        """
+        """Genera dinámicamente un prompt para el siguiente campo faltante usando el LLM Core."""
         try:
             patient_record = self._get_patient_data(patient_key)
             if not patient_record:
@@ -148,16 +123,16 @@ class ClaimManager:
                 value = patient_record.get(field)
 
                 if field == "informante":
-                    # El campo 'informante' en BigQuery es una lista de structs
-                    if isinstance(value, list) and value and value[0].get("nombre") and value[0].get("parentesco"):
+                    if (isinstance(value, list) and value and 
+                        value[0].get("nombre") and value[0].get("parentesco")):
                         parentesco = value[0]["parentesco"]
-                        display_text = "Paciente" if parentesco == "Mismo paciente" else f"{value[0]['nombre']} ({parentesco})"
+                        display_text = ("Paciente" if parentesco == "Mismo paciente" 
+                                      else f"{value[0]['nombre']} ({parentesco})")
                         datos_confirmados.append(f"- Informante: {display_text}")
                     else:
                         campo_faltante = "informante"
                         break
                 elif field in ["correo", "telefono_contacto"]:
-                    # Campos que son arrays de strings
                     if isinstance(value, list) and any(v and str(v).strip() for v in value):
                         datos_confirmados.append(
                             f"- {self._get_field_display_name(field)}: {', '.join(str(v) for v in value if v and str(v).strip())}"
@@ -171,12 +146,11 @@ class ClaimManager:
                     else:
                         eps_cruda = patient_record.get("eps_cruda")
                         if eps_cruda and str(eps_cruda).strip():
-                            campo_faltante = "eps_confirmacion"  # Preguntar al usuario si esta es su EPS
+                            campo_faltante = "eps_confirmacion"
                         else:
-                            campo_faltante = "eps_estandarizada"  # Pedir directamente la EPS
+                            campo_faltante = "eps_estandarizada"
                         break
                 elif value and str(value).strip():
-                    # Campo tiene valor válido
                     datos_confirmados.append(f"- {self._get_field_display_name(field)}: {value}")
                 else:
                     campo_faltante = field
@@ -224,18 +198,13 @@ class ClaimManager:
         return self.FIELD_DISPLAY_NAMES.get(field_name, field_name.replace("_", " "))
 
     def update_patient_field(self, patient_key: str, field_name: str, value: Any) -> bool:
-        """
-        Actualiza un campo específico del paciente en BigQuery.
-        Utiliza `insert_or_update_patient_data` que maneja el upsert (DELETE + INSERT) completo.
-        """
+        """Actualiza un campo específico del paciente en BigQuery."""
         try:
-            # Normaliza el valor antes de enviarlo a BigQuery
             normalized_value = self._normalize_field_value(field_name, value)
             update_data = {field_name: normalized_value}
 
-            # La función insert_or_update_patient_data manejará la lógica de upsert
             insert_or_update_patient_data(
-                patient_data={"paciente_clave": patient_key}, # Se necesita paciente_clave para el lookup
+                patient_data={"paciente_clave": patient_key},
                 fields_to_update=update_data,
             )
             logger.info(f"Campo '{field_name}' del paciente '{patient_key}' actualizado.")
@@ -247,35 +216,28 @@ class ClaimManager:
             logger.exception(f"Error inesperado al actualizar campo '{field_name}' para paciente '{patient_key}'.")
             raise ClaimManagerError(f"Error inesperado al actualizar campo: {e}") from e
 
-    def update_undelivered_medicines(self, patient_key: str, session_id: str, undelivered_med_names: List[str]) -> bool:
-        """
-        Actualiza el estado 'entregado' de los medicamentos en la estructura de prescripciones
-        delegando la lógica a `bigquery_pip.update_patient_medications_no_buffer`.
-        """
+    def update_undelivered_medicines(self, patient_key: str, session_id: str, 
+                                   undelivered_med_names: List[str]) -> bool:
+        """Actualiza el estado 'entregado' de los medicamentos en la estructura de prescripciones."""
         try:
             success = update_patient_medications_no_buffer(patient_key, session_id, undelivered_med_names)
             if success:
-                logger.info(f"Medicamentos actualizados para paciente '{patient_key}' en sesión '{session_id}' a través de `bigquery_pip`.")
+                logger.info(f"Medicamentos actualizados para paciente '{patient_key}' en sesión '{session_id}'.")
             return success
         except Exception as e:
-            logger.error(f"Error al delegar la actualización de medicamentos a `bigquery_pip`: {e}", exc_info=True)
+            logger.error(f"Error al delegar la actualización de medicamentos: {e}", exc_info=True)
             return False
 
     def _normalize_date(self, date_input: Any) -> Optional[str]:
-        """
-        Normaliza fechas usando IA para interpretar el formato del usuario.
-        Convierte cualquier formato de fecha a YYYY-MM-DD para BigQuery.
-        """
+        """Normaliza fechas usando IA para interpretar el formato del usuario."""
         if not date_input:
             return None
 
         date_str = str(date_input).strip()
 
-        # Si ya está en formato correcto YYYY-MM-DD, devolverlo directamente
         if re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
             return date_str
 
-        # Usar IA para interpretar la fecha
         date_normalization_prompt = f"""
 Necesito que normalices esta fecha de nacimiento a formato YYYY-MM-DD para una base de datos.
 
@@ -301,15 +263,13 @@ Respuesta:"""
             ai_response = self.llm_core.ask_text(date_normalization_prompt)
             normalized_date = ai_response.strip().strip('"\'')
 
-            # Validar que la respuesta de la IA sea correcta
             if normalized_date == "INVALID":
                 logger.error(f"IA no pudo normalizar la fecha: '{date_str}'")
                 return None
 
-            # Verificar que el formato sea correcto
             if re.match(r'^\d{4}-\d{2}-\d{2}$', normalized_date):
-                # Validar que sea una fecha real
                 try:
+                    from datetime import datetime
                     datetime.strptime(normalized_date, '%Y-%m-%d')
                     logger.info(f"Fecha normalizada por IA: '{date_str}' → '{normalized_date}'")
                     return normalized_date
@@ -322,18 +282,16 @@ Respuesta:"""
 
         except Exception as e:
             logger.error(f"Error usando IA para normalizar fecha '{date_str}': {e}")
-            # Fallback a normalización manual básica
             return self._fallback_date_normalization(date_str)
 
     def _fallback_date_normalization(self, date_str: str) -> Optional[str]:
-        """
-        Normalización manual básica como fallback si la IA falla.
-        """
-        # Intentar parsear diferentes formatos comunes
+        """Normalización manual básica como fallback si la IA falla."""
+        from datetime import datetime
+        
         date_patterns = [
-            (r'^(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})$', '%d/%m/%Y'),  # DD/MM/YYYY o DD-MM-YYYY
-            (r'^(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})$', '%Y/%m/%d'),  # YYYY/MM/DD o YYYY-MM-DD
-            (r'^(\d{1,2})[/\-](\d{1,2})[/\-](\d{2})$', '%d/%m/%y'),  # DD/MM/YY o DD-MM-YY
+            (r'^(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})$', '%d/%m/%Y'),
+            (r'^(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})$', '%Y/%m/%d'),
+            (r'^(\d{1,2})[/\-](\d{1,2})[/\-](\d{2})$', '%d/%m/%y'),
         ]
 
         for pattern, format_str in date_patterns:
@@ -341,19 +299,16 @@ Respuesta:"""
             if match:
                 try:
                     if format_str in ['%d/%m/%Y', '%d/%m/%y']:
-                        # Para DD/MM/YYYY, reorganizar a YYYY-MM-DD
                         if format_str == '%d/%m/%Y':
                             day, month, year = match.groups()
-                        else:  # %d/%m/%y
+                        else:
                             day, month, year_short = match.groups()
                             year = f"20{year_short}" if int(year_short) < 50 else f"19{year_short}"
 
-                        # Validar que la fecha sea válida
                         parsed_date = datetime(int(year), int(month), int(day))
                         return parsed_date.strftime('%Y-%m-%d')
 
                     else:
-                        # Para otros formatos
                         parsed_date = datetime.strptime(date_str, format_str)
                         return parsed_date.strftime('%Y-%m-%d')
 
@@ -361,35 +316,25 @@ Respuesta:"""
                     logger.warning(f"Error parseando fecha '{date_str}' con formato '{format_str}': {e}")
                     continue
 
-        # Si no se pudo parsear
-        logger.error(f"No se pudo normalizar la fecha: '{date_str}'. Formatos aceptados: DD/MM/YYYY, YYYY-MM-DD")
+        logger.error(f"No se pudo normalizar la fecha: '{date_str}'.")
         return None
 
     def _normalize_field_value(self, field_name: str, value: Any) -> Any:
         """Normaliza el valor de un campo según su tipo y el contexto del bot."""
-
         if value is None:
             return None
 
-        # Manejo especial para fechas con IA
         if field_name == "fecha_nacimiento":
             return self._normalize_date(value)
 
-        # Campos de texto simple que siempre deben ser string
         simple_string_fields = [
-            "tipo_documento",
-            "numero_documento",
-            "nombre_paciente",
-            "regimen",
-            "ciudad",
-            "direccion",
-            "eps_estandarizada",
-            "canal_contacto",
+            "tipo_documento", "numero_documento", "nombre_paciente",
+            "regimen", "ciudad", "direccion", "eps_estandarizada",
+            "canal_contacto", "farmacia",
         ]
         if field_name in simple_string_fields:
             return str(value).strip()
 
-        # Campos que son arrays de strings (ej. correo, telefono)
         if field_name in ["correo", "telefono_contacto"]:
             if isinstance(value, str):
                 return [item.strip() for item in value.split(",") if item.strip()]
@@ -397,23 +342,16 @@ Respuesta:"""
                 return [str(item).strip() for item in value if str(item).strip()]
             return []
 
-        # Campo informante: se espera una lista de diccionarios (struct)
         if field_name == "informante":
             if isinstance(value, list) and all(isinstance(item, dict) for item in value):
                 return value
             else:
-                logger.warning(f"Formato inesperado para el campo 'informante': {value}. Se esperaba List[Dict].")
+                logger.warning(f"Formato inesperado para el campo 'informante': {value}.")
                 return []
 
-        # Normalización específica para operador_logistico
-        if field_name == "operador_logistico":
-            return self._standardize_response(value, self.OPERATOR_STANDARDIZATION_MAP)
-
-        # Normalización específica para sede_farmacia
-        if field_name == "sede_farmacia":
+        if field_name in ["farmacia", "sede_farmacia"]:
             return self._standardize_response(value, self.PHARMACY_STANDARDIZATION_MAP)
 
-        # Si no hay una normalización específica, devolver como string
         return str(value).strip()
 
     def _standardize_response(self, user_response: str, mapping: Dict[str, str]) -> str:
@@ -423,14 +361,10 @@ Respuesta:"""
             if key in response_lower:
                 return standard_value
         return user_response
-    
-    def update_informante_with_merge(self,
-        patient_key: str,
-        new_informante: List[Dict[str, Any]]
-    ) -> bool:
-        """
-        Actualiza el campo 'informante' (REPEATED RECORD) usando MERGE
-        """
+
+    def update_informante_with_merge(self, patient_key: str, 
+                                   new_informante: List[Dict[str, Any]]) -> bool:
+        """Actualiza el campo 'informante' (REPEATED RECORD) usando MERGE"""
         if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
             raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
 
@@ -438,7 +372,6 @@ Respuesta:"""
         table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
 
         try:
-            # Obtener el registro completo actual
             get_query = f"""
                 SELECT * FROM `{table_reference}`
                 WHERE paciente_clave = @patient_key
@@ -456,12 +389,11 @@ Respuesta:"""
                 logger.error(f"Paciente {patient_key} no encontrado para actualizar informante.")
                 return False
 
-            # Reemplazar (o extender) la lista de informantes
             current_data["informante"] = new_informante
 
-            # Montar lista de literales STRUCT(...)
             struct_sql = []
             for item in new_informante:
+                import json
                 nombre = json.dumps(item["nombre"])
                 parentesco = json.dumps(item["parentesco"])
                 identificacion = json.dumps(item["identificacion"])
@@ -470,7 +402,6 @@ Respuesta:"""
                     f"{parentesco} AS parentesco, "
                     f"{identificacion} AS identificacion)"
                 )
-            # Unirlos en un ARRAY[…]
             array_sql = "[" + ", ".join(struct_sql) + "]"
 
             merge_query = f"""
@@ -493,20 +424,17 @@ Respuesta:"""
                 ]
             )
             client.query(merge_query, job_config=job_config).result()
-            logger.info(f"🔄 Informante MERGE actualizado para paciente {patient_key}")
+            logger.info(f"Informante MERGE actualizado para paciente {patient_key}")
             return True
 
-
-
         except Exception as e:
-            logger.error(f"❌ Error actualizando informante SIN BÚFER: {e}")
+            logger.error(f"Error actualizando informante: {e}")
             return False
-
 
 
 try:
     claim_manager = ClaimManager()
     logger.info("ClaimManager instanciado correctamente.")
 except ClaimManagerError as e:
-    logger.critical(f"Error fatal al inicializar ClaimManager: {e}. El bot no podrá generar reclamaciones.")
+    logger.critical(f"Error fatal al inicializar ClaimManager: {e}.")
     claim_manager = None

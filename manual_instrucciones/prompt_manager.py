@@ -2,14 +2,13 @@ import os
 import logging
 from typing import Optional, Dict
 
-from google.cloud import bigquery
-from google.api_core.exceptions import GoogleAPIError
-
 from dotenv import load_dotenv
+from google.api_core.exceptions import GoogleAPIError
+from google.cloud import bigquery
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 
 class PromptManagerError(Exception):
@@ -17,15 +16,10 @@ class PromptManagerError(Exception):
 
 
 class PromptManager:
-    """
-    Gestiona la recuperación dinámica de prompts de una tabla de BigQuery.
-    """
+    """Gestiona la recuperación dinámica de prompts de una tabla de BigQuery."""
 
     def __init__(self) -> None:
-        """
-        Inicializa PromptManager configurando el cliente de BigQuery
-        y definiendo la tabla de prompts.
-        """
+        """Inicializa PromptManager configurando el cliente de BigQuery y definiendo la tabla de prompts."""
         self.project_id = os.getenv("PROJECT_ID")
         self.dataset_id = os.getenv("BIGQUERY_DATASET_ID", "NME_dev")
         self.table_id = os.getenv("BIGQUERY_PROMPTS_TABLE_ID", "manual_instrucciones")
@@ -44,15 +38,7 @@ class PromptManager:
             raise PromptManagerError(f"Fallo al inicializar el cliente de BigQuery: {exc}") from exc
 
     def get_prompt_by_keyword(self, modulo: str) -> Optional[str]:
-        """
-        Recupera un prompt de la tabla basándose en el módulo especificado.
-
-        Args:
-            modulo (str): Nombre del módulo (BYC, PIP, etc.)
-
-        Returns:
-            Optional[str]: Texto del prompt si se encuentra, None en caso contrario.
-        """
+        """Recupera un prompt de la tabla basándose en el módulo especificado."""
         query = f"""
             SELECT prompt_text
             FROM `{self.table_reference}`
@@ -84,12 +70,7 @@ class PromptManager:
             return None
 
     def get_all_prompts(self) -> Dict[str, str]:
-        """
-        Recupera todos los prompts disponibles.
-
-        Returns:
-            dict: Diccionario con los módulos como claves y los prompts como valores.
-        """
+        """Recupera todos los prompts disponibles."""
         query = f"""
             SELECT modulo, prompt_text
             FROM `{self.table_reference}`

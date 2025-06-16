@@ -3,31 +3,27 @@ import logging
 import os
 from datetime import datetime, timedelta
 from typing import Any, Dict
-import pytz
 
+import pytz
 from dotenv import load_dotenv
+from google.api_core.exceptions import GoogleAPIError, NotFound
+from google.cloud import firestore
+
 load_dotenv()
 
-from google.cloud import firestore
-from google.api_core.exceptions import GoogleAPIError, NotFound
-
-class SessionManagerError(Exception):
-    """Excepción base para errores en SessionManager."""
-
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
 logger = logging.getLogger(__name__)
 
 PROJECT_ID: str = os.getenv("PROJECT_ID", "")
 FIRESTORE_COLLECTION_SESSIONS_ACTIVE: str = "sesiones_activas"
 FIRESTORE_DATABASE_NAME: str = "historia"
 
+
+class SessionManagerError(Exception):
+    """Excepción base para errores en SessionManager."""
+
+
 class SessionManager:
-    """
-    Gestiona las sesiones de conversación como documentos en la colección 'sesiones_activas' de Firestore.
-    """
+    """Gestiona las sesiones de conversación como documentos en la colección 'sesiones_activas' de Firestore."""
 
     def __init__(self):
         """Inicializa el gestor de sesiones, estableciendo la conexión con Firestore."""
@@ -38,14 +34,14 @@ class SessionManager:
         self.db = self._get_firestore_client()
         self.sessions_collection_ref = self.db.collection(FIRESTORE_COLLECTION_SESSIONS_ACTIVE)
         self.colombia_tz = pytz.timezone('America/Bogota')
-        logger.info(f"SessionManager inicializado. Conectado a la colección de Firestore: '{FIRESTORE_COLLECTION_SESSIONS_ACTIVE}'.")
+        logger.info(f"SessionManager inicializado. Conectado a la colección: '{FIRESTORE_COLLECTION_SESSIONS_ACTIVE}'")
 
     def _get_firestore_client(self) -> firestore.Client:
         """Crea y devuelve una instancia del cliente de Firestore."""
         try:
             return firestore.Client(project=PROJECT_ID, database=FIRESTORE_DATABASE_NAME)
         except Exception as e:
-            logger.exception(f"Error al inicializar el cliente de Firestore para el proyecto '{PROJECT_ID}' y la base de datos '{FIRESTORE_DATABASE_NAME}': {e}")
+            logger.exception(f"Error al inicializar Firestore para proyecto '{PROJECT_ID}' y BD '{FIRESTORE_DATABASE_NAME}': {e}")
             raise SessionManagerError(f"Fallo al crear el cliente de Firestore: {e}") from e
 
     def _normalize_user_identifier(self, user_identifier: str) -> str:
@@ -58,20 +54,14 @@ class SessionManager:
         return clean_identifier[:15]
 
     def generate_session_id(self, user_identifier: str, channel: str) -> str:
-        """
-        Genera un ID de sesión único y legible.
-        Formato: CANAL_IDENTIFICADOR_AAAAMMDD_HHmmss.
-        """
+        """Genera un ID de sesión único. Formato: CANAL_IDENTIFICADOR_AAAAMMDD_HHmmss."""
         normalized_identifier = self._normalize_user_identifier(user_identifier)
         now = datetime.now(self.colombia_tz)
         timestamp_str = now.strftime("%Y%m%d_%H%M%S")
-        session_id = f"{channel}_{normalized_identifier}_{timestamp_str}"
-        return session_id
+        return f"{channel}_{normalized_identifier}_{timestamp_str}"
 
     def create_session(self, user_identifier: str, channel: str = "TL") -> str:
-        """
-        Crea un nuevo documento de sesión en Firestore.
-        """
+        """Crea un nuevo documento de sesión en Firestore."""
         session_id = self.generate_session_id(user_identifier, channel)
         current_time_iso = datetime.now(self.colombia_tz).isoformat()
 
@@ -105,12 +95,9 @@ class SessionManager:
             logger.error(f"Error inesperado al crear la sesión '{session_id}': {e}", exc_info=True)
             raise SessionManagerError(f"Error inesperado al crear la sesión en Firestore: {e}") from e
 
-    def add_message_to_session(
-        self, session_id: str, message_content: str, sender: str = "user", message_type: str = "conversation"
-    ) -> None:
-        """
-        Añade un mensaje al array 'conversation' del documento de sesión.
-        """
+    def add_message_to_session(self, session_id: str, message_content: str, 
+                              sender: str = "user", message_type: str = "conversation") -> None:
+        """Añade un mensaje al array 'conversation' del documento de sesión."""
         current_time_iso = datetime.now(self.colombia_tz).isoformat()
         user_identifier = self.extract_user_identifier_from_session_id(session_id)
 
@@ -137,9 +124,7 @@ class SessionManager:
             logger.warning(f"Error inesperado al añadir mensaje a la sesión '{session_id}': {e}")
 
     def update_consent_for_session(self, session_id: str, consent_status: str) -> bool:
-        """
-        Actualiza el estado de consentimiento de la sesión.
-        """
+        """Actualiza el estado de consentimiento de la sesión."""
         current_time_iso = datetime.now(self.colombia_tz).isoformat()
         consent_bool_value = consent_status == "autorizado"
 
@@ -177,10 +162,7 @@ class SessionManager:
             return False
 
     def close_session(self, session_id: str, reason: str = "completed") -> None:
-        """
-        Cierra una sesión actualizando su estado a 'cerrado'.
-        Esto debería activar la Cloud Function para migrar a BigQuery.
-        """
+        """Cierra una sesión actualizando su estado a 'cerrado'. Esto activa la Cloud Function para migrar a BigQuery."""
         try:
             doc_ref = self.sessions_collection_ref.document(session_id)
             doc_ref.update({
@@ -198,15 +180,7 @@ class SessionManager:
             logger.warning(f"Error inesperado al cerrar la sesión '{session_id}': {e}")
 
     def auto_close_inactive_sessions(self, inactivity_seconds: int = 300) -> int:
-        """
-        Cierra automáticamente las sesiones inactivas después del tiempo especificado.
-
-        Args:
-            inactivity_seconds: Segundos de inactividad antes de cerrar (predeterminado: 5 minutos).
-
-        Returns:
-            int: Número de sesiones cerradas.
-        """
+        """Cierra automáticamente las sesiones inactivas después del tiempo especificado."""
         try:
             cutoff_time = datetime.now(self.colombia_tz) - timedelta(seconds=inactivity_seconds)
 
@@ -238,9 +212,7 @@ class SessionManager:
             return 0
 
     def create_session_with_history_check(self, user_identifier: str, channel: str = "TL") -> Dict[str, Any]:
-        """
-        Crea una nueva sesión inmediatamente.
-        """
+        """Crea una nueva sesión inmediatamente."""
         normalized_identifier = self._normalize_user_identifier(user_identifier)
 
         try:
@@ -270,17 +242,17 @@ class SessionManager:
             }
 
     def get_session_info(self, session_id: str) -> Dict[str, Any]:
-        """
-        Recupera información detallada sobre una sesión.
-        """
+        """Recupera información detallada sobre una sesión."""
         try:
             doc_ref = self.sessions_collection_ref.document(session_id)
             doc = doc_ref.get()
             if doc.exists:
                 data = doc.to_dict()
 
-                created_at_str = data['created_at'].isoformat() if isinstance(data.get('created_at'), datetime) else None
-                last_activity_str = data['last_activity_at'].isoformat() if isinstance(data.get('last_activity_at'), datetime) else None
+                created_at_str = (data['created_at'].isoformat() 
+                                 if isinstance(data.get('created_at'), datetime) else None)
+                last_activity_str = (data['last_activity_at'].isoformat() 
+                                   if isinstance(data.get('last_activity_at'), datetime) else None)
 
                 return {
                     "session_id": session_id,
@@ -309,9 +281,7 @@ class SessionManager:
             return "unknown_identifier"
 
     def check_and_expire_session(self, session_id: str, expiration_seconds: int = 24 * 3600) -> bool:
-        """
-        Verifica si una sesión ha expirado y la cierra si es necesario.
-        """
+        """Verifica si una sesión ha expirado y la cierra si es necesario."""
         try:
             doc_ref = self.sessions_collection_ref.document(session_id)
             doc = doc_ref.get(['last_activity_at', 'estado_sesion'])

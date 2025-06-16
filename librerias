@@ -1,0 +1,9 @@
+pip install google-api-python-client google-auth
+pip install google-cloud-firestore
+pip install google-cloud-bigquery
+pip install google-cloud-storage
+pip install python-dotenv
+pip install python-telegram-bot
+pip install pytz
+pip install openai
+

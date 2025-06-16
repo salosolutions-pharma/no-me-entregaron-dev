@@ -1,0 +1,11 @@
+fastapi
+functions-framework
+openai
+pytz
+python-dotenv
+python-telegram-bot[job-queue]==20.3
+requests
+uvicorn[standard]
+google-cloud-bigquery
+google-cloud-firestore
+google-cloud-storage
