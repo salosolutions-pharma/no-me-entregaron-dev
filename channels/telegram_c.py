@@ -41,10 +41,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 TELEGRAM_API_TOKEN = os.getenv("TELEGRAM_API_TOKEN", "")
-# 6 horas de duración de sesión (21600 segundos)
-SESSION_EXPIRATION_SECONDS = int(os.getenv("SESSION_EXPIRATION_SECONDS", 21600))
-# Revisar cada 2 horas en lugar de cada minuto (7200 segundos)
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", 7200))
+
 
 if not TELEGRAM_API_TOKEN:
     logger.critical("TELEGRAM_API_TOKEN no configurado. Abortando.")
@@ -63,7 +60,6 @@ except Exception as e:
     logger.critical(f"Error al inicializar componentes: {e}. Abortando.")
     sys.exit(1)
 
-active_sessions: Dict[str, datetime] = {}
 
 
 def create_consent_keyboard() -> InlineKeyboardMarkup:
@@ -174,6 +170,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     session_id = session_context.get("session_id")
 
     try:
+        # ✅ NUEVO: Verificar inactividad solo cuando el usuario escribe
+        if session_id and consent_manager:
+            session_expired = consent_manager.session_manager.check_session_inactivity(session_id)
+            if session_expired:
+                # Limpiar sesión expirada y empezar nueva
+                context.user_data.clear()
+                response = ("¡Hola de nuevo! 👋 Tu sesión anterior expiró por inactividad. "
+                          "No te preocupes, podemos comenzar tu solicitud desde el inicio.")
+                await send_and_log_message(chat_id, response, context)
+                return
+
+        # ✅ VERIFICAR si el usuario se está despidiendo
         if (consent_manager and 
             consent_manager.should_close_session(user_message, session_context) and 
             session_id):
@@ -218,7 +226,7 @@ def close_user_session(session_id: str, context: ContextTypes.DEFAULT_TYPE, reas
     """Cierra la sesión del usuario y limpia su user_data."""
     if consent_manager and consent_manager.session_manager:
         consent_manager.session_manager.close_session(session_id, reason=reason)
-    active_sessions.pop(session_id, None)
+
     context.user_data.clear()
     logger.info(f"Sesión {session_id} cerrada por {reason}.")
 
@@ -244,7 +252,6 @@ async def process_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data["phone"] = phone
         context.user_data["phone_shared"] = True
         context.user_data["detected_channel"] = "TL"
-        active_sessions[new_session_id] = datetime.now()
 
         logger.info(f"Sesión creada: {new_session_id}")
 
@@ -591,6 +598,7 @@ async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_
     field_prompt = claim_manager.get_next_missing_field_prompt(patient_key)
 
     if field_prompt.get("field_name"):
+        # Aún faltan campos - continuar
         field_name = field_prompt["field_name"]
         context.user_data["waiting_for_field"] = field_name
         context.user_data["patient_key"] = patient_key
@@ -606,16 +614,22 @@ async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_
         else:
             await send_and_log_message(chat_id, field_prompt["prompt_text"], context)
     else:
+    
         await send_and_log_message(
             chat_id,
-            ("🎉 Ya tenemos toda la información para radicar la reclamación en tu nombre.\n\n"
-             "En las próximas 48 horas te enviaremos el número de radicado.\n\n"
-             "Si deseas radicar otra reclamación, no dudes en ponerte en contacto con nosotros."),
+            ("🎉 ¡Perfecto! Ya tenemos toda la información necesaria para radicar tu reclamación.\n\n"
+             "📋 En las próximas 48 horas te enviaremos el número de radicado.\n\n"
+             "✅ Proceso completado exitosamente. Si necesitas algo más, no dudes en contactarnos.\n\n"
+             "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"),
             context
         )
+        
+        # ✅ AGREGAR: Cerrar sesión automáticamente al completar el proceso
         session_id = context.user_data.get("session_id")
         if session_id:
-            close_user_session(session_id, context, reason="completed")
+            close_user_session(session_id, context, reason="process_completed")
+        
+        logger.info(f"Proceso completado para paciente {patient_key} - sesión cerrada automáticamente")
 
 
 async def handle_informante_selection(query, context: ContextTypes.DEFAULT_TYPE, informante_type: str) -> None:
@@ -722,45 +736,6 @@ async def handle_field_response(update: Update, context: ContextTypes.DEFAULT_TY
         return True
 
 
-async def check_expired_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Verifica y expira sesiones antiguas de forma optimizada para reducir costos."""
-    logger.info("🔍 Iniciando verificación de sesiones expiradas (cada 2 horas)...")
-    sessions_to_remove = []
-    current_time = datetime.now()
-
-    # Solo revisar sesiones en memoria que realmente puedan estar expiradas
-    for session_id, last_activity_time in list(active_sessions.items()):
-        if (current_time - last_activity_time).total_seconds() > SESSION_EXPIRATION_SECONDS:
-            try:
-                if consent_manager and consent_manager.session_manager:
-                    consent_manager.session_manager.close_session(session_id, reason="expired_in_memory")
-                sessions_to_remove.append(session_id)
-                logger.info(f"✅ Sesión {session_id[:20]}... cerrada por expiración")
-            except Exception as e:
-                logger.error(f"❌ Error al cerrar sesión {session_id}: {e}")
-
-    # Limpiar sesiones de memoria
-    for session_id in sessions_to_remove:
-        active_sessions.pop(session_id, None)
-
-    if sessions_to_remove:
-        logger.info(f"🧹 {len(sessions_to_remove)} sesiones expiradas procesadas")
-    else:
-        logger.info("✅ No hay sesiones expiradas en memoria")
-
-    # Revisar Firestore solo ocasionalmente (cada 4 horas aproximadamente)
-    # Esto reduce aún más las consultas costosas
-    if len(active_sessions) % 2 == 0:  # Solo en verificaciones pares
-        if consent_manager and consent_manager.session_manager:
-            try:
-                closed_by_firestore = consent_manager.session_manager.auto_close_inactive_sessions(SESSION_EXPIRATION_SECONDS)
-                if closed_by_firestore > 0:
-                    logger.info(f"🔥 {closed_by_firestore} sesiones cerradas desde Firestore")
-            except Exception as e:
-                logger.error(f"❌ Error en auto-cierre de Firestore: {e}")
-    
-    logger.info(f"⏰ Próxima verificación en {CHECK_INTERVAL_SECONDS/3600:.1f} horas")
-
 
 def setup_handlers(application: Application) -> None:
     """Configura los manejadores de mensajes y callbacks."""
@@ -772,16 +747,10 @@ def setup_handlers(application: Application) -> None:
 
 
 def setup_job_queue(application: Application) -> None:
-    """Configura los trabajos programados con intervalos optimizados para reducir costos."""
+    """Configura trabajos programados - SIN jobs periódicos"""
     job_queue = application.job_queue
-    # Revisar sesiones expiradas cada 2 horas en lugar de cada minuto
-    # Esto reduce las consultas a Firestore de 1440 por día a solo 12 por día
-    job_queue.run_repeating(
-        check_expired_sessions, 
-        interval=CHECK_INTERVAL_SECONDS,  # 7200 segundos = 2 horas
-        first=CHECK_INTERVAL_SECONDS      # Empezar después de 2 horas
-    )
-    logger.info(f"Cola de trabajos configurada: revisión cada {CHECK_INTERVAL_SECONDS/3600:.1f} horas")
+    
+    logger.info("job queue configurado Sin trabajos periódicos ")
 
 
 def format_telegram_text(text: str) -> str:
@@ -789,9 +758,8 @@ def format_telegram_text(text: str) -> str:
     import re
     return re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
 
-"""
 def main() -> None:
-    Función principal para iniciar el bot de Telegram.
+    "Función principal para iniciar el bot de Telegram."
     logger.info("Iniciando Bot de Telegram...")
 
     if not all([consent_manager, pip_processor_instance, claim_manager]):
@@ -807,18 +775,19 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()"""
+    main()
 
+"""
 def create_application() -> Application:
       
-     
-      """
+    
+      
       Carga y configura una instancia de Application de python-telegram-bot:
        - Verifica que los componentes críticos (ConsentManager, PIPProcessor, ClaimManager) estén inicializados.
        - Construye el Application con el TOKEN de Telegram.
        - Registra los jobs y handlers.
       Úsala para polling (local) o para procesar webhooks (production).
-     """
+     
       logger.info("Configurando la aplicación del bot de Telegram...")
 
       # Verificación de componentes
@@ -844,7 +813,7 @@ def create_application() -> Application:
 
 
 def main() -> None:
-     """Punto de entrada: arranca el bot en modo polling (desarrollo local)."""
+     Punto de entrada: arranca el bot en modo polling (desarrollo local).
      app = create_application()
      logger.info("Arrancando polling del bot...")
      app.run_polling(allowed_updates=["message", "callback_query"])
@@ -853,4 +822,4 @@ def main() -> None:
 if __name__ == "__main__":
      main()
 
-    
+"""

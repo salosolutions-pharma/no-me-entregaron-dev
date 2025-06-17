@@ -36,6 +36,49 @@ class SessionManager:
         self.colombia_tz = pytz.timezone('America/Bogota')
         logger.info(f"SessionManager inicializado. Conectado a la colección: '{FIRESTORE_COLLECTION_SESSIONS_ACTIVE}'")
 
+    def check_session_inactivity(self, session_id: str, hours_limit: int = 6) -> bool:
+        """
+        Verifica si una sesión específica está inactiva por más de X horas.
+        Solo se ejecuta cuando el usuario vuelve a interactuar.
+        """
+        try:
+            doc_ref = self.sessions_collection_ref.document(session_id)
+            doc = doc_ref.get(['last_activity_at', 'estado_sesion'])
+
+            if not doc.exists:
+                logger.debug(f"Sesión '{session_id}' no existe - considerada expirada")
+                return True
+
+            session_data = doc.to_dict()
+            estado_sesion = session_data.get('estado_sesion')
+
+            if estado_sesion == "cerrado":
+                logger.debug(f"Sesión '{session_id}' ya estaba cerrada")
+                return True
+
+            last_activity_at = session_data.get('last_activity_at')
+            if not last_activity_at or not isinstance(last_activity_at, datetime):
+                logger.info(f"Sesión '{session_id}' sin timestamp válido - cerrando")
+                self.close_session(session_id, "invalid_timestamp")
+                return True
+
+            # Calcular tiempo de inactividad
+            current_time = datetime.now(self.colombia_tz)
+            last_activity_time = last_activity_at.astimezone(self.colombia_tz)
+            hours_inactive = (current_time - last_activity_time).total_seconds() / 3600
+
+            if hours_inactive > hours_limit:
+                logger.info(f"Sesión '{session_id[:20]}...' inactiva {hours_inactive:.1f}h - cerrando")
+                self.close_session(session_id, f"inactive_{hours_inactive:.1f}h")
+                return True
+            
+            logger.debug(f"Sesión '{session_id[:20]}...' activa ({hours_inactive:.1f}h)")
+            return False
+
+        except Exception as e:
+            logger.warning(f"Error verificando inactividad de sesión '{session_id}': {e}")
+            return True
+        
     def _get_firestore_client(self) -> firestore.Client:
         """Crea y devuelve una instancia del cliente de Firestore."""
         try:
@@ -179,37 +222,7 @@ class SessionManager:
         except Exception as e:
             logger.warning(f"Error inesperado al cerrar la sesión '{session_id}': {e}")
 
-    def auto_close_inactive_sessions(self, inactivity_seconds: int = 300) -> int:
-        """Cierra automáticamente las sesiones inactivas después del tiempo especificado."""
-        try:
-            cutoff_time = datetime.now(self.colombia_tz) - timedelta(seconds=inactivity_seconds)
-
-            query = (
-                self.sessions_collection_ref
-                .where(filter=firestore.FieldFilter('estado_sesion', '==', 'activa'))
-                .where(filter=firestore.FieldFilter('last_activity_at', '<', cutoff_time))
-                .limit(10)
-            )
-
-            sessions_to_close = query.stream()
-            closed_count = 0
-
-            for doc in sessions_to_close:
-                session_id = doc.id
-                try:
-                    self.close_session(session_id, "auto_inactivity")
-                    closed_count += 1
-                    logger.info(f"Sesión inactiva cerrada automáticamente: {session_id[:20]}...")
-                except Exception as e:
-                    logger.error(f"Error al cerrar automáticamente la sesión {session_id}: {e}")
-
-            if closed_count > 0:
-                logger.info(f"{closed_count} sesiones cerradas por inactividad.")
-            return closed_count
-
-        except Exception as e:
-            logger.error(f"Error en auto_close_inactive_sessions: {e}")
-            return 0
+    
 
     def create_session_with_history_check(self, user_identifier: str, channel: str = "TL") -> Dict[str, Any]:
         """Crea una nueva sesión inmediatamente."""
