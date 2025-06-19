@@ -37,18 +37,28 @@ class PromptManager:
             logger.exception("Fallo al inicializar el cliente de BigQuery en PromptManager.")
             raise PromptManagerError(f"Fallo al inicializar el cliente de BigQuery: {exc}") from exc
 
-    def get_prompt_by_keyword(self, modulo: str) -> Optional[str]:
-        """Recupera un prompt de la tabla basándose en el módulo especificado."""
+    def get_prompt_by_module_and_function(self, modulo: str, funcionalidad: str) -> Optional[str]:
+        """
+        Recupera un prompt específico por módulo y funcionalidad.
+        
+        Args:
+            modulo: Nombre del módulo (ej: 'CLAIM', 'BYC', 'PIP', 'DATA')
+            funcionalidad: Nombre de la funcionalidad (ej: 'reclamacion_eps', 'consentimiento')
+            
+        Returns:
+            El texto del prompt o None si no se encuentra
+        """
         query = f"""
             SELECT prompt_text
             FROM `{self.table_reference}`
-            WHERE modulo = @modulo
+            WHERE modulo = @modulo AND funcionalidad = @funcionalidad
             LIMIT 1
         """
 
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
                 bigquery.ScalarQueryParameter("modulo", "STRING", modulo),
+                bigquery.ScalarQueryParameter("funcionalidad", "STRING", funcionalidad),
             ]
         )
 
@@ -56,24 +66,59 @@ class PromptManager:
             results = self.bq_client.query(query, job_config=job_config).result()
 
             for row in results:
-                logger.info(f"Prompt encontrado para el módulo '{modulo}' (longitud: {len(row.prompt_text)} caracteres)")
+                logger.info(f"Prompt encontrado para {modulo}.{funcionalidad} (longitud: {len(row.prompt_text)} caracteres)")
                 return row.prompt_text
 
-            logger.warning(f"No se encontró ningún prompt para el módulo '{modulo}'")
+            logger.warning(f"No se encontró ningún prompt para {modulo}.{funcionalidad}")
             return None
 
         except GoogleAPIError as exc:
-            logger.error(f"Error de BigQuery al consultar el prompt para el módulo '{modulo}': {exc}")
+            logger.error(f"Error de BigQuery al consultar el prompt para {modulo}.{funcionalidad}: {exc}")
             return None
         except Exception as exc:
             logger.error(f"Error inesperado al consultar el prompt en PromptManager: {exc}")
             return None
 
-    def get_all_prompts(self) -> Dict[str, str]:
-        """Recupera todos los prompts disponibles."""
+    def get_prompt_by_keyword(self, keyword: str) -> Optional[str]:
+        """
+        Método legacy para compatibilidad con código existente.
+        Mapea keywords antiguos a la nueva estructura modulo.funcionalidad.
+        
+        Args:
+            keyword: Keyword antiguo (ej: 'BYC', 'PIP', 'CLAIM', 'RECLAMACION_EPS')
+            
+        Returns:
+            El texto del prompt o None si no se encuentra
+        """
+        # Mapeo de keywords antiguos a nueva estructura
+        mapping = {
+            "BYC": ("BYC", "consentimiento"),
+            "PIP": ("PIP", "extraccion_data"), 
+            "CLAIM": ("DATA", "recoleccion_campos"),
+            "RECLAMACION_EPS": ("CLAIM", "reclamacion_eps"),
+            "RECLAMACION_SUPERSALUD": ("CLAIM", "reclamacion_supersalud"),
+            "TUTELA": ("CLAIM", "tutela")
+        }
+        
+        if keyword in mapping:
+            modulo, funcionalidad = mapping[keyword]
+            logger.info(f"Mapeando keyword '{keyword}' a {modulo}.{funcionalidad}")
+            return self.get_prompt_by_module_and_function(modulo, funcionalidad)
+        
+        logger.warning(f"Keyword '{keyword}' no encontrado en el mapeo legacy")
+        return None
+
+    def get_all_prompts(self) -> Dict[str, Dict[str, str]]:
+        """
+        Recupera todos los prompts disponibles organizados por módulo y funcionalidad.
+        
+        Returns:
+            Dict anidado: {modulo: {funcionalidad: prompt_text}}
+        """
         query = f"""
-            SELECT modulo, prompt_text
+            SELECT modulo, funcionalidad, prompt_text
             FROM `{self.table_reference}`
+            ORDER BY modulo, funcionalidad
         """
 
         try:
@@ -81,9 +126,15 @@ class PromptManager:
             prompts = {}
 
             for row in results:
-                prompts[row.modulo] = row.prompt_text
+                modulo = row.modulo
+                funcionalidad = row.funcionalidad
+                
+                if modulo not in prompts:
+                    prompts[modulo] = {}
+                
+                prompts[modulo][funcionalidad] = row.prompt_text
 
-            logger.info(f"Cargados {len(prompts)} prompts desde BigQuery.")
+            logger.info(f"Cargados prompts de {len(prompts)} módulos desde BigQuery.")
             return prompts
 
         except GoogleAPIError as exc:
@@ -93,11 +144,46 @@ class PromptManager:
             logger.error(f"Error inesperado al obtener todos los prompts: {exc}")
             return {}
 
+    def list_available_modules(self) -> Dict[str, list]:
+        """
+        Lista todos los módulos y sus funcionalidades disponibles.
+        
+        Returns:
+            Dict: {modulo: [lista_de_funcionalidades]}
+        """
+        query = f"""
+            SELECT modulo, funcionalidad
+            FROM `{self.table_reference}`
+            ORDER BY modulo, funcionalidad
+        """
 
+        try:
+            results = self.bq_client.query(query).result()
+            modules = {}
+
+            for row in results:
+                modulo = row.modulo
+                funcionalidad = row.funcionalidad
+                
+                if modulo not in modules:
+                    modules[modulo] = []
+                
+                modules[modulo].append(funcionalidad)
+
+            logger.info(f"Módulos disponibles: {list(modules.keys())}")
+            return modules
+
+        except Exception as exc:
+            logger.error(f"Error al listar módulos disponibles: {exc}")
+            return {}
+
+
+# Instancia global
 prompt_manager: Optional[PromptManager] = None
 
 try:
     prompt_manager = PromptManager()
+    logger.info("PromptManager instanciado correctamente.")
 except PromptManagerError as e:
     logger.critical(f"Error al inicializar prompt_manager: {e}")
     prompt_manager = None

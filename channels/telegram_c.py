@@ -27,7 +27,8 @@ from telegram.ext import (
 try:
     from BYC.consentimiento import ConsentManager
     from processor_image_prescription.pip_processor import PIPProcessor
-    from claim_generator.claim_manager import ClaimManager
+    from claim_manager.data_collection import ClaimManager
+    from claim_manager.claim_generator import generar_reclamacion_eps, generar_tutela, generar_reclamacion_supersalud, validar_disponibilidad_supersalud
 except ImportError as e:
     print(f"Error al importar módulos: {e}")
     sys.exit(1)
@@ -132,7 +133,28 @@ def get_session_context(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
         "detected_channel": context.user_data.get("detected_channel", "TL"),
     }
 
-
+def _get_entidad_destinataria(tipo_accion: str, patient_data: Dict[str, Any]) -> str:
+    """
+    Determina la entidad destinataria según el tipo de acción.
+    
+    Args:
+        tipo_accion: Tipo de reclamación
+        patient_data: Datos del paciente
+        
+    Returns:
+        String con el nombre de la entidad destinataria
+    """
+    if tipo_accion == "reclamacion_eps":
+        return patient_data.get("eps_estandarizada", "EPS")
+    elif tipo_accion == "reclamacion_supersalud":
+        return "Superintendencia Nacional de Salud"
+    elif tipo_accion == "tutela":
+        return "Juzgado de Tutela"
+    elif tipo_accion == "desacato":
+        return "Juzgado de Tutela (Desacato)"
+    else:
+        return "Entidad no especificada"
+    
 async def send_and_log_message(chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE,
                               message_type: str = "conversation", 
                               reply_markup: Optional[Any] = None) -> None:
@@ -592,7 +614,114 @@ async def continue_with_missing_fields_after_meds_safe(query, context: ContextTy
         chat_id = query.message.chat_id
         await send_and_log_message(chat_id, "Ocurrió un error. Por favor, intenta de nuevo.", context)
 
-
+async def save_reclamacion_to_database(patient_key: str, tipo_accion: str, 
+                                     texto_reclamacion: str, estado_reclamacion: str,
+                                     nivel_escalamiento: int, 
+                                     resultado_claim_generator: Dict[str, Any] = None) -> bool:
+    """
+    Guarda la reclamación generada en la tabla pacientes.reclamaciones.
+    ACTUALIZADA para usar datos del claim_generator y evitar campos inexistentes.
+    
+    Args:
+        patient_key: Clave del paciente
+        tipo_accion: Tipo de reclamación ("reclamacion_eps", "reclamacion_supersalud", "tutela")
+        texto_reclamacion: Texto completo de la reclamación generada
+        estado_reclamacion: Estado actual (pendiente_radicacion, radicado, etc.)
+        nivel_escalamiento: Nivel de escalamiento (1 = primera reclamación, 2 = Supersalud, etc.)
+        resultado_claim_generator: Resultado completo del claim_generator (opcional)
+        
+    Returns:
+        bool: True si se guardó exitosamente, False en caso contrario
+    """
+    try:
+        from processor_image_prescription.bigquery_pip import get_bigquery_client, _convert_bq_row_to_dict_recursive
+        from google.cloud import bigquery
+        from datetime import datetime
+        
+        client = get_bigquery_client()
+        
+        # Usar variables de entorno para la consulta
+        from processor_image_prescription.bigquery_pip import PROJECT_ID, DATASET_ID, TABLE_ID
+        table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+        
+        # 1. Obtener datos actuales del paciente
+        get_query = f"""
+            SELECT * FROM `{table_reference}`
+            WHERE paciente_clave = @patient_key
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)]
+        )
+        
+        results = client.query(get_query, job_config=job_config).result()
+        current_data = None
+        
+        for row in results:
+            current_data = _convert_bq_row_to_dict_recursive(row)
+            break
+        
+        if not current_data:
+            logger.error(f"Paciente {patient_key} no encontrado para guardar reclamación.")
+            return False
+        
+        # Obtener medicamentos no entregados de prescripciones
+        med_no_entregados_from_prescriptions = ""
+        if current_data.get("prescripciones"):
+            ultima_prescripcion = current_data["prescripciones"][-1]
+            medicamentos = ultima_prescripcion.get("medicamentos", [])
+            
+            meds_no_entregados = []
+            for med in medicamentos:
+                if isinstance(med, dict) and med.get("entregado") == "no entregado":
+                    nombre = med.get("nombre", "")
+                    if nombre:
+                        meds_no_entregados.append(nombre)
+            
+            med_no_entregados_from_prescriptions = ", ".join(meds_no_entregados)
+        
+        # 2. Preparar nueva reclamación SIN los campos problemáticos
+        nueva_reclamacion = {
+            "med_no_entregados": med_no_entregados_from_prescriptions,
+            "tipo_accion": tipo_accion,
+            "texto_reclamacion": texto_reclamacion,
+            "estado_reclamacion": estado_reclamacion,
+            "nivel_escalamiento": nivel_escalamiento,
+            "url_documento": "",  # Solo para tutelas
+            "numero_radicado": "",  # Se llena cuando se radica
+            "fecha_radicacion": None,  # Se llena cuando se radica
+            "fecha_revision": None,   # Se llena cuando hay respuesta
+            # REMOVIDOS los campos que causaban error:
+            # "fecha_generacion": datetime.now().isoformat(),
+            # "entidad_destinataria": _get_entidad_destinataria(tipo_accion, current_data)
+        }
+        
+        # 3. Agregar a reclamaciones existentes
+        reclamaciones_actuales = current_data.get("reclamaciones", [])
+        reclamaciones_actuales.append(nueva_reclamacion)
+        current_data["reclamaciones"] = reclamaciones_actuales
+        
+        # 4. DELETE + INSERT para actualizar
+        delete_query = f"""
+            DELETE FROM `{table_reference}`
+            WHERE paciente_clave = @patient_key
+        """
+        
+        delete_job = client.query(delete_query, job_config=job_config)
+        delete_job.result()
+        logger.info(f"Registro {patient_key} eliminado para actualizar reclamaciones.")
+        
+        # 5. INSERT con nueva reclamación
+        from processor_image_prescription.bigquery_pip import load_table_from_json_direct
+        load_table_from_json_direct([current_data], table_reference)
+        
+        logger.info(f"Reclamación {tipo_accion} (nivel {nivel_escalamiento}) guardada exitosamente para paciente {patient_key}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error guardando reclamación en base de datos para paciente {patient_key}: {e}")
+        return False
+    
 async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_TYPE, patient_key: str) -> None:
     """Obtiene y solicita el siguiente campo faltante al usuario."""
     field_prompt = claim_manager.get_next_missing_field_prompt(patient_key)
@@ -614,22 +743,79 @@ async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_
         else:
             await send_and_log_message(chat_id, field_prompt["prompt_text"], context)
     else:
-    
-        await send_and_log_message(
-            chat_id,
-            ("🎉 ¡Perfecto! Ya tenemos toda la información necesaria para radicar tu reclamación.\n\n"
-             "📋 En las próximas 48 horas te enviaremos el número de radicado.\n\n"
-             "✅ Proceso completado exitosamente. Si necesitas algo más, no dudes en contactarnos.\n\n"
-             "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"),
-            context
-        )
         
-        # ✅ AGREGAR: Cerrar sesión automáticamente al completar el proceso
+        logger.info(f"Todos los campos completos para paciente {patient_key}. Iniciando generación de reclamación.")
+        
+        # 1. GENERAR RECLAMACIÓN EPS AUTOMÁTICAMENTE
+        try:
+            resultado_reclamacion = generar_reclamacion_eps(patient_key)
+            
+            if resultado_reclamacion["success"]:
+                # 2. GUARDAR EN TABLA RECLAMACIONES
+                success_saved = await save_reclamacion_to_database(
+                    patient_key=patient_key,
+                    tipo_accion="reclamacion_eps",
+                    texto_reclamacion=resultado_reclamacion["texto_reclamacion"],
+                    estado_reclamacion="pendiente_radicacion",
+                    nivel_escalamiento=1,
+                    resultado_claim_generator=resultado_reclamacion
+                )
+                
+                if success_saved:
+                    logger.info(f"Reclamación EPS generada y guardada exitosamente para paciente {patient_key}")
+                    supersalud_disponible = validar_disponibilidad_supersalud()
+
+                    if supersalud_disponible.get("disponible"):
+                        success_message = (
+                            "🎉 ¡Perfecto! Ya tenemos toda la información necesaria para radicar tu reclamación.\n\n"
+                            "📄 **Reclamación EPS generada exitosamente**\n\n"
+                            "📋 En las próximas 48 horas te enviaremos el número de radicado.\n\n"
+                            "🔄 **Sistema de escalamiento activado:**\n"
+                            "• Si no hay respuesta en el plazo establecido, automáticamente escalaremos tu caso a la Superintendencia Nacional de Salud\n"
+                            "• Te mantendremos informado en cada paso del proceso\n\n"
+                            "✅ Proceso completado exitosamente. Si necesitas algo más, no dudes en contactarnos.\n\n"
+                            "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                        )
+                    else:
+                        success_message = (
+                            "🎉 ¡Perfecto! Ya tenemos toda la información necesaria para radicar tu reclamación.\n\n"
+                            "📄 **Reclamación EPS generada exitosamente**\n\n"
+                            "📋 En las próximas 48 horas te enviaremos el número de radicado.\n\n"
+                            "✅ Proceso completado exitosamente. Si necesitas algo más, no dudes en contactarnos.\n\n"
+                            "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                        )
+                else:
+                    logger.error(f"Error guardando reclamación para paciente {patient_key}")
+                    success_message = ( 
+                        "⚠️ Se completó la recopilación de datos, pero hubo un problema técnico guardando tu reclamación.\n\n"
+                        "📞 Nuestro equipo revisará tu caso manualmente.\n\n"
+                        "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                    )
+            else:
+                logger.error(f"Error generando reclamación EPS para paciente {patient_key}: {resultado_reclamacion.get('error', 'Error desconocido')}")
+                success_message = (
+                    "⚠️ Se completó la recopilación de datos, pero hubo un problema técnico generando tu reclamación.\n\n"
+                    "📞 Nuestro equipo revisará tu caso manualmente.\n\n"
+                    "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                )
+                
+        except Exception as e:
+            logger.error(f"Error inesperado en generación de reclamación para paciente {patient_key}: {e}")
+            success_message = (
+                "⚠️ Se completó la recopilación de datos. Nuestro equipo procesará tu reclamación manualmente.\n\n"
+                "📞 Te contactaremos pronto.\n\n"
+                "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+            )
+        
+        # 3. ENVIAR MENSAJE FINAL
+        await send_and_log_message(chat_id, success_message, context)
+        
+        # 4. CERRAR SESIÓN AUTOMÁTICAMENTE
         session_id = context.user_data.get("session_id")
         if session_id:
-            close_user_session(session_id, context, reason="process_completed")
+            close_user_session(session_id, context, reason="process_completed_with_claim")
         
-        logger.info(f"Proceso completado para paciente {patient_key} - sesión cerrada automáticamente")
+        logger.info(f"Proceso completo finalizado para paciente {patient_key} - sesión cerrada automáticamente")
 
 
 async def handle_informante_selection(query, context: ContextTypes.DEFAULT_TYPE, informante_type: str) -> None:

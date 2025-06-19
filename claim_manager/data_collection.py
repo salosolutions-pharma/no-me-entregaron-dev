@@ -161,7 +161,7 @@ class ClaimManager:
                     "prompt_text": "✅ Ya hemos recopilado toda la información necesaria para tu reclamación. ¡Gracias por tu colaboración!",
                 }
 
-            claim_prompt_template = prompt_manager.get_prompt_by_keyword("CLAIM")
+            claim_prompt_template = prompt_manager.get_prompt_by_module_and_function("DATA", "recoleccion_campos")
             if not claim_prompt_template:
                 logger.error("Prompt 'CLAIM' no encontrado en manual_instrucciones.")
                 return {

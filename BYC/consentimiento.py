@@ -20,7 +20,7 @@ class ConsentManager:
                         session_context: Dict[str, Any] = None) -> str:
         """Genera la respuesta del bot usando el prompt BYC."""
         try:
-            byc_prompt = prompt_manager.get_prompt_by_keyword("BYC")
+            byc_prompt = prompt_manager.get_prompt_by_module_and_function("BYC", "consentimiento")
             if not byc_prompt:
                 logger.error("Prompt BYC no encontrado.")
                 return "Lo siento, hay un problema técnico. Por favor intenta más tarde."

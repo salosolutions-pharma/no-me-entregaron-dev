@@ -86,7 +86,7 @@ class PIPProcessor:
         """Procesa una imagen de receta médica de principio a fin."""
         temp_image_path: Path = Path(image_path) if isinstance(image_path, str) else image_path
         try:
-            prompt_content = prompt_manager.get_prompt_by_keyword("PIP")
+            prompt_content = prompt_manager.get_prompt_by_module_and_function("PIP", "extraccion_data")
             if not prompt_content:
                 return self._get_error_message("pip_prompt_not_found")
 
@@ -318,11 +318,11 @@ class PIPProcessor:
         existing_risk = data.get("categoria_riesgo")
         if existing_risk:
             if "vital" in existing_risk.lower():
-                return "Riesgo Vital"
+                return "vital"
             if "priorizado" in existing_risk.lower():
-                return "Riesgo Priorizado"
+                return "priorizado"
             if "simple" in existing_risk.lower():
-                return "Riesgo Simple"
+                return "simple"
             return existing_risk
 
         diagnostico = data.get("diagnostico", "").lower()
@@ -334,10 +334,10 @@ class PIPProcessor:
         combined_text = f"{diagnostico} {medicamentos_text}"
 
         if any(keyword in combined_text for keyword in self.RISK_KEYWORDS["vital"]):
-            return "Riesgo Vital"
+            return "vital"
         if any(keyword in combined_text for keyword in self.RISK_KEYWORDS["priorizado"]):
-            return "Riesgo Priorizado"
-        return "Riesgo Simple"
+            return "priorizado"
+        return "simple"
 
     def _detect_missing_fields(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Detecta campos que podrían necesitar completarse interactivamente."""

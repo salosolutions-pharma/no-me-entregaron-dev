@@ -3,7 +3,7 @@ functions-framework
 openai
 pytz
 python-dotenv
-python-telegram-bot[job-queue]==20.3
+python-telegram-bot
 requests
 uvicorn[standard]
 google-cloud-bigquery
