@@ -178,41 +178,42 @@ def migrate_session_to_bigquery(cloud_event: Any) -> None:
     """Función de Cloud para migrar datos de sesión de Firestore a BigQuery."""
     logger.info("Iniciando la migración de la sesión a BigQuery.")
 
-    if firestore_client is None or get_bigquery_client() is None:
-        logger.critical("Clientes de Google Cloud no inicializados, abortando.")
-        return
+    # if firestore_client is None or get_bigquery_client() is None:
+    #     logger.critical("Clientes de Google Cloud no inicializados, abortando.")
+    #     return
 
-    resource = cloud_event.data.get("resource", "")
-    if FIRESTORE_COLLECTION_NAME not in resource:
-        logger.info("Evento ignorado: no pertenece a la colección sesiones_activas.")
-        return
+    # resource = cloud_event.data.get("resource", "")
+    # if FIRESTORE_COLLECTION_NAME not in resource:
+    #     logger.info("Evento ignorado: no pertenece a la colección sesiones_activas.")
+    #     return
 
-    session_id = _extract_session_id_from_resource(resource)
-    if not session_id:
-        logger.error("No se pudo extraer el session_id del evento.")
-        return
+    # session_id = _extract_session_id_from_resource(resource)
+    # if not session_id:
+    #     logger.error("No se pudo extraer el session_id del evento.")
+    #     return
 
-    if _check_if_session_exists_in_bigquery(session_id):
-        logger.info(f"Sesión {session_id} ya migrada, procediendo a eliminar de Firestore si existe.")
-        _delete_session_from_firestore(session_id)
-        return
+    # if _check_if_session_exists_in_bigquery(session_id):
+    #     logger.info(f"Sesión {session_id} ya migrada, procediendo a eliminar de Firestore si existe.")
+    #     _delete_session_from_firestore(session_id)
+    #     return
 
-    session_data = _get_session_data_from_firestore(session_id)
-    if not session_data:
-        logger.warning(f"No hay datos para la sesión {session_id} en Firestore.")
-        _delete_session_from_firestore(session_id)
-        return
+    # session_data = _get_session_data_from_firestore(session_id)
+    # if not session_data:
+    #     logger.warning(f"No hay datos para la sesión {session_id} en Firestore.")
+    #     _delete_session_from_firestore(session_id)
+    #     return
 
-    if session_data.get("estado_sesion") != "cerrado":
-        logger.info(f"La sesión {session_id} no está cerrada ('{session_data.get('estado_sesion')}'). No se migrará ahora.")
-        return
+    # if session_data.get("estado_sesion") != "cerrado":
+    #     logger.info(f"La sesión {session_id} no está cerrada ('{session_data.get('estado_sesion')}'). No se migrará ahora.")
+    #     return
 
-    logger.info(f"Procesando sesión cerrada: {session_id}.")
+    # logger.info(f"Procesando sesión cerrada: {session_id}.")
 
-    session_record = _prepare_session_for_bigquery(session_data)
+    # session_record = _prepare_session_for_bigquery(session_data)
 
-    if _insert_session_to_bigquery(session_record):
-        _delete_session_from_firestore(session_id)
-        logger.info(f"Migración completa: Sesión {session_id} → BigQuery (historial).")
-    else:
-        logger.error(f"La migración de {session_id} falló, se mantiene en Firestore.")
+    # if _insert_session_to_bigquery(session_record):
+    #     _delete_session_from_firestore(session_id)
+    #     logger.info(f"Migración completa: Sesión {session_id} → BigQuery (historial).")
+    # else:
+    #     logger.error(f"La migración de {session_id} falló, se mantiene en Firestore.")
+    return

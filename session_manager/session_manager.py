@@ -37,47 +37,48 @@ class SessionManager:
         logger.info(f"SessionManager inicializado. Conectado a la colección: '{FIRESTORE_COLLECTION_SESSIONS_ACTIVE}'")
 
     def check_session_inactivity(self, session_id: str, hours_limit: int = 6) -> bool:
-        """
-        Verifica si una sesión específica está inactiva por más de X horas.
-        Solo se ejecuta cuando el usuario vuelve a interactuar.
-        """
-        try:
-            doc_ref = self.sessions_collection_ref.document(session_id)
-            doc = doc_ref.get(['last_activity_at', 'estado_sesion'])
+        # """
+        # Verifica si una sesión específica está inactiva por más de X horas.
+        # Solo se ejecuta cuando el usuario vuelve a interactuar.
+        # """
+        # try:
+        #     doc_ref = self.sessions_collection_ref.document(session_id)
+        #     doc = doc_ref.get(['last_activity_at', 'estado_sesion'])
 
-            if not doc.exists:
-                logger.debug(f"Sesión '{session_id}' no existe - considerada expirada")
-                return True
+        #     if not doc.exists:
+        #         logger.debug(f"Sesión '{session_id}' no existe - considerada expirada")
+        #         return True
 
-            session_data = doc.to_dict()
-            estado_sesion = session_data.get('estado_sesion')
+        #     session_data = doc.to_dict()
+        #     estado_sesion = session_data.get('estado_sesion')
 
-            if estado_sesion == "cerrado":
-                logger.debug(f"Sesión '{session_id}' ya estaba cerrada")
-                return True
+        #     if estado_sesion == "cerrado":
+        #         logger.debug(f"Sesión '{session_id}' ya estaba cerrada")
+        #         return True
 
-            last_activity_at = session_data.get('last_activity_at')
-            if not last_activity_at or not isinstance(last_activity_at, datetime):
-                logger.info(f"Sesión '{session_id}' sin timestamp válido - cerrando")
-                self.close_session(session_id, "invalid_timestamp")
-                return True
+        #     last_activity_at = session_data.get('last_activity_at')
+        #     if not last_activity_at or not isinstance(last_activity_at, datetime):
+        #         logger.info(f"Sesión '{session_id}' sin timestamp válido - cerrando")
+        #         self.close_session(session_id, "invalid_timestamp")
+        #         return True
 
-            # Calcular tiempo de inactividad
-            current_time = datetime.now(self.colombia_tz)
-            last_activity_time = last_activity_at.astimezone(self.colombia_tz)
-            hours_inactive = (current_time - last_activity_time).total_seconds() / 3600
+        #     # Calcular tiempo de inactividad
+        #     current_time = datetime.now(self.colombia_tz)
+        #     last_activity_time = last_activity_at.astimezone(self.colombia_tz)
+        #     hours_inactive = (current_time - last_activity_time).total_seconds() / 3600
 
-            if hours_inactive > hours_limit:
-                logger.info(f"Sesión '{session_id[:20]}...' inactiva {hours_inactive:.1f}h - cerrando")
-                self.close_session(session_id, f"inactive_{hours_inactive:.1f}h")
-                return True
+        #     if hours_inactive > hours_limit:
+        #         logger.info(f"Sesión '{session_id[:20]}...' inactiva {hours_inactive:.1f}h - cerrando")
+        #         self.close_session(session_id, f"inactive_{hours_inactive:.1f}h")
+        #         return True
             
-            logger.debug(f"Sesión '{session_id[:20]}...' activa ({hours_inactive:.1f}h)")
-            return False
+        #     logger.debug(f"Sesión '{session_id[:20]}...' activa ({hours_inactive:.1f}h)")
+        #     return False
 
-        except Exception as e:
-            logger.warning(f"Error verificando inactividad de sesión '{session_id}': {e}")
-            return True
+        # except Exception as e:
+        #     logger.warning(f"Error verificando inactividad de sesión '{session_id}': {e}")
+        #     return True
+        return False
         
     def _get_firestore_client(self) -> firestore.Client:
         """Crea y devuelve una instancia del cliente de Firestore."""
@@ -294,35 +295,36 @@ class SessionManager:
             return "unknown_identifier"
 
     def check_and_expire_session(self, session_id: str, expiration_seconds: int = 24 * 3600) -> bool:
-        """Verifica si una sesión ha expirado y la cierra si es necesario."""
-        try:
-            doc_ref = self.sessions_collection_ref.document(session_id)
-            doc = doc_ref.get(['last_activity_at', 'estado_sesion'])
+        # """Verifica si una sesión ha expirado y la cierra si es necesario."""
+        # try:
+        #     doc_ref = self.sessions_collection_ref.document(session_id)
+        #     doc = doc_ref.get(['last_activity_at', 'estado_sesion'])
 
-            if not doc.exists:
-                logger.debug(f"Sesión '{session_id}' no encontrada. Considerada expirada.")
-                return True
+        #     if not doc.exists:
+        #         logger.debug(f"Sesión '{session_id}' no encontrada. Considerada expirada.")
+        #         return True
 
-            session_data = doc.to_dict()
-            estado_sesion = session_data.get('estado_sesion')
+        #     session_data = doc.to_dict()
+        #     estado_sesion = session_data.get('estado_sesion')
 
-            if estado_sesion == "cerrado":
-                return True
+        #     if estado_sesion == "cerrado":
+        #         return True
 
-            last_activity_at = session_data.get('last_activity_at')
-            if not last_activity_at or not isinstance(last_activity_at, datetime):
-                self.close_session(session_id, "invalid_timestamp")
-                return True
+        #     last_activity_at = session_data.get('last_activity_at')
+        #     if not last_activity_at or not isinstance(last_activity_at, datetime):
+        #         self.close_session(session_id, "invalid_timestamp")
+        #         return True
 
-            current_time = datetime.now(self.colombia_tz)
-            last_activity_time = last_activity_at.astimezone(self.colombia_tz)
-            age_seconds = (current_time - last_activity_time).total_seconds()
+        #     current_time = datetime.now(self.colombia_tz)
+        #     last_activity_time = last_activity_at.astimezone(self.colombia_tz)
+        #     age_seconds = (current_time - last_activity_time).total_seconds()
 
-            if age_seconds > expiration_seconds:
-                self.close_session(session_id, "expired")
-                return True
-            return False
+        #     if age_seconds > expiration_seconds:
+        #         self.close_session(session_id, "expired")
+        #         return True
+        #     return False
 
-        except Exception as e:
-            logger.warning(f"Error al verificar la expiración de la sesión para '{session_id}': {e}")
-            return True
+        # except Exception as e:
+        #     logger.warning(f"Error al verificar la expiración de la sesión para '{session_id}': {e}")
+        #     return True
+        return False

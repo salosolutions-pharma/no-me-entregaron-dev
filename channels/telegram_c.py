@@ -193,24 +193,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         # ✅ NUEVO: Verificar inactividad solo cuando el usuario escribe
-        if session_id and consent_manager:
-            session_expired = consent_manager.session_manager.check_session_inactivity(session_id)
-            if session_expired:
-                # Limpiar sesión expirada y empezar nueva
-                context.user_data.clear()
-                response = ("¡Hola de nuevo! 👋 Tu sesión anterior expiró por inactividad. "
-                          "No te preocupes, podemos comenzar tu solicitud desde el inicio.")
-                await send_and_log_message(chat_id, response, context)
-                return
+        # if session_id and consent_manager:
+        #     session_expired = consent_manager.session_manager.check_session_inactivity(session_id)
+        #     if session_expired:
+        #         # Limpiar sesión expirada y empezar nueva
+        #         context.user_data.clear()
+        #         response = ("¡Hola de nuevo! 👋 Tu sesión anterior expiró por inactividad. "
+        #                   "No te preocupes, podemos comenzar tu solicitud desde el inicio.")
+        #         await send_and_log_message(chat_id, response, context)
+        #         return
 
-        # ✅ VERIFICAR si el usuario se está despidiendo
-        if (consent_manager and 
-            consent_manager.should_close_session(user_message, session_context) and 
-            session_id):
-            response = consent_manager.get_bot_response(user_message, session_context)
-            await send_and_log_message(chat_id, response, context)
-            close_user_session(session_id, context, reason="user_farewell")
-            return
+        # # ✅ VERIFICAR si el usuario se está despidiendo
+        # if (consent_manager and 
+        #     consent_manager.should_close_session(user_message, session_context) and 
+        #     session_id):
+        #     response = consent_manager.get_bot_response(user_message, session_context)
+        #     await send_and_log_message(chat_id, response, context)
+        #     close_user_session(session_id, context, reason="user_farewell")
+        #     return
 
         if session_context.get("waiting_for_field"):
             handled = await handle_field_response(update, context)
@@ -774,7 +774,9 @@ async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_
                             "• Si no hay respuesta en el plazo establecido, automáticamente escalaremos tu caso a la Superintendencia Nacional de Salud\n"
                             "• Te mantendremos informado en cada paso del proceso\n\n"
                             "✅ Proceso completado exitosamente. Si necesitas algo más, no dudes en contactarnos.\n\n"
-                            "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                            # ✅ QUITAR ESTA LÍNEA PARA NO CERRAR LA SESIÓN:
+                            # "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                            "💬 Puedes seguir escribiéndome si necesitas ayuda adicional. ¡Gracias por confiar en nosotros!"
                         )
                     else:
                         success_message = (
@@ -782,21 +784,27 @@ async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_
                             "📄 **Reclamación EPS generada exitosamente**\n\n"
                             "📋 En las próximas 48 horas te enviaremos el número de radicado.\n\n"
                             "✅ Proceso completado exitosamente. Si necesitas algo más, no dudes en contactarnos.\n\n"
-                            "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                            # ✅ QUITAR ESTA LÍNEA PARA NO CERRAR LA SESIÓN:
+                            # "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                            "💬 Puedes seguir escribiéndome si necesitas ayuda adicional. ¡Gracias por confiar en nosotros!"
                         )
                 else:
                     logger.error(f"Error guardando reclamación para paciente {patient_key}")
                     success_message = ( 
                         "⚠️ Se completó la recopilación de datos, pero hubo un problema técnico guardando tu reclamación.\n\n"
                         "📞 Nuestro equipo revisará tu caso manualmente.\n\n"
-                        "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                        # ✅ QUITAR ESTA LÍNEA PARA NO CERRAR LA SESIÓN:
+                        # "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                        "💬 Puedes seguir escribiéndome si necesitas ayuda adicional. ¡Gracias por confiar en nosotros!"
                     )
             else:
                 logger.error(f"Error generando reclamación EPS para paciente {patient_key}: {resultado_reclamacion.get('error', 'Error desconocido')}")
                 success_message = (
                     "⚠️ Se completó la recopilación de datos, pero hubo un problema técnico generando tu reclamación.\n\n"
                     "📞 Nuestro equipo revisará tu caso manualmente.\n\n"
-                    "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                    # ✅ QUITAR ESTA LÍNEA PARA NO CERRAR LA SESIÓN:
+                    # "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                    "💬 Puedes seguir escribiéndome si necesitas ayuda adicional. ¡Gracias por confiar en nosotros!"
                 )
                 
         except Exception as e:
@@ -804,18 +812,20 @@ async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_
             success_message = (
                 "⚠️ Se completó la recopilación de datos. Nuestro equipo procesará tu reclamación manualmente.\n\n"
                 "📞 Te contactaremos pronto.\n\n"
-                "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                # ✅ QUITAR ESTA LÍNEA PARA NO CERRAR LA SESIÓN:
+                # "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                "💬 Puedes seguir escribiéndome si necesitas ayuda adicional. ¡Gracias por confiar en nosotros!"
             )
         
         # 3. ENVIAR MENSAJE FINAL
         await send_and_log_message(chat_id, success_message, context)
         
-        # 4. CERRAR SESIÓN AUTOMÁTICAMENTE
-        session_id = context.user_data.get("session_id")
-        if session_id:
-            close_user_session(session_id, context, reason="process_completed_with_claim")
+        # ✅ COMENTAR ESTAS LÍNEAS PARA NO CERRAR LA SESIÓN AUTOMÁTICAMENTE:
+        # session_id = context.user_data.get("session_id")
+        # if session_id:
+        #     close_user_session(session_id, context, reason="process_completed_with_claim")
         
-        logger.info(f"Proceso completo finalizado para paciente {patient_key} - sesión cerrada automáticamente")
+        logger.info(f"Proceso completo finalizado para paciente {patient_key} - sesión MANTIENE ABIERTA")
 
 
 async def handle_informante_selection(query, context: ContextTypes.DEFAULT_TYPE, informante_type: str) -> None:

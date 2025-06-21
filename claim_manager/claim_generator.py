@@ -50,7 +50,7 @@ class ClaimGenerator:
         "numero_documento",
         "eps_estandarizada",
         "med_no_entregados",
-        "diagnostico"
+        #"diagnostico"
     ]
     
     CAMPOS_ADICIONALES_SUPERSALUD = ["ciudad", "direccion", "telefono_contacto", "correo"]
@@ -122,6 +122,8 @@ class ClaimGenerator:
         diagnostico, categoria_riesgo = self._extraer_datos_prescripcion(patient_data)
         med_no_entregados = self._obtener_medicamentos_no_entregados(patient_data)
         
+        diagnostico_texto = diagnostico if diagnostico and diagnostico.strip() else "No especificado en la prescripción"
+
         return {
             "nombre_paciente": patient_data.get("nombre_paciente", ""),
             "tipo_documento": patient_data.get("tipo_documento", ""),
@@ -133,7 +135,7 @@ class ClaimGenerator:
                 patient_data.get("telefono_contacto", [])
             ),
             "correo": self._format_array_field(patient_data.get("correo", [])),
-            "diagnostico": diagnostico,
+            "diagnostico": diagnostico_texto,
             "categoria_riesgo": categoria_riesgo,
             "med_no_entregados": med_no_entregados,
             "farmacia": patient_data.get("farmacia", ""),
@@ -210,16 +212,36 @@ class ClaimGenerator:
         return campos_faltantes
 
     def validar_datos_eps(self, datos: Dict[str, Any]) -> List[str]:
-        """Valida datos mínimos para reclamación EPS."""
-        return self._validar_campos_requeridos(datos)
+        """Valida datos mínimos para reclamación EPS - diagnóstico opcional."""
+        campos_requeridos_eps = [
+            "nombre_paciente",
+            "tipo_documento", 
+            "numero_documento",
+            "eps_estandarizada",
+            "med_no_entregados"
+            # 'diagnostico' 
+        ]
+        
+        campos_faltantes = []
+        for campo in campos_requeridos_eps:
+            valor = datos.get(campo, "")
+            if not valor or (isinstance(valor, str) and not valor.strip()):
+                campos_faltantes.append(campo)
+        
+        if campos_faltantes:
+            logger.warning(f"Campos faltantes para reclamación EPS: {campos_faltantes}")
+        
+        return campos_faltantes
 
     def validar_datos_supersalud(self, datos: Dict[str, Any]) -> List[str]:
-        """Valida datos mínimos para queja ante Supersalud."""
-        return self._validar_campos_requeridos(datos, self.CAMPOS_ADICIONALES_SUPERSALUD)
+        """Valida datos mínimos para queja ante Supersalud - diagnóstico SÍ requerido."""
+        campos_adicionales_con_diagnostico = self.CAMPOS_ADICIONALES_SUPERSALUD + ["diagnostico"]
+        return self._validar_campos_requeridos(datos, campos_adicionales_con_diagnostico)
 
     def validar_datos_tutela(self, datos: Dict[str, Any]) -> List[str]:
-        """Valida datos mínimos para tutela."""
-        return self._validar_campos_requeridos(datos, self.CAMPOS_ADICIONALES_TUTELA)
+        """Valida datos mínimos para tutela - diagnóstico SÍ requerido."""
+        campos_adicionales_con_diagnostico = self.CAMPOS_ADICIONALES_TUTELA + ["diagnostico"]
+        return self._validar_campos_requeridos(datos, campos_adicionales_con_diagnostico)
 
     def _generar_documento_legal(self, patient_key: str, tipo_documento: str,
                                gestiones_previas: Optional[List[str]] = None) -> Dict[str, Any]:
