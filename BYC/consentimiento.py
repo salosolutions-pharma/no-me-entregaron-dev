@@ -16,6 +16,13 @@ class ConsentManager:
         self.llm_core = LLMCore()
         logger.info("ConsentManager inicializado con LLM Core.")
 
+    def _convert_to_telegram_format(self, text: str) -> str:
+        """Convierte formato markdown estándar a formato Telegram."""
+        import re
+        # **texto** → *texto*
+        text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
+        return text
+
     def get_bot_response(self, user_message: str = "", 
                         session_context: Dict[str, Any] = None) -> str:
         """Genera la respuesta del bot usando el prompt BYC."""
@@ -50,6 +57,7 @@ class ConsentManager:
 - Sigue el flujo: 1) Teléfono → 2) Consentimiento → 3) Fórmula médica
 - Mantén un tono amigable y profesional con emojis.
 - NO menciones que estás usando un prompt o que eres un LLM.
+- ✅ IMPORTANTE: Usa formato Telegram para negritas: *texto* en lugar de **texto**
 
 ¿Es este un mensaje de despedida?: {"SÍ" if is_farewell else "NO"}
 
@@ -57,7 +65,7 @@ Responde ahora como el asistente "No Me Entregaron":
 """
 
             response = self.llm_core.ask_text(full_prompt)
-            return response.strip()
+            return self._convert_to_telegram_format(response.strip())
 
         except Exception as e:
             logger.error(f"Error generando respuesta con prompt BYC: {e}")

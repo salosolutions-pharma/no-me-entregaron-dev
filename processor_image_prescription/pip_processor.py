@@ -82,7 +82,7 @@ class PIPProcessor:
             logger.critical("PromptManager no disponible en PIPProcessor.")
             raise PIPProcessorError("PromptManager no disponible.")
 
-    def process_image(self, image_path: Union[str, Path], session_id: str) -> Union[str, Dict[str, Any]]:
+    def process_image(self, image_path: Union[str, Path], session_id: str, telegram_user_id: str = None) -> Union[str, Dict[str, Any]]:
         """Procesa una imagen de receta médica de principio a fin."""
         temp_image_path: Path = Path(image_path) if isinstance(image_path, str) else image_path
         try:
@@ -121,7 +121,7 @@ class PIPProcessor:
             cleaned_data["categoria_riesgo"] = self._classify_risk(cleaned_data)
             cleaned_data["canal_contacto"] = cleaned_data.get("canal_contacto", "TL")
 
-            bigquery_data = self._prepare_data_for_bigquery(cleaned_data, session_id, patient_key)
+            bigquery_data = self._prepare_data_for_bigquery(cleaned_data, session_id, patient_key, telegram_user_id)
             try:
                 insert_or_update_patient_data(bigquery_data)
                 logger.info(f"Datos del paciente guardados/actualizados en BigQuery para clave: {patient_key}")
@@ -252,9 +252,10 @@ class PIPProcessor:
         else:
             data["eps_cruda"] = None
             data["eps_estandarizada"] = None
-
-    def _prepare_data_for_bigquery(self, data: Dict[str, Any], session_id: str, patient_key: str) -> Dict[str, Any]:
+        
+    def _prepare_data_for_bigquery(self, data: Dict[str, Any], session_id: str, patient_key: str, telegram_user_id: str = None) -> Dict[str, Any]:
         """Prepara los datos en el formato correcto para la tabla de pacientes de BigQuery."""
+        
         medications_bq = []
         for med_raw in data.get("medicamentos", []):
             if isinstance(med_raw, dict):
@@ -274,6 +275,7 @@ class PIPProcessor:
 
         prescription_bq = {
             "id_session": session_id,
+            "user_id": str(telegram_user_id) if telegram_user_id else "unknown",
             "url_prescripcion": data.get("url_prescripcion_subida", ""),
             "categoria_riesgo": data.get("categoria_riesgo", "No clasificado"),
             "justificacion_riesgo": data.get("justificacion_riesgo", ""),
@@ -297,7 +299,6 @@ class PIPProcessor:
             "numero_documento": str(data.get("numero_documento", "")),
             "nombre_paciente": data.get("paciente") or data.get("nombre_paciente", ""),
             "fecha_nacimiento": data.get("fecha_nacimiento", ""),
-            "genero": data.get("genero", ""),
             "correo": correo if isinstance(correo, list) else [],
             "telefono_contacto": telefono_contacto if isinstance(telefono_contacto, list) else [],
             "canal_contacto": data.get("canal_contacto", ""),

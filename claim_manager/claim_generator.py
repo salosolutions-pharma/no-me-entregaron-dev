@@ -243,6 +243,121 @@ class ClaimGenerator:
         campos_adicionales_con_diagnostico = self.CAMPOS_ADICIONALES_TUTELA + ["diagnostico"]
         return self._validar_campos_requeridos(datos, campos_adicionales_con_diagnostico)
 
+    def _obtener_radicados_previos(self, patient_key: str, tipos_accion: List[str]) -> List[Dict[str, Any]]:
+        """
+        Obtiene radicados previos de reclamaciones específicas para el mismo paciente y medicamentos.
+        
+        Args:
+            patient_key: Clave del paciente
+            tipos_accion: Lista de tipos de acción a buscar (ej: ["reclamacion_eps"])
+            
+        Returns:
+            Lista de reclamaciones con radicados encontrados
+        """
+        try:
+            query = f"""
+            SELECT reclamaciones
+            FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
+            WHERE paciente_clave = @patient_key
+            """
+            
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)
+                ]
+            )
+            
+            results = self.bq_client.query(query, job_config=job_config).result()
+            
+            for row in results:
+                reclamaciones = row.reclamaciones if row.reclamaciones else []
+                
+                # Filtrar reclamaciones que tengan radicado y sean del tipo solicitado
+                radicados_previos = []
+                for reclamacion in reclamaciones:
+                    if (reclamacion.get("tipo_accion") in tipos_accion and 
+                        reclamacion.get("numero_radicado") and 
+                        reclamacion.get("numero_radicado").strip()):
+                        radicados_previos.append({
+                            "tipo_accion": reclamacion.get("tipo_accion"),
+                            "numero_radicado": reclamacion.get("numero_radicado"),
+                            "fecha_radicacion": reclamacion.get("fecha_radicacion"),
+                            "med_no_entregados": reclamacion.get("med_no_entregados", ""),
+                            "estado_reclamacion": reclamacion.get("estado_reclamacion")
+                        })
+                
+                return radicados_previos
+                
+            return []
+            
+        except Exception as e:
+            logger.error(f"Error obteniendo radicados previos para {patient_key}: {e}")
+            return []
+
+    def validar_requisitos_escalamiento(self, patient_key: str, tipo_escalamiento: str) -> Dict[str, Any]:
+        """
+        Valida si un paciente cumple los requisitos para un tipo específico de escalamiento.
+        
+        Args:
+            patient_key: Clave del paciente
+            tipo_escalamiento: "supersalud", "tutela", o "desacato"
+            
+        Returns:
+            Dict con información sobre si puede escalar y qué requisitos faltan
+        """
+        try:
+            requisitos = {
+                "supersalud": {
+                    "requiere": ["reclamacion_eps"],
+                    "nivel": 2,
+                    "descripcion": "Queja ante Superintendencia Nacional de Salud"
+                },
+                "tutela": {
+                    "requiere": ["reclamacion_eps"],  # Supersalud es opcional
+                    "nivel": 3,
+                    "descripcion": "Acción de tutela por vulneración del derecho a la salud"
+                },
+                "desacato": {
+                    "requiere": ["tutela_favorable"],  # Requiere fallo favorable de tutela
+                    "nivel": 4,
+                    "descripcion": "Incidente de desacato por incumplimiento de fallo de tutela"
+                }
+            }
+            
+            if tipo_escalamiento not in requisitos:
+                return {
+                    "puede_escalar": False,
+                    "error": f"Tipo de escalamiento no válido: {tipo_escalamiento}"
+                }
+            
+            config = requisitos[tipo_escalamiento]
+            
+            # Verificar requisitos específicos
+            if "reclamacion_eps" in config["requiere"]:
+                radicados_eps = self._obtener_radicados_previos(patient_key, ["reclamacion_eps"])
+                if not radicados_eps:
+                    return {
+                        "puede_escalar": False,
+                        "requisitos_faltantes": ["reclamacion_eps_radicada"],
+                        "mensaje": f"Para {config['descripcion']} se requiere al menos una reclamación EPS previa con radicado",
+                        "nivel_escalamiento": config["nivel"]
+                    }
+            
+            return {
+                "puede_escalar": True,
+                "tipo_escalamiento": tipo_escalamiento,
+                "nivel_escalamiento": config["nivel"],
+                "descripcion": config["descripcion"],
+                "patient_key": patient_key
+            }
+            
+        except Exception as e:
+            logger.error(f"Error validando requisitos de escalamiento: {e}")
+            return {
+                "puede_escalar": False,
+                "error": f"Error verificando requisitos: {str(e)}"
+            }
+
     def _generar_documento_legal(self, patient_key: str, tipo_documento: str,
                                gestiones_previas: Optional[List[str]] = None) -> Dict[str, Any]:
         """Método genérico para generar documentos legales."""
@@ -346,13 +461,158 @@ class ClaimGenerator:
         return self._generar_documento_legal(patient_key, "reclamacion_eps")
 
     def generar_reclamacion_supersalud(self, patient_key: str) -> Dict[str, Any]:
-        """Genera una queja formal ante la Superintendencia Nacional de Salud."""
-        return self._generar_documento_legal(patient_key, "reclamacion_supersalud")
+        """
+        Genera una queja formal ante la Superintendencia Nacional de Salud.
+        REQUIERE reclamaciones EPS previas con radicado para el mismo paciente.
+        """
+        try:
+            logger.info(f"Iniciando generación de reclamación Supersalud para paciente: {patient_key}")
+            
+            # 1. Verificar que existan reclamaciones EPS previas con radicado
+            radicados_eps = self._obtener_radicados_previos(patient_key, ["reclamacion_eps"])
+            
+            if not radicados_eps:
+                return {
+                    "success": False,
+                    "error": "No se encontraron reclamaciones EPS previas con radicado para este paciente",
+                    "patient_key": patient_key,
+                    "tipo_documento": "reclamacion_supersalud",
+                    "nivel_escalamiento": 2,
+                    "requisitos_faltantes": ["reclamacion_eps_radicada"]
+                }
+            
+            # 2. Obtener datos del paciente y validar
+            datos_paciente = self.obtener_datos_paciente(patient_key)
+            campos_faltantes = self.validar_datos_supersalud(datos_paciente)
+            
+            if campos_faltantes:
+                return {
+                    "success": False,
+                    "error": f"Faltan campos requeridos para Supersalud: {', '.join(campos_faltantes)}",
+                    "campos_faltantes": campos_faltantes,
+                    "patient_key": patient_key,
+                    "tipo_documento": "reclamacion_supersalud",
+                    "nivel_escalamiento": 2
+                }
+            
+            # 3. Agregar información de gestiones previas al contexto del prompt
+            gestiones_previas = []
+            for radicado in radicados_eps:
+                fecha_rad = radicado.get("fecha_radicacion", "")
+                num_rad = radicado.get("numero_radicado", "")
+                gestiones_previas.append(
+                    f"Reclamación ante EPS radicada el {fecha_rad} bajo el número {num_rad}"
+                )
+            
+            datos_paciente["gestiones_previas_eps"] = ". ".join(gestiones_previas)
+            datos_paciente["radicados_previos"] = radicados_eps
+            
+            # 4. Generar documento usando el método base
+            resultado = self._generar_documento_legal(patient_key, "reclamacion_supersalud")
+            
+            if resultado["success"]:
+                resultado["nivel_escalamiento"] = 2
+                resultado["radicados_eps_previos"] = radicados_eps
+                resultado["gestiones_previas"] = gestiones_previas
+                
+            return resultado
+            
+        except Exception as e:
+            logger.error(f"Error inesperado generando reclamación Supersalud para {patient_key}: {e}")
+            return {
+                "success": False,
+                "error": f"Error inesperado: {str(e)}",
+                "tipo_reclamacion": "reclamacion_supersalud",
+                "patient_key": patient_key,
+                "nivel_escalamiento": 2
+            }
 
     def generar_tutela(self, patient_key: str, 
                       gestiones_previas: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Genera una acción de tutela por vulneración del derecho a la salud."""
-        return self._generar_documento_legal(patient_key, "tutela", gestiones_previas)
+        """
+        Genera una acción de tutela por vulneración del derecho a la salud.
+        REQUIERE reclamaciones EPS y opcionalmente Supersalud previas con radicado.
+        """
+        try:
+            logger.info(f"Iniciando generación de tutela para paciente: {patient_key}")
+            
+            # 1. Verificar gestiones previas obligatorias
+            radicados_eps = self._obtener_radicados_previos(patient_key, ["reclamacion_eps"])
+            radicados_supersalud = self._obtener_radicados_previos(patient_key, ["reclamacion_supersalud"])
+            
+            if not radicados_eps:
+                return {
+                    "success": False,
+                    "error": "No se encontraron reclamaciones EPS previas con radicado para generar tutela",
+                    "patient_key": patient_key,
+                    "tipo_documento": "tutela",
+                    "nivel_escalamiento": 3,
+                    "requisitos_faltantes": ["reclamacion_eps_radicada"]
+                }
+            
+            # 2. Obtener datos del paciente y validar
+            datos_paciente = self.obtener_datos_paciente(patient_key)
+            campos_faltantes = self.validar_datos_tutela(datos_paciente)
+            
+            if campos_faltantes:
+                return {
+                    "success": False,
+                    "error": f"Faltan campos requeridos para tutela: {', '.join(campos_faltantes)}",
+                    "campos_faltantes": campos_faltantes,
+                    "patient_key": patient_key,
+                    "tipo_documento": "tutela",
+                    "nivel_escalamiento": 3
+                }
+            
+            # 3. Construir gestiones previas automáticamente si no se proporcionan
+            if not gestiones_previas:
+                gestiones_previas = []
+                
+                # Agregar reclamaciones EPS
+                for radicado in radicados_eps:
+                    fecha_rad = radicado.get("fecha_radicacion", "")
+                    num_rad = radicado.get("numero_radicado", "")
+                    gestiones_previas.append(
+                        f"Reclamación ante {datos_paciente.get('eps_estandarizada', 'EPS')} "
+                        f"radicada el {fecha_rad} bajo el número {num_rad} sin respuesta satisfactoria"
+                    )
+                
+                # Agregar reclamaciones Supersalud si existen
+                for radicado in radicados_supersalud:
+                    fecha_rad = radicado.get("fecha_radicacion", "")
+                    num_rad = radicado.get("numero_radicado", "")
+                    gestiones_previas.append(
+                        f"Queja ante Superintendencia Nacional de Salud "
+                        f"radicada el {fecha_rad} bajo el número {num_rad} sin respuesta satisfactoria"
+                    )
+                
+                # Agregar gestiones adicionales estándar
+                gestiones_previas.extend([
+                    "Múltiples solicitudes presenciales y telefónicas ante la EPS",
+                    "Agotamiento de medios ordinarios de reclamación administrativa"
+                ])
+            
+            # 4. Generar documento
+            resultado = self._generar_documento_legal(patient_key, "tutela", gestiones_previas)
+            
+            if resultado["success"]:
+                resultado["nivel_escalamiento"] = 3
+                resultado["radicados_eps_previos"] = radicados_eps
+                resultado["radicados_supersalud_previos"] = radicados_supersalud
+                resultado["requiere_pdf"] = True
+                resultado["requiere_firma_paciente"] = True
+                
+            return resultado
+            
+        except Exception as e:
+            logger.error(f"Error inesperado generando tutela para {patient_key}: {e}")
+            return {
+                "success": False,
+                "error": f"Error inesperado: {str(e)}",
+                "tipo_reclamacion": "tutela",
+                "patient_key": patient_key,
+                "nivel_escalamiento": 3
+            }
 
     def obtener_preview_datos(self, patient_key: str, 
                              tipo_documento: str = "reclamacion_eps") -> Dict[str, Any]:
@@ -412,7 +672,7 @@ def generar_reclamacion_eps(patient_key: str) -> Dict[str, Any]:
 
 
 def generar_reclamacion_supersalud(patient_key: str) -> Dict[str, Any]:
-    """Función de conveniencia para generar queja ante Supersalud."""
+    """Función de conveniencia para generar queja ante Supersalud con validación de requisitos."""
     if not claim_generator:
         return {"success": False, "error": "ClaimGenerator no disponible"}
     return claim_generator.generar_reclamacion_supersalud(patient_key)
@@ -420,10 +680,17 @@ def generar_reclamacion_supersalud(patient_key: str) -> Dict[str, Any]:
 
 def generar_tutela(patient_key: str, 
                   gestiones_previas: Optional[List[str]] = None) -> Dict[str, Any]:
-    """Función de conveniencia para generar tutela."""
+    """Función de conveniencia para generar tutela con validación de requisitos."""
     if not claim_generator:
         return {"success": False, "error": "ClaimGenerator no disponible"}
     return claim_generator.generar_tutela(patient_key, gestiones_previas)
+
+
+def validar_requisitos_escalamiento(patient_key: str, tipo_escalamiento: str) -> Dict[str, Any]:
+    """Función de conveniencia para validar requisitos de escalamiento."""
+    if not claim_generator:
+        return {"puede_escalar": False, "error": "ClaimGenerator no disponible"}
+    return claim_generator.validar_requisitos_escalamiento(patient_key, tipo_escalamiento)
 
 
 def preview_datos_paciente(patient_key: str, 
@@ -432,6 +699,7 @@ def preview_datos_paciente(patient_key: str,
     if not claim_generator:
         return {"success": False, "error": "ClaimGenerator no disponible"}
     return claim_generator.obtener_preview_datos(patient_key, tipo_documento)
+
 
 def validar_disponibilidad_supersalud() -> Dict[str, Any]:
     """

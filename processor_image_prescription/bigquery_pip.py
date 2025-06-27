@@ -382,7 +382,6 @@ def _prepare_clean_patient_record(patient_data: Dict[str, Any],
         "eps_cruda": patient_data.get("eps_cruda"),
         "eps_estandarizada": patient_data.get("eps_estandarizada"),
         "informante": patient_data.get("informante", []),
-        "sesiones": patient_data.get("sesiones", []),
         "prescripciones": patient_data.get("prescripciones", []),
         "reclamaciones": patient_data.get("reclamaciones", []),
     }
@@ -411,7 +410,7 @@ def _prepare_clean_patient_record(patient_data: Dict[str, Any],
 
     for key, value in new_patient_record.items():
         if value is None:
-            if key in ["correo", "telefono_contacto", "informante", "sesiones", "prescripciones", "reclamaciones"]:
+            if key in ["correo", "telefono_contacto", "informante", "prescripciones", "reclamaciones"]:
                 new_patient_record[key] = []
             else:
                 new_patient_record[key] = ""
@@ -494,4 +493,174 @@ def update_patient_medications_no_buffer(patient_key: str, session_id: str,
 
     except Exception as e:
         logger.error(f"Error actualizando medicamentos SIN BÚFER para paciente '{patient_key}': {e}")
+        return False
+    
+def save_document_url_to_reclamacion(patient_key: str, nivel_escalamiento: int, 
+                                    url_documento: str, tipo_documento: str) -> bool:
+    """
+    Actualiza la URL del documento generado en la reclamación correspondiente.
+    
+    Args:
+        patient_key: Clave del paciente
+        nivel_escalamiento: Nivel de escalamiento de la reclamación (2=Supersalud, 3=Tutela, 4=Desacato)
+        url_documento: URL del documento en Cloud Storage
+        tipo_documento: Tipo de documento ("tutela", "desacato")
+        
+    Returns:
+        bool: True si se actualizó correctamente
+    """
+    if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
+        raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
+
+    client = get_bigquery_client()
+    table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+
+    try:
+        # Obtener datos actuales del paciente
+        get_query = f"""
+            SELECT * FROM `{table_reference}`
+            WHERE paciente_clave = @patient_key
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)]
+        )
+        
+        results = client.query(get_query, job_config=job_config).result()
+        current_data = None
+        
+        for row in results:
+            current_data = _convert_bq_row_to_dict_recursive(row)
+            break
+        
+        if not current_data:
+            logger.error(f"Paciente {patient_key} no encontrado para actualizar URL de documento.")
+            return False
+        
+        # Encontrar y actualizar la reclamación correspondiente
+        reclamaciones = current_data.get("reclamaciones", [])
+        reclamacion_actualizada = False
+        
+        for reclamacion in reclamaciones:
+            if reclamacion.get("nivel_escalamiento") == nivel_escalamiento:
+                reclamacion["url_documento"] = url_documento
+                reclamacion["fecha_generacion_documento"] = datetime.now().isoformat()
+                reclamacion["tipo_documento"] = tipo_documento
+                reclamacion_actualizada = True
+                logger.info(f"URL de documento actualizada para nivel {nivel_escalamiento}: {url_documento}")
+                break
+        
+        if not reclamacion_actualizada:
+            logger.warning(f"No se encontró reclamación de nivel {nivel_escalamiento} para paciente {patient_key}")
+            return False
+        
+        # Actualizar usando DELETE + INSERT
+        current_data["reclamaciones"] = reclamaciones
+        
+        delete_query = f"""
+            DELETE FROM `{table_reference}`
+            WHERE paciente_clave = @patient_key
+        """
+        
+        delete_job = client.query(delete_query, job_config=job_config)
+        delete_job.result()
+        logger.info(f"Registro {patient_key} eliminado para actualizar URL de documento.")
+        
+        load_table_from_json_direct([current_data], table_reference)
+        logger.info(f"URL de documento guardada para paciente {patient_key}, nivel {nivel_escalamiento}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error guardando URL de documento: {e}")
+        return False
+
+
+def update_reclamacion_status(patient_key: str, nivel_escalamiento: int, 
+                            nuevo_estado: str, numero_radicado: str = None, 
+                            fecha_radicacion: str = None) -> bool:
+    """
+    Actualiza el estado y radicado de una reclamación específica.
+    
+    Args:
+        patient_key: Clave del paciente
+        nivel_escalamiento: Nivel de escalamiento de la reclamación
+        nuevo_estado: Nuevo estado ("pendiente_radicacion", "radicado", "resuelto", etc.)
+        numero_radicado: Número de radicado (opcional)
+        fecha_radicacion: Fecha de radicación (opcional)
+        
+    Returns:
+        bool: True si se actualizó correctamente
+    """
+    if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
+        raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
+
+    client = get_bigquery_client()
+    table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+
+    try:
+        # Obtener datos actuales del paciente
+        get_query = f"""
+            SELECT * FROM `{table_reference}`
+            WHERE paciente_clave = @patient_key
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)]
+        )
+        
+        results = client.query(get_query, job_config=job_config).result()
+        current_data = None
+        
+        for row in results:
+            current_data = _convert_bq_row_to_dict_recursive(row)
+            break
+        
+        if not current_data:
+            logger.error(f"Paciente {patient_key} no encontrado para actualizar estado de reclamación.")
+            return False
+        
+        # Encontrar y actualizar la reclamación correspondiente
+        reclamaciones = current_data.get("reclamaciones", [])
+        reclamacion_actualizada = False
+        
+        for reclamacion in reclamaciones:
+            if reclamacion.get("nivel_escalamiento") == nivel_escalamiento:
+                reclamacion["estado_reclamacion"] = nuevo_estado
+                
+                if numero_radicado:
+                    reclamacion["numero_radicado"] = numero_radicado
+                    
+                if fecha_radicacion:
+                    reclamacion["fecha_radicacion"] = fecha_radicacion
+                else:
+                    # Si se proporciona radicado pero no fecha, usar fecha actual
+                    if numero_radicado:
+                        reclamacion["fecha_radicacion"] = datetime.now().strftime("%Y-%m-%d")
+                
+                reclamacion_actualizada = True
+                logger.info(f"Estado de reclamación actualizado para nivel {nivel_escalamiento}: {nuevo_estado}")
+                break
+        
+        if not reclamacion_actualizada:
+            logger.warning(f"No se encontró reclamación de nivel {nivel_escalamiento} para paciente {patient_key}")
+            return False
+        
+        # Actualizar usando DELETE + INSERT
+        current_data["reclamaciones"] = reclamaciones
+        
+        delete_query = f"""
+            DELETE FROM `{table_reference}`
+            WHERE paciente_clave = @patient_key
+        """
+        
+        delete_job = client.query(delete_query, job_config=job_config)
+        delete_job.result()
+        logger.info(f"Registro {patient_key} eliminado para actualizar estado de reclamación.")
+        
+        load_table_from_json_direct([current_data], table_reference)
+        logger.info(f"Estado de reclamación actualizado para paciente {patient_key}, nivel {nivel_escalamiento}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error actualizando estado de reclamación: {e}")
         return False

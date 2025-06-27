@@ -104,7 +104,7 @@ class SessionManager:
         timestamp_str = now.strftime("%Y%m%d_%H%M%S")
         return f"{channel}_{normalized_identifier}_{timestamp_str}"
 
-    def create_session(self, user_identifier: str, channel: str = "TL") -> str:
+    def create_session(self, user_identifier: str, channel: str = "TL", telegram_user_id: str = None) -> str:
         """Crea un nuevo documento de sesión en Firestore."""
         session_id = self.generate_session_id(user_identifier, channel)
         current_time_iso = datetime.now(self.colombia_tz).isoformat()
@@ -112,6 +112,7 @@ class SessionManager:
         session_data = {
             "id_sesion": session_id,
             "user_identifier": user_identifier,
+            "telegram_user_id": str(telegram_user_id) if telegram_user_id else None,
             "channel": channel,
             "created_at": firestore.SERVER_TIMESTAMP,
             "last_activity_at": firestore.SERVER_TIMESTAMP,
@@ -121,6 +122,7 @@ class SessionManager:
                 "message": "Sesión iniciada.",
                 "event_type": "session_started",
                 "user_id": user_identifier,
+                "telegram_user_id": str(telegram_user_id) if telegram_user_id else None,
             }],
             "consentimiento": None,
             "timestamp_consentimiento": None,
@@ -130,7 +132,7 @@ class SessionManager:
         try:
             doc_ref = self.sessions_collection_ref.document(session_id)
             doc_ref.set(session_data)
-            logger.info(f"Sesión '{session_id}' creada en Firestore.")
+            logger.info(f"Sesión '{session_id}' creada con telegram_user_id: {telegram_user_id}")
             return session_id
         except GoogleAPIError as e:
             logger.error(f"Error de Firestore al crear la sesión '{session_id}': {e}", exc_info=True)
@@ -225,17 +227,18 @@ class SessionManager:
 
     
 
-    def create_session_with_history_check(self, user_identifier: str, channel: str = "TL") -> Dict[str, Any]:
+    def create_session_with_history_check(self, user_identifier: str, channel: str = "TL", telegram_user_id: str = None) -> Dict[str, Any]:
         """Crea una nueva sesión inmediatamente."""
         normalized_identifier = self._normalize_user_identifier(user_identifier)
 
         try:
-            logger.info(f"Creando sesión para '{normalized_identifier}'.")
-            new_session_id = self.create_session(normalized_identifier, channel)
+            logger.info(f"Creando sesión para '{normalized_identifier}' con telegram_user_id: {telegram_user_id}")
+            new_session_id = self.create_session(normalized_identifier, channel, telegram_user_id)
 
             return {
                 "new_session_id": new_session_id,
                 "user_identifier": normalized_identifier,
+                "telegram_user_id": str(telegram_user_id) if telegram_user_id else None,
                 "channel": channel,
                 "has_previous_history": False,
                 "previous_sessions_count": 0,
@@ -249,6 +252,7 @@ class SessionManager:
             return {
                 "new_session_id": fallback_session_id,
                 "user_identifier": normalized_identifier,
+                "telegram_user_id": str(telegram_user_id) if telegram_user_id else None,
                 "channel": channel,
                 "has_previous_history": False,
                 "previous_sessions_count": 0,

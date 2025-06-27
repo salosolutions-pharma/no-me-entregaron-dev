@@ -128,6 +128,7 @@ def get_session_context(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
         "consent_asked": context.user_data.get("consent_asked", False),
         "prescription_uploaded": context.user_data.get("prescription_uploaded", False),
         "session_id": context.user_data.get("session_id"),
+        "telegram_user_id": context.user_data.get("telegram_user_id"),
         "waiting_for_field": context.user_data.get("waiting_for_field"),
         "patient_key": context.user_data.get("patient_key"),
         "detected_channel": context.user_data.get("detected_channel", "TL"),
@@ -160,11 +161,12 @@ async def send_and_log_message(chat_id: int, text: str, context: ContextTypes.DE
                               reply_markup: Optional[Any] = None) -> None:
     """Envía un mensaje al usuario y lo registra en la sesión."""
     formatted_text = format_telegram_text(text)
+    
     await context.bot.send_message(
         chat_id=chat_id,
         text=formatted_text,
         reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
+        parse_mode=ParseMode.MARKDOWN  
     )
 
     session_id = context.user_data.get("session_id")
@@ -256,10 +258,11 @@ def close_user_session(session_id: str, context: ContextTypes.DEFAULT_TYPE, reas
 async def process_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Procesa el contacto compartido por el usuario."""
     chat_id = update.effective_chat.id
+    telegram_user_id = update.effective_user.id
     contact = update.message.contact
     phone = contact.phone_number if contact else None
 
-    logger.info(f"Contacto recibido: {phone}")
+    logger.info(f"Contacto recibido: {phone} de user_id: {telegram_user_id}")
 
     if not phone:
         await send_and_log_message(chat_id, "No pude obtener tu número. Por favor, inténtalo de nuevo.", context)
@@ -269,13 +272,19 @@ async def process_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not consent_manager or not consent_manager.session_manager:
             raise ValueError("ConsentManager o SessionManager no inicializado.")
 
-        new_session_id = consent_manager.session_manager.create_session(phone, channel="TL")
+        new_session_id = consent_manager.session_manager.create_session(
+            phone, 
+            channel="TL", 
+            telegram_user_id=telegram_user_id
+        )
+        
         context.user_data["session_id"] = new_session_id
         context.user_data["phone"] = phone
         context.user_data["phone_shared"] = True
         context.user_data["detected_channel"] = "TL"
+        context.user_data["telegram_user_id"] = telegram_user_id  # 🟢 GUARDAR para uso posterior
 
-        logger.info(f"Sesión creada: {new_session_id}")
+        logger.info(f"Sesión creada: {new_session_id} para user_id: {telegram_user_id}")
 
         session_context = get_session_context(context)
         response = consent_manager.get_bot_response("He compartido mi número de teléfono", session_context)
@@ -374,6 +383,7 @@ async def handle_consent_response(query, context: ContextTypes.DEFAULT_TYPE,
 async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Procesa imágenes de recetas médicas."""
     chat_id = update.effective_chat.id
+    telegram_user_id = update.effective_user.id
     session_context = get_session_context(context)
 
     if not session_context.get("consent_given"):
@@ -409,7 +419,7 @@ async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         context.user_data["detected_channel"] = "TL"
 
-        result = pip_processor_instance.process_image(temp_image_path, session_id)
+        result = pip_processor_instance.process_image(temp_image_path, session_id, telegram_user_id=telegram_user_id)
         await processing_msg.delete()
 
         if isinstance(result, str):
@@ -619,19 +629,7 @@ async def save_reclamacion_to_database(patient_key: str, tipo_accion: str,
                                      nivel_escalamiento: int, 
                                      resultado_claim_generator: Dict[str, Any] = None) -> bool:
     """
-    Guarda la reclamación generada en la tabla pacientes.reclamaciones.
-    ACTUALIZADA para usar datos del claim_generator y evitar campos inexistentes.
-    
-    Args:
-        patient_key: Clave del paciente
-        tipo_accion: Tipo de reclamación ("reclamacion_eps", "reclamacion_supersalud", "tutela")
-        texto_reclamacion: Texto completo de la reclamación generada
-        estado_reclamacion: Estado actual (pendiente_radicacion, radicado, etc.)
-        nivel_escalamiento: Nivel de escalamiento (1 = primera reclamación, 2 = Supersalud, etc.)
-        resultado_claim_generator: Resultado completo del claim_generator (opcional)
-        
-    Returns:
-        bool: True si se guardó exitosamente, False en caso contrario
+    VERSIÓN ACTUALIZADA que soporta URLs de documentos para tutelas.
     """
     try:
         from processor_image_prescription.bigquery_pip import get_bigquery_client, _convert_bq_row_to_dict_recursive
@@ -640,7 +638,6 @@ async def save_reclamacion_to_database(patient_key: str, tipo_accion: str,
         
         client = get_bigquery_client()
         
-        # Usar variables de entorno para la consulta
         from processor_image_prescription.bigquery_pip import PROJECT_ID, DATASET_ID, TABLE_ID
         table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
         
@@ -680,20 +677,17 @@ async def save_reclamacion_to_database(patient_key: str, tipo_accion: str,
             
             med_no_entregados_from_prescriptions = ", ".join(meds_no_entregados)
         
-        # 2. Preparar nueva reclamación SIN los campos problemáticos
+        # 2. Preparar nueva reclamación CON soporte para URL de documento
         nueva_reclamacion = {
             "med_no_entregados": med_no_entregados_from_prescriptions,
             "tipo_accion": tipo_accion,
             "texto_reclamacion": texto_reclamacion,
             "estado_reclamacion": estado_reclamacion,
             "nivel_escalamiento": nivel_escalamiento,
-            "url_documento": "",  # Solo para tutelas
+            "url_documento": "",  # Se llena después si es tutela/desacato
             "numero_radicado": "",  # Se llena cuando se radica
             "fecha_radicacion": None,  # Se llena cuando se radica
             "fecha_revision": None,   # Se llena cuando hay respuesta
-            # REMOVIDOS los campos que causaban error:
-            # "fecha_generacion": datetime.now().isoformat(),
-            # "entidad_destinataria": _get_entidad_destinataria(tipo_accion, current_data)
         }
         
         # 3. Agregar a reclamaciones existentes
@@ -722,6 +716,253 @@ async def save_reclamacion_to_database(patient_key: str, tipo_accion: str,
         logger.error(f"Error guardando reclamación en base de datos para paciente {patient_key}: {e}")
         return False
     
+async def generar_reclamacion_supersalud_flow(patient_key: str, chat_id: int, 
+                                             context: ContextTypes.DEFAULT_TYPE, 
+                                             session_id: str) -> Dict[str, Any]:
+    """
+    Flujo completo para generar reclamación ante Supersalud.
+    """
+    try:
+        from claim_manager.claim_generator import generar_reclamacion_supersalud
+        
+        # Generar reclamación
+        resultado_supersalud = generar_reclamacion_supersalud(patient_key)
+        
+        if resultado_supersalud["success"]:
+            # Guardar en base de datos
+            success_saved = await save_reclamacion_to_database(
+                patient_key=patient_key,
+                tipo_accion="reclamacion_supersalud",
+                texto_reclamacion=resultado_supersalud["texto_reclamacion"],
+                estado_reclamacion="pendiente_radicacion",
+                nivel_escalamiento=2,
+                resultado_claim_generator=resultado_supersalud
+            )
+            
+            if success_saved:
+                logger.info(f"Reclamación Supersalud generada y guardada para paciente {patient_key}")
+                
+                # Mensaje informativo sobre el proceso
+                mensaje_info = (
+                    "📄 **Queja ante Superintendencia Nacional de Salud generada**\n\n"
+                    "📋 En las próximas 48 horas radicaremos tu queja ante la Superintendencia.\n\n"
+                    "🔄 **Proceso automático:**\n"
+                    "• Seguimiento de plazos de respuesta\n"
+                    "• Escalamiento a tutela si es necesario\n"
+                    "• Notificaciones automáticas de avances\n\n"
+                    "💬 Te mantendremos informado en cada paso."
+                )
+                
+                await send_and_log_message(chat_id, mensaje_info, context)
+                if session_id:
+                    await log_user_message(session_id, "Reclamación Supersalud generada exitosamente", "supersalud_generated")
+                
+                return {"success": True, "message": "Reclamación Supersalud generada"}
+            else:
+                logger.error(f"Error guardando reclamación Supersalud para paciente {patient_key}")
+                return {"success": False, "error": "Error guardando en base de datos"}
+        else:
+            error_msg = resultado_supersalud.get("error", "Error desconocido")
+            logger.error(f"Error generando reclamación Supersalud: {error_msg}")
+            return {"success": False, "error": error_msg}
+            
+    except Exception as e:
+        logger.error(f"Error en flujo Supersalud para paciente {patient_key}: {e}")
+        return {"success": False, "error": f"Error inesperado: {str(e)}"}
+
+
+async def generar_tutela_flow(patient_key: str, chat_id: int, 
+                             context: ContextTypes.DEFAULT_TYPE, 
+                             session_id: str) -> Dict[str, Any]:
+    """
+    Flujo completo para generar tutela incluyendo PDF.
+    """
+    try:
+        from claim_manager.claim_generator import generar_tutela
+        from processor_image_prescription.pdf_generator import generar_pdf_tutela
+        from processor_image_prescription.bigquery_pip import save_document_url_to_reclamacion
+        
+        # Generar tutela
+        resultado_tutela = generar_tutela(patient_key)
+        
+        if resultado_tutela["success"]:
+            # Generar PDF
+            pdf_result = generar_pdf_tutela(resultado_tutela)
+            
+            if pdf_result.get("success"):
+                pdf_url = pdf_result.get("pdf_url")
+                
+                # Guardar reclamación en base de datos
+                success_saved = await save_reclamacion_to_database(
+                    patient_key=patient_key,
+                    tipo_accion="tutela",
+                    texto_reclamacion=resultado_tutela["texto_reclamacion"],
+                    estado_reclamacion="pendiente_radicacion",
+                    nivel_escalamiento=3,
+                    resultado_claim_generator=resultado_tutela
+                )
+                
+                if success_saved and pdf_url:
+                    # Guardar URL del PDF en la reclamación
+                    save_document_url_to_reclamacion(
+                        patient_key=patient_key,
+                        nivel_escalamiento=3,
+                        url_documento=pdf_url,
+                        tipo_documento="tutela"
+                    )
+                    
+                    logger.info(f"Tutela y PDF generados para paciente {patient_key}: {pdf_url}")
+                    
+                    # Mensaje con instrucciones para el paciente
+                    mensaje_tutela = (
+                        "⚖️ **Acción de Tutela generada exitosamente**\n\n"
+                        "📄 **Tu documento está listo para firmar y radicar**\n\n"
+                        "📋 **Instrucciones importantes:**\n"
+                        "1. **Descargar** el documento PDF que te enviaremos\n"
+                        "2. **Imprimir** el documento en papel\n"
+                        "3. **Firmar** en el lugar indicado\n"
+                        "4. **Radicar** en cualquier juzgado de tu ciudad\n\n"
+                        "📞 **¿Necesitas ayuda?** Responde a este mensaje si tienes dudas.\n\n"
+                        "⚠️ **Importante:** Este documento debe ser firmado por ti y radicado personalmente."
+                    )
+                    
+                    await send_and_log_message(chat_id, mensaje_tutela, context)
+                    
+                    # Enviar el PDF como enlace (en producción se podría enviar como archivo)
+                    try:
+                        await send_and_log_message(
+                            chat_id, 
+                            f"📎 **Enlace a tu documento de tutela:**\n\n{pdf_url}\n\n"
+                            f"💡 Descarga el archivo, imprímelo, fírmalo y radícalo en un juzgado.", 
+                            context
+                        )
+                    except Exception as send_error:
+                        logger.warning(f"Error enviando PDF: {send_error}")
+                        await send_and_log_message(
+                            chat_id,
+                            "📎 Tu documento de tutela ha sido generado. "
+                            "Te contactaremos para enviártelo.",
+                            context
+                        )
+                    
+                    if session_id:
+                        await log_user_message(session_id, "Tutela y PDF generados exitosamente", "tutela_generated")
+                    
+                    return {"success": True, "message": "Tutela y PDF generados", "pdf_url": pdf_url}
+                else:
+                    logger.error(f"Error guardando tutela para paciente {patient_key}")
+                    return {"success": False, "error": "Error guardando tutela en base de datos"}
+            else:
+                # Tutela generada pero PDF falló
+                logger.warning(f"Tutela generada pero PDF falló para paciente {patient_key}")
+                
+                # Guardar solo la tutela sin PDF
+                success_saved = await save_reclamacion_to_database(
+                    patient_key=patient_key,
+                    tipo_accion="tutela",
+                    texto_reclamacion=resultado_tutela["texto_reclamacion"],
+                    estado_reclamacion="pendiente_radicacion",
+                    nivel_escalamiento=3,
+                    resultado_claim_generator=resultado_tutela
+                )
+                
+                if success_saved:
+                    await send_and_log_message(
+                        chat_id,
+                        "⚖️ **Tutela generada exitosamente**\n\n"
+                        "📄 El texto de tu tutela está listo.\n"
+                        "📞 Te contactaremos para enviarte el documento.",
+                        context
+                    )
+                    return {"success": True, "message": "Tutela generada (PDF pendiente)"}
+                else:
+                    return {"success": False, "error": "Error guardando tutela"}
+        else:
+            error_msg = resultado_tutela.get("error", "Error desconocido")
+            logger.error(f"Error generando tutela: {error_msg}")
+            return {"success": False, "error": error_msg}
+            
+    except Exception as e:
+        logger.error(f"Error en flujo de tutela para paciente {patient_key}: {e}")
+        return {"success": False, "error": f"Error inesperado: {str(e)}"}
+
+
+# Función auxiliar para uso manual del escalamiento
+async def manejar_escalamiento_manual(update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                                     patient_key: str, tipo_escalamiento: str) -> None:
+    """
+    Maneja solicitudes manuales de escalamiento desde el bot.
+    
+    Args:
+        update: Update de Telegram
+        context: Contexto de Telegram
+        patient_key: Clave del paciente
+        tipo_escalamiento: "supersalud" o "tutela"
+    """
+    chat_id = update.effective_chat.id
+    session_id = context.user_data.get("session_id")
+    
+    try:
+        # Validar requisitos de escalamiento
+        from claim_manager.claim_generator import validar_requisitos_escalamiento
+        
+        validacion = validar_requisitos_escalamiento(patient_key, tipo_escalamiento)
+        
+        if not validacion.get("puede_escalar"):
+            requisitos_faltantes = validacion.get("requisitos_faltantes", [])
+            mensaje_error = validacion.get("mensaje", "No se cumplen los requisitos para escalar")
+            
+            await send_and_log_message(
+                chat_id, 
+                f"⚠️ **No se puede proceder con {tipo_escalamiento.title()}**\n\n"
+                f"{mensaje_error}\n\n"
+                f"📋 Requisitos faltantes: {', '.join(requisitos_faltantes)}", 
+                context
+            )
+            return
+        
+        # Procesar escalamiento según tipo
+        if tipo_escalamiento == "supersalud":
+            resultado = await generar_reclamacion_supersalud_flow(patient_key, chat_id, context, session_id)
+        elif tipo_escalamiento == "tutela":
+            resultado = await generar_tutela_flow(patient_key, chat_id, context, session_id)
+        else:
+            await send_and_log_message(
+                chat_id, 
+                f"❌ Tipo de escalamiento no válido: {tipo_escalamiento}", 
+                context
+            )
+            return
+        
+        # Enviar mensaje de resultado
+        if resultado.get("success"):
+            nivel = validacion.get("nivel_escalamiento", 0)
+            await send_and_log_message(
+                chat_id,
+                f"✅ **{tipo_escalamiento.title()} generada exitosamente**\n\n"
+                f"📄 Nivel de escalamiento: {nivel}\n\n"
+                f"🎯 Tu caso ha sido escalado. Te mantendremos informado del proceso.",
+                context
+            )
+        else:
+            error_msg = resultado.get("error", "Error desconocido")
+            await send_and_log_message(
+                chat_id,
+                f"❌ **Error generando {tipo_escalamiento}**\n\n"
+                f"💬 {error_msg}\n\n"
+                f"📞 Nuestro equipo revisará tu caso manualmente.",
+                context
+            )
+            
+    except Exception as e:
+        logger.error(f"Error en escalamiento manual {tipo_escalamiento} para paciente {patient_key}: {e}")
+        await send_and_log_message(
+            chat_id,
+            f"⚠️ Ocurrió un error procesando tu solicitud de {tipo_escalamiento}. "
+            f"Nuestro equipo revisará tu caso manualmente.",
+            context
+        )
+
 async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_TYPE, patient_key: str) -> None:
     """Obtiene y solicita el siguiente campo faltante al usuario."""
     field_prompt = claim_manager.get_next_missing_field_prompt(patient_key)
@@ -952,9 +1193,14 @@ def setup_job_queue(application: Application) -> None:
 def format_telegram_text(text: str) -> str:
     """Convierte formato markdown a formato Telegram correcto"""
     import re
-    return re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
+    text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
+    text = text.replace('_', r'\_')
+    text = text.replace('[', r'\[')
+    text = text.replace(']', r'\]')
 
-def main() -> None:
+    return text
+
+"""def main() -> None:
     "Función principal para iniciar el bot de Telegram."
     logger.info("Iniciando Bot de Telegram...")
 
@@ -975,47 +1221,43 @@ if __name__ == "__main__":
 
 """
 def create_application() -> Application:
-      
-    
-      
-      Carga y configura una instancia de Application de python-telegram-bot:
-       - Verifica que los componentes críticos (ConsentManager, PIPProcessor, ClaimManager) estén inicializados.
-       - Construye el Application con el TOKEN de Telegram.
-       - Registra los jobs y handlers.
-      Úsala para polling (local) o para procesar webhooks (production).
+    '''Carga y configura una instancia de Application de python-telegram-bot:
+    - Verifica que los componentes críticos (ConsentManager, PIPProcessor, ClaimManager) estén inicializados.
+    - Construye el Application con el TOKEN de Telegram.
+    - Registra los jobs y handlers.
+    Se usa para desplegar en cloudrun'''
      
-      logger.info("Configurando la aplicación del bot de Telegram...")
+    logger.info("Configurando la aplicación del bot de Telegram...")
 
-      # Verificación de componentes
-      if not all([consent_manager, pip_processor_instance, claim_manager]):       
-          logger.critical("Uno o más componentes críticos no están inicializados. Abortando.")
-          sys.exit(1)
+    # Verificación de componentes
+    if not all([consent_manager, pip_processor_instance, claim_manager]):       
+        logger.critical("Uno o más componentes críticos no están inicializados. Abortando.")
+        sys.exit(1)
 
-      # Construcción de la aplicación
-      application = (
-          Application.builder()
-          .token(TELEGRAM_API_TOKEN)
-          .build())
+    # Construcción de la aplicación
+    application = (
+        Application.builder()
+        .token(TELEGRAM_API_TOKEN)
+        .build())
 
-      #await application.initialize()
-      # Registro de jobs periódicos (expiración de sesiones, etc.)
-      setup_job_queue(application)
+    #await application.initialize()
+    # Registro de jobs periódicos (expiración de sesiones, etc.)
+    setup_job_queue(application)
 
-      # Registro de handlers de mensajes y callbacks
-      setup_handlers(application)
+    # Registro de handlers de mensajes y callbacks
+    setup_handlers(application)
 
-      logger.info("Aplicación configurada correctamente.")
-      return application
+    logger.info("Aplicación configurada correctamente.")
+    return application
 
 
 def main() -> None:
-     Punto de entrada: arranca el bot en modo polling (desarrollo local).
-     app = create_application()
-     logger.info("Arrancando polling del bot...")
-     app.run_polling(allowed_updates=["message", "callback_query"])
+    """Punto de entrada: arranca el bot en modo polling (desarrollo local)."""
+    app = create_application()
+    logger.info("Arrancando polling del bot...")
+    app.run_polling(allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
      main()
 
-"""
