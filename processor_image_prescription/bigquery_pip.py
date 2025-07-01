@@ -73,6 +73,7 @@ def update_single_field_safe(patient_key: str, field_name: str, field_value: Any
     """
     UPDATE instantáneo y SEGURO para campos simples usando DML.
     NO borra datos, solo actualiza el campo específico.
+    ACTUALIZADO: Soporte para campo informante.
     """
     if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
         raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
@@ -81,6 +82,49 @@ def update_single_field_safe(patient_key: str, field_name: str, field_value: Any
     table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
 
     try:
+        # ✅ NUEVO: Manejo especial para campo informante
+        if field_name == "informante" and isinstance(field_value, list) and field_value:
+            informante = field_value[0] if field_value else {}
+            
+            update_query = f"""
+                UPDATE `{table_reference}`
+                SET informante = [
+                    STRUCT(
+                        @nombre AS nombre,
+                        @parentesco AS parentesco,
+                        @identificacion AS identificacion
+                    )
+                ]
+                WHERE paciente_clave = @patient_key
+            """
+            
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key),
+                    bigquery.ScalarQueryParameter("nombre", "STRING", str(informante.get("nombre", ""))),
+                    bigquery.ScalarQueryParameter("parentesco", "STRING", str(informante.get("parentesco", ""))),
+                    bigquery.ScalarQueryParameter("identificacion", "STRING", str(informante.get("identificacion", "")))
+                ]
+            )
+            
+            logger.info(f"🔄 UPDATE INFORMANTE para paciente '{patient_key}'")
+            
+            query_job = client.query(update_query, job_config=job_config)
+            query_job.result()
+
+            if query_job.errors:
+                logger.error(f"Errores en UPDATE informante: {query_job.errors}")
+                return False
+
+            rows_affected = getattr(query_job, 'num_dml_affected_rows', 0)
+            if rows_affected == 0:
+                logger.warning(f"No se encontró paciente '{patient_key}' para actualizar informante")
+                return False
+
+            logger.info(f"✅ Informante actualizado exitosamente")
+            return True
+
+        # ✅ RESTO DEL CÓDIGO EXISTENTE SIN CAMBIOS
         # Preparar valor para SQL
         if field_value is None:
             sql_value = "NULL"
@@ -138,11 +182,12 @@ def update_single_field_safe(patient_key: str, field_name: str, field_value: Any
         return False
 
 
-# ✅ NUEVA FUNCIÓN: Agregar reclamación sin borrar datos existentes
+# Reemplazar la función add_reclamacion_safe en bigquery_pip.py:
+
 def add_reclamacion_safe(patient_key: str, nueva_reclamacion: Dict[str, Any]) -> bool:
     """
-    Agrega una nueva reclamación al array existente sin borrar el paciente.
-    VERSIÓN CORREGIDA que escapa comillas y caracteres especiales correctamente.
+    Agrega una nueva reclamación usando solo los campos que existen en el esquema.
+    VERSIÓN CORREGIDA basada en el esquema real de la tabla.
     """
     if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
         raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
@@ -151,21 +196,7 @@ def add_reclamacion_safe(patient_key: str, nueva_reclamacion: Dict[str, Any]) ->
     table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
 
     try:
-        # ✅ FUNCIÓN HELPER para escapar strings SQL
-        def escape_sql_string(value: str) -> str:
-            """Escapa comillas y caracteres especiales para SQL."""
-            if not isinstance(value, str):
-                return str(value)
-            # Escapar comillas simples duplicándolas
-            escaped = value.replace("'", "''")
-            # Escapar caracteres de nueva línea
-            escaped = escaped.replace('\n', '\\n')
-            escaped = escaped.replace('\r', '\\r')
-            # Escapar backslashes
-            escaped = escaped.replace('\\', '\\\\')
-            return escaped
-
-        # ✅ USAR PARÁMETROS EN LUGAR DE CONCATENACIÓN DIRECTA
+        # ✅ USAR solo los campos que existen en el esquema real
         update_query = f"""
         UPDATE `{table_reference}`
         SET reclamaciones = ARRAY_CONCAT(
@@ -179,39 +210,40 @@ def add_reclamacion_safe(patient_key: str, nueva_reclamacion: Dict[str, Any]) ->
                 @url_documento AS url_documento,
                 @numero_radicado AS numero_radicado,
                 @fecha_radicacion AS fecha_radicacion,
-                @fecha_revision AS fecha_revision
+                @fecha_revision AS fecha_revision,
+                @id_session AS id_session
             )]
         )
         WHERE paciente_clave = @patient_key
         """
 
-        # ✅ PREPARAR PARÁMETROS SEGUROS
         query_parameters = [
             bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key),
             bigquery.ScalarQueryParameter("med_no_entregados", "STRING", 
-                nueva_reclamacion.get('med_no_entregados', '')),
+                str(nueva_reclamacion.get('med_no_entregados', ''))),
             bigquery.ScalarQueryParameter("tipo_accion", "STRING", 
-                nueva_reclamacion.get('tipo_accion', '')),
+                str(nueva_reclamacion.get('tipo_accion', ''))),
             bigquery.ScalarQueryParameter("texto_reclamacion", "STRING", 
-                nueva_reclamacion.get('texto_reclamacion', '')),
+                str(nueva_reclamacion.get('texto_reclamacion', ''))),
             bigquery.ScalarQueryParameter("estado_reclamacion", "STRING", 
-                nueva_reclamacion.get('estado_reclamacion', '')),
+                str(nueva_reclamacion.get('estado_reclamacion', 'pendiente_radicacion'))),
             bigquery.ScalarQueryParameter("nivel_escalamiento", "INTEGER", 
-                nueva_reclamacion.get('nivel_escalamiento', 0)),
+                int(nueva_reclamacion.get('nivel_escalamiento', 1))),
             bigquery.ScalarQueryParameter("url_documento", "STRING", 
-                nueva_reclamacion.get('url_documento', '')),
+                str(nueva_reclamacion.get('url_documento', ''))),
             bigquery.ScalarQueryParameter("numero_radicado", "STRING", 
-                nueva_reclamacion.get('numero_radicado', '')),
+                str(nueva_reclamacion.get('numero_radicado', ''))),
             bigquery.ScalarQueryParameter("fecha_radicacion", "DATE", 
                 nueva_reclamacion.get('fecha_radicacion')),
             bigquery.ScalarQueryParameter("fecha_revision", "DATE", 
-                nueva_reclamacion.get('fecha_revision'))
+                nueva_reclamacion.get('fecha_revision')),
+            bigquery.ScalarQueryParameter("id_session", "STRING", 
+                str(nueva_reclamacion.get('id_session', '')))
         ]
 
         job_config = bigquery.QueryJobConfig(query_parameters=query_parameters)
 
         logger.info(f"➕ Agregando reclamación {nueva_reclamacion.get('tipo_accion')} para paciente {patient_key}")
-        logger.debug(f"Texto length: {len(nueva_reclamacion.get('texto_reclamacion', ''))} caracteres")
         
         query_job = client.query(update_query, job_config=job_config)
         query_job.result()
@@ -230,17 +262,13 @@ def add_reclamacion_safe(patient_key: str, nueva_reclamacion: Dict[str, Any]) ->
 
     except Exception as e:
         logger.error(f"❌ Error agregando reclamación: {e}")
-        # ✅ LOG ADICIONAL para debugging
-        if nueva_reclamacion.get('texto_reclamacion'):
-            logger.debug(f"Texto problemático (primeros 200 chars): {nueva_reclamacion['texto_reclamacion'][:200]}...")
         return False
-
-
-# ✅ NUEVA FUNCIÓN: Actualizar reclamación específica
+    
 def update_reclamacion_by_level_safe(patient_key: str, nivel_escalamiento: int, 
                                    updates: Dict[str, Any]) -> bool:
     """
     Actualiza una reclamación específica por nivel de escalamiento de forma segura.
+    VERSIÓN CORREGIDA - No maneja campos de radicación.
     """
     if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
         raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
@@ -249,7 +277,6 @@ def update_reclamacion_by_level_safe(patient_key: str, nivel_escalamiento: int,
     table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
 
     try:
-        # ✅ NUEVA SINTAXIS CORRECTA usando ARRAY() con SELECT AS STRUCT
         update_query = f"""
         UPDATE `{table_reference}`
         SET reclamaciones = ARRAY(
@@ -259,57 +286,31 @@ def update_reclamacion_by_level_safe(patient_key: str, nivel_escalamiento: int,
                 rec.texto_reclamacion,
                 CASE 
                     WHEN rec.nivel_escalamiento = @nivel_escalamiento THEN
-                        CASE 
-                            WHEN @new_estado IS NOT NULL THEN @new_estado
-                            ELSE rec.estado_reclamacion
-                        END
+                        COALESCE(@new_estado, rec.estado_reclamacion)
                     ELSE rec.estado_reclamacion
                 END AS estado_reclamacion,
                 rec.nivel_escalamiento,
                 CASE 
                     WHEN rec.nivel_escalamiento = @nivel_escalamiento THEN
-                        CASE 
-                            WHEN @new_url IS NOT NULL THEN @new_url
-                            ELSE rec.url_documento
-                        END
+                        COALESCE(@new_url, rec.url_documento)
                     ELSE rec.url_documento
                 END AS url_documento,
-                CASE 
-                    WHEN rec.nivel_escalamiento = @nivel_escalamiento THEN
-                        CASE 
-                            WHEN @new_radicado IS NOT NULL THEN @new_radicado
-                            ELSE rec.numero_radicado
-                        END
-                    ELSE rec.numero_radicado
-                END AS numero_radicado,
-                CASE 
-                    WHEN rec.nivel_escalamiento = @nivel_escalamiento THEN
-                        CASE 
-                            WHEN @new_fecha_radicacion IS NOT NULL THEN DATE(@new_fecha_radicacion)
-                            ELSE rec.fecha_radicacion
-                        END
-                    ELSE rec.fecha_radicacion
-                END AS fecha_radicacion,
-                rec.fecha_revision
+                rec.id_session
             FROM UNNEST(reclamaciones) AS rec
         )
         WHERE paciente_clave = @patient_key
         """
 
-        # Preparar parámetros con valores por defecto
         query_parameters = [
             bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key),
             bigquery.ScalarQueryParameter("nivel_escalamiento", "INTEGER", nivel_escalamiento),
             bigquery.ScalarQueryParameter("new_estado", "STRING", updates.get('estado_reclamacion')),
-            bigquery.ScalarQueryParameter("new_url", "STRING", updates.get('url_documento')),
-            bigquery.ScalarQueryParameter("new_radicado", "STRING", updates.get('numero_radicado')),
-            bigquery.ScalarQueryParameter("new_fecha_radicacion", "STRING", updates.get('fecha_radicacion'))
+            bigquery.ScalarQueryParameter("new_url", "STRING", updates.get('url_documento'))
         ]
 
         job_config = bigquery.QueryJobConfig(query_parameters=query_parameters)
 
         logger.info(f"🔄 Actualizando reclamación nivel {nivel_escalamiento} para paciente {patient_key}")
-        logger.debug(f"Updates: {updates}")
         
         query_job = client.query(update_query, job_config=job_config)
         query_job.result()
@@ -331,73 +332,72 @@ def update_reclamacion_by_level_safe(patient_key: str, nivel_escalamiento: int,
         return False
 
 
-# ✅ FUNCIÓN CORREGIDA: save_document_url_to_reclamacion
-def save_document_url_to_reclamacion(patient_key: str, nivel_escalamiento: int, 
-                                    url_documento: str, tipo_documento: str) -> bool:
+def save_document_url_to_reclamacion(patient_key: str, nivel_escalamiento: int = None, session_id: str = None, 
+                                    url_documento: str = "", tipo_documento: str = "") -> bool:
     """
     Actualiza la URL del documento generado en la reclamación correspondiente.
     VERSIÓN SEGURA que no borra datos.
     """
     try:
-        updates = {
-            "url_documento": url_documento
-        }
+        updates = {"url_documento": url_documento}
         
-        success = update_reclamacion_by_level_safe(
-            patient_key=patient_key,
-            nivel_escalamiento=nivel_escalamiento, 
-            updates=updates
-        )
-        
-        if success:
-            logger.info(f"✅ URL de documento guardada para paciente {patient_key}, nivel {nivel_escalamiento}")
+        if session_id:
+            # Preferir búsqueda por session_id (más precisa)
+            success = update_reclamacion_by_session_safe(
+                patient_key=patient_key,
+                session_id=session_id,
+                updates=updates
+            )
+            logger.info(f"URL actualizada por session_id: {session_id}")
+        elif nivel_escalamiento is not None:
+            # Fallback a búsqueda por nivel
+            success = update_reclamacion_by_level_safe(
+                patient_key=patient_key,
+                nivel_escalamiento=nivel_escalamiento,
+                updates=updates
+            )
+            logger.info(f"URL actualizada por nivel: {nivel_escalamiento}")
         else:
-            logger.error(f"❌ Error guardando URL de documento para paciente {patient_key}")
+            logger.error("Se requiere session_id O nivel_escalamiento")
+            return False
             
         return success
         
     except Exception as e:
-        logger.error(f"❌ Error guardando URL de documento: {e}")
+        logger.error(f"Error guardando URL de documento: {e}")
         return False
 
 
 # ✅ FUNCIÓN CORREGIDA: update_reclamacion_status  
-def update_reclamacion_status(patient_key: str, nivel_escalamiento: int, 
-                            nuevo_estado: str, numero_radicado: str = None, 
-                            fecha_radicacion: str = None) -> bool:
+def update_reclamacion_status(patient_key: str, nuevo_estado: str, 
+                            nivel_escalamiento: int = None, session_id: str = None) -> bool:
     """
     Actualiza el estado y radicado de una reclamación específica.
     VERSIÓN SEGURA que no borra datos.
     """
     try:
-        updates = {
-            "estado_reclamacion": nuevo_estado
-        }
+        updates = {"estado_reclamacion": nuevo_estado}
         
-        if numero_radicado:
-            updates["numero_radicado"] = numero_radicado
-            
-        if fecha_radicacion:
-            updates["fecha_radicacion"] = fecha_radicacion
-        elif numero_radicado:
-            # Si se proporciona radicado pero no fecha, usar fecha actual
-            updates["fecha_radicacion"] = datetime.now().strftime("%Y-%m-%d")
-        
-        success = update_reclamacion_by_level_safe(
-            patient_key=patient_key,
-            nivel_escalamiento=nivel_escalamiento,
-            updates=updates
-        )
-        
-        if success:
-            logger.info(f"✅ Estado de reclamación actualizado para paciente {patient_key}, nivel {nivel_escalamiento}")
+        if session_id:
+            success = update_reclamacion_by_session_safe(
+                patient_key=patient_key,
+                session_id=session_id,
+                updates=updates
+            )
+        elif nivel_escalamiento is not None:
+            success = update_reclamacion_by_level_safe(
+                patient_key=patient_key,
+                nivel_escalamiento=nivel_escalamiento,
+                updates=updates
+            )
         else:
-            logger.error(f"❌ Error actualizando estado de reclamación para paciente {patient_key}")
+            logger.error("Se requiere session_id O nivel_escalamiento")
+            return False
             
         return success
         
     except Exception as e:
-        logger.error(f"❌ Error actualizando estado de reclamación: {e}")
+        logger.error(f"Error actualizando estado de reclamación: {e}")
         return False
 
 

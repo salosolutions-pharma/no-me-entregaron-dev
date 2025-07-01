@@ -201,18 +201,27 @@ async def handle_escalamiento_response(update: Update, context: ContextTypes.DEF
             context.user_data.pop("esperando_escalamiento", None)
             context.user_data.pop("escalamientos_disponibles", None)
             await generar_reclamacion_supersalud_flow(patient_key, chat_id, context, session_id)
+            # ✅ CERRAR SESIÓN DESPUÉS DEL ESCALAMIENTO
+            if session_id:
+                close_user_session(session_id, context, reason="escalamiento_supersalud_completado")
             return True
             
         elif user_message in ["tutela", "accion de tutela"] and "tutela" in escalamientos_disponibles:
             context.user_data.pop("esperando_escalamiento", None)
             context.user_data.pop("escalamientos_disponibles", None)
             await generar_tutela_flow(patient_key, chat_id, context, session_id)
+            # ✅ CERRAR SESIÓN DESPUÉS DEL ESCALAMIENTO
+            if session_id:
+                close_user_session(session_id, context, reason="escalamiento_tutela_completado")
             return True
             
         elif user_message in ["desacato", "incidente de desacato"] and "desacato" in escalamientos_disponibles:
             context.user_data.pop("esperando_escalamiento", None)
             context.user_data.pop("escalamientos_disponibles", None)
             await generar_desacato_flow(patient_key, chat_id, context, session_id)
+            # ✅ CERRAR SESIÓN DESPUÉS DEL ESCALAMIENTO
+            if session_id:
+                close_user_session(session_id, context, reason="escalamiento_desacato_completado")
             return True
             
         elif user_message in ["no", "no gracias", "ahora no", "no por ahora"]:
@@ -220,9 +229,13 @@ async def handle_escalamiento_response(update: Update, context: ContextTypes.DEF
             context.user_data.pop("escalamientos_disponibles", None)
             await send_and_log_message(
                 chat_id,
-                "✅ Perfecto. Si más adelante necesitas escalar tu caso, solo escríbeme y te ayudo.",
+                "✅ Perfecto. Si más adelante necesitas escalar tu caso, solo escríbeme y te ayudo.\n\n"
+                "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!",
                 context
             )
+            # ✅ CERRAR SESIÓN CUANDO EL USUARIO DICE NO
+            if session_id:
+                close_user_session(session_id, context, reason="escalamiento_rechazado")
             return True
         else:
             # Respuesta no reconocida
@@ -247,25 +260,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     session_id = session_context.get("session_id")
 
     try:
-        # ✅ NUEVO: Verificar inactividad solo cuando el usuario escribe
-        # if session_id and consent_manager:
-        #     session_expired = consent_manager.session_manager.check_session_inactivity(session_id)
-        #     if session_expired:
-        #         # Limpiar sesión expirada y empezar nueva
-        #         context.user_data.clear()
-        #         response = ("¡Hola de nuevo! 👋 Tu sesión anterior expiró por inactividad. "
-        #                   "No te preocupes, podemos comenzar tu solicitud desde el inicio.")
-        #         await send_and_log_message(chat_id, response, context)
-        #         return
+        #✅ NUEVO: Verificar inactividad solo cuando el usuario escribe
+        if session_id and consent_manager:
+            session_expired = consent_manager.session_manager.check_session_inactivity(session_id)
+            if session_expired:
+                # Limpiar sesión expirada y empezar nueva
+                context.user_data.clear()
+                response = ("¡Hola de nuevo! 👋 Tu sesión anterior expiró por inactividad. "
+                          "No te preocupes, podemos comenzar tu solicitud desde el inicio.")
+                await send_and_log_message(chat_id, response, context)
+                return
 
-        # # ✅ VERIFICAR si el usuario se está despidiendo
-        # if (consent_manager and 
-        #     consent_manager.should_close_session(user_message, session_context) and 
-        #     session_id):
-        #     response = consent_manager.get_bot_response(user_message, session_context)
-        #     await send_and_log_message(chat_id, response, context)
-        #     close_user_session(session_id, context, reason="user_farewell")
-        #     return
+        # ✅ VERIFICAR si el usuario se está despidiendo
+        if (consent_manager and 
+            consent_manager.should_close_session(user_message, session_context) and 
+            session_id):
+            response = consent_manager.get_bot_response(user_message, session_context)
+            await send_and_log_message(chat_id, response, context)
+            close_user_session(session_id, context, reason="user_farewell")
+            return
 
         if session_context.get("waiting_for_field"):
             handled = await handle_field_response(update, context)
@@ -382,28 +395,27 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     data = query.data
-    session_id = data.split("_", 2)[-1] if data.startswith("followup_yes_") or data.startswith("followup_no_") else None
+    
+    logger.info(f"Callback recibido: {data}")
 
-
-    logger.info(f"Callback recibido: {data} para sesión: {session_id}")
-
-    if not session_id:
-        await query.edit_message_text("No se han encontrado reclamaciones correspondientes al proceso")
-        return
-
+    # Extraer session_id según el tipo de callback
     if data.startswith("consent_"):
+        # Para consentimiento, obtener session_id del contexto
+        session_id = context.user_data.get("session_id")
+        logger.info(f"Callback de consentimiento - session_id del contexto: {session_id}")
+        
+        if not session_id:
+            await query.edit_message_text("Error: No se encontró una sesión activa. Por favor, reinicia la conversación.")
+            return
+            
         await handle_consent_response(query, context, session_id, data == "consent_yes")
-    elif data.startswith("med_"):
-        await handle_medication_selection(query, context, data)
-    elif data.startswith("informante_"):
-        informante_type = "paciente" if "paciente" in data else "cuidador"
-        await handle_informante_selection(query, context, informante_type)
-    elif data.startswith("regimen_"):
-        regimen_type = "Contributivo" if "contributivo" in data else "Subsidiado"
-        await handle_regimen_selection(query, context, regimen_type)
+        return
+        
     elif data.startswith("followup_yes_") or data.startswith("followup_no_"):
+        # Para followup, extraer session_id del callback data
         session_id = data[len("followup_yes_"):] if data.startswith("followup_yes_") else data[len("followup_no_"):]
         logger.info(f"🟢 Acción followup detectada para sesión: {session_id}")
+        
         if data.startswith("followup_yes_"):
             try:
                 pm = PatientModule()
@@ -423,6 +435,26 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     [InlineKeyboardButton("❌ No, gracias", callback_data=f"no_escalate_{session_id}")]
                 ])
             )
+        return
+        
+    elif data.startswith("med_"):
+        await handle_medication_selection(query, context, data)
+        return
+        
+    elif data.startswith("informante_"):
+        informante_type = "paciente" if "paciente" in data else "cuidador"
+        await handle_informante_selection(query, context, informante_type)
+        return
+        
+    elif data.startswith("regimen_"):
+        regimen_type = "Contributivo" if "contributivo" in data else "Subsidiado"
+        await handle_regimen_selection(query, context, regimen_type)
+        return
+        
+    else:
+        # Para otros tipos de callback que no reconocemos
+        await query.edit_message_text("Acción no reconocida. Por favor, intenta de nuevo.")
+        logger.warning(f"Callback no reconocido: {data}")
         return
 
 
@@ -707,19 +739,20 @@ async def continue_with_missing_fields_after_meds_safe(query, context: ContextTy
 
 async def save_reclamacion_to_database(patient_key: str, tipo_accion: str, 
                                      texto_reclamacion: str, estado_reclamacion: str,
-                                     nivel_escalamiento: int, 
+                                     nivel_escalamiento: int, session_id: str,
                                      resultado_claim_generator: Dict[str, Any] = None) -> bool:
     """
-    ✅ VERSIÓN SEGURA que usa add_reclamacion_safe() en lugar de DELETE+INSERT.
-    Es MUCHO más rápida y no arriesga perder datos.
+    Guarda una nueva reclamación en la tabla pacientes.
+    VERSIÓN CORREGIDA: No incluye campos de radicación (numero_radicado, fecha_radicacion).
+    Solo incluye campos que maneja el claim_manager según arquitectura.
     """
     try:
-        from processor_image_prescription.bigquery_pip import get_bigquery_client, _convert_bq_row_to_dict_recursive, add_reclamacion_safe
+        from processor_image_prescription.bigquery_pip import get_bigquery_client, add_reclamacion_safe
         from google.cloud import bigquery
         
         logger.info(f"💾 Guardando reclamación {tipo_accion} para paciente {patient_key}")
         
-        # ✅ 1. Obtener medicamentos no entregados (MUY RÁPIDO)
+        # Obtener medicamentos no entregados de la prescripción más reciente
         client = get_bigquery_client()
         from processor_image_prescription.bigquery_pip import PROJECT_ID, DATASET_ID, TABLE_ID
         table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
@@ -752,20 +785,18 @@ async def save_reclamacion_to_database(patient_key: str, tipo_accion: str,
                 med_no_entregados_from_prescriptions = ", ".join(meds_no_entregados)
             break
 
-        # ✅ 2. Preparar nueva reclamación
+        # Preparar nueva reclamación - SOLO campos que maneja claim_manager
         nueva_reclamacion = {
             "med_no_entregados": med_no_entregados_from_prescriptions,
             "tipo_accion": tipo_accion,
             "texto_reclamacion": texto_reclamacion,
             "estado_reclamacion": estado_reclamacion,
             "nivel_escalamiento": nivel_escalamiento,
-            "url_documento": "",  # Se llena después si es tutela/desacato
-            "numero_radicado": "",  # Se llena cuando se radica
-            "fecha_radicacion": None,  # Se llena cuando se radica
-            "fecha_revision": None,   # Se llena cuando hay respuesta
+            "url_documento": "",  # Se actualiza después si hay PDF
+            "id_session": session_id  # ✅ INCLUIR session_id según requisitos
         }
         
-        # ✅ 3. USAR FUNCIÓN SEGURA (sin DELETE peligroso)
+        # Usar función segura para agregar reclamación
         success = add_reclamacion_safe(patient_key, nueva_reclamacion)
         
         if success:
@@ -799,6 +830,7 @@ async def generar_reclamacion_supersalud_flow(patient_key: str, chat_id: int,
                 texto_reclamacion=resultado_supersalud["texto_reclamacion"],
                 estado_reclamacion="pendiente_radicacion",
                 nivel_escalamiento=2,
+                session_id=session_id,
                 resultado_claim_generator=resultado_supersalud
             )
             
@@ -862,6 +894,7 @@ async def generar_tutela_flow(patient_key: str, chat_id: int,
                     texto_reclamacion=resultado_tutela["texto_reclamacion"],
                     estado_reclamacion="pendiente_radicacion",
                     nivel_escalamiento=3,
+                    session_id=session_id,
                     resultado_claim_generator=resultado_tutela
                 )
                 
@@ -869,7 +902,7 @@ async def generar_tutela_flow(patient_key: str, chat_id: int,
                     # Guardar URL del PDF en la reclamación
                     save_document_url_to_reclamacion(
                         patient_key=patient_key,
-                        nivel_escalamiento=3,
+                        session_id=session_id,
                         url_documento=pdf_url,
                         tipo_documento="tutela"
                     )
@@ -926,6 +959,7 @@ async def generar_tutela_flow(patient_key: str, chat_id: int,
                     texto_reclamacion=resultado_tutela["texto_reclamacion"],
                     estado_reclamacion="pendiente_radicacion",
                     nivel_escalamiento=3,
+                    session_id=session_id,
                     resultado_claim_generator=resultado_tutela
                 )
                 
@@ -1113,6 +1147,7 @@ async def generar_desacato_directo_flow(patient_key: str, chat_id: int,
                         texto_reclamacion=resultado_desacato["texto_reclamacion"],
                         estado_reclamacion="pendiente_radicacion",
                         nivel_escalamiento=4,
+                        session_id=session_id,
                         resultado_claim_generator=resultado_desacato
                     )
                     
@@ -1120,7 +1155,7 @@ async def generar_desacato_directo_flow(patient_key: str, chat_id: int,
                         # Guardar URL del PDF en la reclamación
                         save_document_url_to_reclamacion(
                             patient_key=patient_key,
-                            nivel_escalamiento=4,
+                            session_id=session_id,
                             url_documento=pdf_url,
                             tipo_documento="desacato"
                         )
@@ -1178,6 +1213,7 @@ async def generar_desacato_directo_flow(patient_key: str, chat_id: int,
                         texto_reclamacion=resultado_desacato["texto_reclamacion"],
                         estado_reclamacion="pendiente_radicacion",
                         nivel_escalamiento=4,
+                        session_id=session_id,
                         resultado_claim_generator=resultado_desacato
                     )
                     
@@ -1200,6 +1236,7 @@ async def generar_desacato_directo_flow(patient_key: str, chat_id: int,
                     texto_reclamacion=resultado_desacato["texto_reclamacion"],
                     estado_reclamacion="pendiente_radicacion",
                     nivel_escalamiento=4,
+                    session_id=session_id,
                     resultado_claim_generator=resultado_desacato
                 )
                 
@@ -1349,8 +1386,19 @@ async def evaluar_escalamiento_automatico(patient_key: str, chat_id: int,
     """
     Evalúa automáticamente si el paciente puede escalar y ofrece opciones.
     Se ejecuta después de generar la reclamación EPS.
+    ✅ MODIFICADO: No ofrece escalamiento automático si la sesión está por cerrarse.
     """
     try:
+        # ✅ NUEVO: Solo ofrecer escalamiento si la sesión sigue activa
+        if not session_id or session_id == "unknown_session":
+            logger.info("No se ofrece escalamiento automático - sesión inválida")
+            return
+            
+        # Verificar si la sesión ya está cerrada
+        if not context.user_data.get("session_id"):
+            logger.info("No se ofrece escalamiento automático - sesión ya cerrada")
+            return
+            
         from claim_manager.claim_generator import validar_requisitos_escalamiento
         
         # Verificar qué escalamientos están disponibles
@@ -1371,7 +1419,7 @@ async def evaluar_escalamiento_automatico(patient_key: str, chat_id: int,
         if validacion_desacato.get("puede_escalar"):
             escalamientos_disponibles.append("desacato")
         
-        # Ofrecer escalamientos disponibles
+        # ✅ NUEVO: Si hay escalamientos, NO cerrar sesión inmediatamente
         if escalamientos_disponibles:
             mensaje = "🔄 **Opciones de escalamiento disponibles:**\n\n"
             
@@ -1382,13 +1430,18 @@ async def evaluar_escalamiento_automatico(patient_key: str, chat_id: int,
             if "desacato" in escalamientos_disponibles:
                 mensaje += "• Puedes generar un **Incidente de Desacato**\n"
             
-            mensaje += "\n💬 ¿Te gustaría proceder con algún escalamiento? Solo responde con 'supersalud', 'tutela' o 'desacato'."
+            mensaje += "\n💬 ¿Te gustaría proceder con algún escalamiento? Solo responde con 'supersalud', 'tutela', 'desacato' o 'no'.\n\n"
+            mensaje += "⏰ Si no respondes en 10 minutos, cerraremos la sesión automáticamente."
             
             # Guardar estado para próxima respuesta
             context.user_data["esperando_escalamiento"] = True
             context.user_data["escalamientos_disponibles"] = escalamientos_disponibles
             
             await send_and_log_message(chat_id, mensaje, context)
+            
+            logger.info(f"Escalamiento automático ofrecido para paciente {patient_key} - sesión mantenida temporalmente")
+        else:
+            logger.info(f"No hay escalamientos disponibles para paciente {patient_key}")
             
     except Exception as e:
         logger.error(f"Error evaluando escalamiento automático: {e}")
@@ -1398,7 +1451,7 @@ async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_
     field_prompt = claim_manager.get_next_missing_field_prompt(patient_key)
 
     if field_prompt.get("field_name"):
-        # Aún faltan campos - continuar
+        
         field_name = field_prompt["field_name"]
         context.user_data["waiting_for_field"] = field_name
         context.user_data["patient_key"] = patient_key
@@ -1417,6 +1470,11 @@ async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_
         
         logger.info(f"Todos los campos completos para paciente {patient_key}. Iniciando generación de reclamación.")
         
+        session_id = context.user_data.get("session_id")
+        if not session_id:
+            logger.error(f"No se encontró session_id para paciente {patient_key}")
+            session_id = "unknown_session"
+
         # 1. GENERAR RECLAMACIÓN EPS AUTOMÁTICAMENTE
         try:
             resultado_reclamacion = generar_reclamacion_eps(patient_key)
@@ -1429,6 +1487,7 @@ async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_
                     texto_reclamacion=resultado_reclamacion["texto_reclamacion"],
                     estado_reclamacion="pendiente_radicacion",
                     nivel_escalamiento=1,
+                    session_id=session_id,
                     resultado_claim_generator=resultado_reclamacion
                 )
                 
@@ -1445,9 +1504,8 @@ async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_
                             "• Si no hay respuesta en el plazo establecido, automáticamente escalaremos tu caso a la Superintendencia Nacional de Salud\n"
                             "• Te mantendremos informado en cada paso del proceso\n\n"
                             "✅ Proceso completado exitosamente. Si necesitas algo más, no dudes en contactarnos.\n\n"
-                            # ✅ QUITAR ESTA LÍNEA PARA NO CERRAR LA SESIÓN:
-                            # "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
-                            "💬 Puedes seguir escribiéndome si necesitas ayuda adicional. ¡Gracias por confiar en nosotros!"
+                             "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                            #"💬 Puedes seguir escribiéndome si necesitas ayuda adicional. ¡Gracias por confiar en nosotros!"
                         )
                     else:
                         success_message = (
@@ -1455,27 +1513,24 @@ async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_
                             "📄 **Reclamación EPS generada exitosamente**\n\n"
                             "📋 En las próximas 48 horas te enviaremos el número de radicado.\n\n"
                             "✅ Proceso completado exitosamente. Si necesitas algo más, no dudes en contactarnos.\n\n"
-                            # ✅ QUITAR ESTA LÍNEA PARA NO CERRAR LA SESIÓN:
-                            # "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
-                            "💬 Puedes seguir escribiéndome si necesitas ayuda adicional. ¡Gracias por confiar en nosotros!"
+                            "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                            #"💬 Puedes seguir escribiéndome si necesitas ayuda adicional. ¡Gracias por confiar en nosotros!"
                         )
                 else:
                     logger.error(f"Error guardando reclamación para paciente {patient_key}")
                     success_message = ( 
                         "⚠️ Se completó la recopilación de datos, pero hubo un problema técnico guardando tu reclamación.\n\n"
                         "📞 Nuestro equipo revisará tu caso manualmente.\n\n"
-                        # ✅ QUITAR ESTA LÍNEA PARA NO CERRAR LA SESIÓN:
-                        # "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
-                        "💬 Puedes seguir escribiéndome si necesitas ayuda adicional. ¡Gracias por confiar en nosotros!"
+                        "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                        #"💬 Puedes seguir escribiéndome si necesitas ayuda adicional. ¡Gracias por confiar en nosotros!"
                     )
             else:
                 logger.error(f"Error generando reclamación EPS para paciente {patient_key}: {resultado_reclamacion.get('error', 'Error desconocido')}")
                 success_message = (
                     "⚠️ Se completó la recopilación de datos, pero hubo un problema técnico generando tu reclamación.\n\n"
                     "📞 Nuestro equipo revisará tu caso manualmente.\n\n"
-                    # ✅ QUITAR ESTA LÍNEA PARA NO CERRAR LA SESIÓN:
-                    # "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
-                    "💬 Puedes seguir escribiéndome si necesitas ayuda adicional. ¡Gracias por confiar en nosotros!"
+                    "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                    #"💬 Puedes seguir escribiéndome si necesitas ayuda adicional. ¡Gracias por confiar en nosotros!"
                 )
                 
         except Exception as e:
@@ -1483,22 +1538,19 @@ async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_
             success_message = (
                 "⚠️ Se completó la recopilación de datos. Nuestro equipo procesará tu reclamación manualmente.\n\n"
                 "📞 Te contactaremos pronto.\n\n"
-                # ✅ QUITAR ESTA LÍNEA PARA NO CERRAR LA SESIÓN:
-                # "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
-                "💬 Puedes seguir escribiéndome si necesitas ayuda adicional. ¡Gracias por confiar en nosotros!"
+                "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                #"💬 Puedes seguir escribiéndome si necesitas ayuda adicional. ¡Gracias por confiar en nosotros!"
             )
         
         # 3. ENVIAR MENSAJE FINAL
         await send_and_log_message(chat_id, success_message, context)
         
-        # ✅ COMENTAR ESTAS LÍNEAS PARA NO CERRAR LA SESIÓN AUTOMÁTICAMENTE:
-        # session_id = context.user_data.get("session_id")
-        # if session_id:
-        #     close_user_session(session_id, context, reason="process_completed_with_claim")
-        if success_saved:
-            await evaluar_escalamiento_automatico(patient_key, chat_id, context, session_id)
+        session_id = context.user_data.get("session_id")
+        if session_id:
+            close_user_session(session_id, context, reason="process_completed_with_claim")
+        
 
-        logger.info(f"Proceso completo finalizado para paciente {patient_key} - sesión MANTIENE ABIERTA")
+        logger.info(f"Proceso completo finalizado para paciente {patient_key} - sesión Cerrada")
 
 
 async def handle_informante_selection(query, context: ContextTypes.DEFAULT_TYPE, informante_type: str) -> None:

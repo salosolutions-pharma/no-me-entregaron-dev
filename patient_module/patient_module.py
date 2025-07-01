@@ -38,7 +38,7 @@ class PatientModule:
         """
         today = today or date.today()
         sql = f"""
-        SELECT pres.user_id AS user_id, pres.id_session AS session_id
+        SELECT pres.user_id AS user_id, rec.id_session AS session_id
         FROM `{self.project}.{self.dataset}.{self.table}` AS t,
              UNNEST(t.prescripciones) AS pres,
              UNNEST(t.reclamaciones) AS rec
@@ -62,59 +62,6 @@ class PatientModule:
             except Exception as e:
                 logger.error(f"Error al enviar mensaje a {user_id}: {e}")
 
-    def handle_user_reply(self, user_id: str, user_reply: str) -> None:
-        """
-        Procesa la respuesta del paciente usando LLM y actúa en consecuencia.
-        """
-        prompt = f"""El paciente ha respondido: "{user_reply}"
-
-        Actúas como un asistente virtual de salud encargado de hacer seguimiento a una solicitud médica.
-
-        Tu objetivo es extraer esta información desde la respuesta:
-
-        1. Si el paciente indica que ya le entregaron los medicamentos:
-        {{
-        "formula_entregada": true,
-        "desea_escalar": false
-        }}
-
-        2. Si el paciente dice que NO le han entregado los medicamentos, y además desea escalar:
-        {{
-        "formula_entregada": false,
-        "desea_escalar": true
-        }}
-
-        3. Si el paciente dice que NO le han entregado los medicamentos, pero NO desea escalar:
-        {{
-        "formula_entregada": false,
-        "desea_escalar": false
-        }}
-
-        **Reglas:**
-        - Devuelve solo el JSON.
-        - No incluyas ningún texto adicional.
-        """
-        llm_response = self.llm_core.ask_text(prompt)
-
-        logger.warning(f"Respuesta del LLM para sesión {user_id}: '{llm_response}'")
-
-        if not llm_response.strip():
-            raise PatientModuleError("Respuesta vacía del LLM")
-
-        try:
-            data = json.loads(llm_response)
-            entregada = bool(data.get("formula_entregada", False))
-            escalacion = bool(data.get("desea_escalar", False))
-        except Exception as e:
-            raise PatientModuleError(f"Respuesta de IA inválida: {e}")
-
-        if entregada:
-            self._mark_as_resolved(user_id)
-            self.send_message(user_id, "¡Excelente! Marcamos tu caso como resuelto.")
-        elif escalacion:
-            self._escalation_protocol(user_id)
-        else:
-            self.send_message(user_id, "Entendido. Quedamos atentos a cualquier novedad.")
 
     def send_message(self, user_id: str, session_id:str, text: str, buttons: list = None) -> None:
         """
@@ -132,28 +79,6 @@ class PatientModule:
         resp = requests.post(f"{self.api_url}/send_message", json=payload)
         if resp.status_code != 200:
             logger.error(f"Error al enviar mensaje a {user_id}: {resp.text}")
-
-
-    def _mark_as_resolved(self, user_id: str) -> None:
-        """
-        Actualiza BigQuery, marcando la reclamación como resuelta.
-        """
-        table_ref = f"{self.project}.{self.dataset}.{self.table}"
-        sql = f"""
-        UPDATE `{table_ref}`
-        
-        SET reclamaciones = ARRAY(
-            SELECT IF(r.id_user = '{user_id}',
-                      REPLACE(r, estado_reclamacion='resuelto'), r)
-            FROM UNNEST(reclamaciones) AS r
-        )
-        WHERE EXISTS(
-            SELECT 1 FROM UNNEST(prescripciones) AS p
-            WHERE p.id_user = '{user_id}'
-        )
-        """
-        self.bq.query(sql).result()
-        logger.info(f"Sesión {user_id}: reclamación marcada como resuelta.")
 
     def update_reclamation_status(self, session_id: str, new_status: str) -> bool:
             

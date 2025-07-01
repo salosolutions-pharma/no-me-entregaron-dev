@@ -127,15 +127,17 @@ Responde ahora como el asistente "No Me Entregaron":
         return self.get_bot_response(user_message, context)
 
     def should_close_session(self, user_message: str, session_context: Dict[str, Any] = None) -> bool:
-        # """Determina si la sesión debe cerrarse basándose en el mensaje del usuario."""
-        # farewell_keywords = [
-        #     "hasta luego", "adiós", "chao", "bye", "gracias",
-        #     "no necesito nada más", "ya no necesito ayuda",
-        #     "eso es todo", "hasta la vista", "nos vemos"
-        # ]
+        """
+        Determina si la sesión debe cerrarse basándose en el mensaje del usuario.
+        ✅ RESTAURADO: Funcionalidad de cierre por despedida.
+        """
+        farewell_keywords = [
+            "hasta luego", "adiós", "chao", "bye", "gracias",
+            "no necesito nada más", "ya no necesito ayuda",
+            "eso es todo", "hasta la vista", "nos vemos"
+        ]
 
-        # message_lower = user_message.lower().strip()
-        # return any(keyword in message_lower for keyword in farewell_keywords)
-        return False
+        message_lower = user_message.lower().strip()
+        return any(keyword in message_lower for keyword in farewell_keywords)
 
     
