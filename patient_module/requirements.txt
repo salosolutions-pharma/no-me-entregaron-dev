@@ -1,0 +1,6 @@
+google-cloud-bigquery
+requests
+openai
+python-dotenv
+
+

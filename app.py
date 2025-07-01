@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
 from channels.telegram_c import create_application
 import traceback
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 # Si tienes un módulo de WhatsApp, impórtalo también:
 # from channels.whatsapp_c import WhatsAppClient
 
@@ -66,25 +67,37 @@ async def telegram_webhook(req: Request):
 @app.post("/send_message")
 async def send_message(req: Request):
     """
-    Recibe payload {"session_id": "TL_57123…", "message": "texto"}
+    Recibe payload {"user_id": "TL_57123…", "message": "texto"}
     y reenvía por Telegram o WhatsApp.
     """
     data = await req.json()
-    sid = data.get("session_id")
+    sid = data.get("user_id")
+    session_id = data.get("session_id")
     text = data.get("message")
+    buttons = data.get("buttons")
     if not sid or not text:
-        raise HTTPException(400, "session_id y message son requeridos")
-
+        raise HTTPException(400, "user_id y message son requeridos")
     prefix, rest = sid.split("_", 1)
     if prefix == "TL":
         # Telegram: el resto contiene el chat_id (e.g. país+número)
         chat_id = int(rest.split("_")[0])
-        logger.info(f"Intentando enviar mensaje Telegram a chat_id: +{chat_id}")
+        logger.info(f"Intentando enviar mensaje Telegram a chat_id: +{chat_id} y sesion {session_id}")
         try:
-            await app.state.telegram_app.bot.send_message(chat_id=chat_id, text=text)
+            if buttons:
+                # construye InlineKeyboardMarkup
+                kb = [
+                    [InlineKeyboardButton(btn["label"], callback_data=f"{btn['action']}_{session_id}")]
+                    for btn in buttons
+                ]
+                reply_markup = InlineKeyboardMarkup(kb)
+                await app.state.telegram_app.bot.send_message(
+                    chat_id=chat_id, text=text, reply_markup=reply_markup
+                )
+            else:
+                await app.state.telegram_app.bot.send_message(chat_id=chat_id, text=text)
         except Exception as e:
             tb = traceback.format_exc()
-            logger.error(f"❌ Error enviando Telegram a chat_id {chat_id} (session_id: {sid}): {e}\n{tb}")
+            logger.error(f"❌ Error enviando Telegram a chat_id {chat_id} (user_id: {sid}): {e}\n{tb}")
             raise HTTPException(500, f"Falló envío Telegram: {str(e)}")
     elif prefix == "WA":
         # WhatsApp: usa tu cliente o API de WhatsApp
@@ -98,7 +111,7 @@ async def send_message(req: Request):
             logger.error(f"Error enviando WhatsApp a {phone}: {e}")
             raise HTTPException(500, "Falló envío WhatsApp")
     else:
-        raise HTTPException(400, f"Canal desconocido en session_id: {prefix}")
+        raise HTTPException(400, f"Canal desconocido en user_id: {prefix}")
 
     return {"ok": True}
 

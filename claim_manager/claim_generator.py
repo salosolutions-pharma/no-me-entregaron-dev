@@ -29,6 +29,7 @@ class ClaimGenerator:
     - Reclamaciones ante EPS
     - Quejas ante Superintendencia Nacional de Salud
     - Acciones de tutela por vulneración del derecho a la salud
+    - Incidentes de desacato por incumplimiento de tutela
     """
     
     # Constantes de clase
@@ -297,6 +298,7 @@ class ClaimGenerator:
     def validar_requisitos_escalamiento(self, patient_key: str, tipo_escalamiento: str) -> Dict[str, Any]:
         """
         Valida si un paciente cumple los requisitos para un tipo específico de escalamiento.
+        ACTUALIZADA para incluir desacato.
         
         Args:
             patient_key: Clave del paciente
@@ -333,7 +335,17 @@ class ClaimGenerator:
             config = requisitos[tipo_escalamiento]
             
             # Verificar requisitos específicos
-            if "reclamacion_eps" in config["requiere"]:
+            if "tutela_favorable" in config["requiere"]:
+                # Para desacato, usar la validación específica
+                validacion_desacato = self.validar_requisitos_desacato(patient_key)
+                if not validacion_desacato.get("puede_desacatar"):
+                    return {
+                        "puede_escalar": False,
+                        "requisitos_faltantes": ["tutela_favorable_registrada"],
+                        "mensaje": f"Para {config['descripcion']} se requiere una tutela favorable previa registrada en el sistema",
+                        "nivel_escalamiento": config["nivel"]
+                    }
+            elif "reclamacion_eps" in config["requiere"]:
                 radicados_eps = self._obtener_radicados_previos(patient_key, ["reclamacion_eps"])
                 if not radicados_eps:
                     return {
@@ -355,6 +367,68 @@ class ClaimGenerator:
             logger.error(f"Error validando requisitos de escalamiento: {e}")
             return {
                 "puede_escalar": False,
+                "error": f"Error verificando requisitos: {str(e)}"
+            }
+
+    def validar_requisitos_desacato(self, patient_key: str) -> Dict[str, Any]:
+        """
+        Valida si un paciente tiene tutela favorable para poder solicitar desacato.
+        
+        Args:
+            patient_key: Clave del paciente
+            
+        Returns:
+            Dict con información sobre si puede solicitar desacato
+        """
+        try:
+            # Verificar que exista tutela favorable en la tabla tutelas
+            query = f"""
+            SELECT 
+                numero_tutela,
+                juzgado, 
+                fecha_sentencia,
+                contenido_fallo,
+                estado_tutela,
+                representante_legal_eps
+            FROM `{PROJECT_ID}.{DATASET_ID}.tutelas`
+            WHERE paciente_clave = @patient_key 
+              AND estado_tutela = 'favorable'
+            ORDER BY fecha_sentencia DESC
+            LIMIT 1
+            """
+            
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)
+                ]
+            )
+            
+            results = self.bq_client.query(query, job_config=job_config).result()
+            
+            for row in results:
+                return {
+                    "puede_desacatar": True,
+                    "numero_tutela": row.numero_tutela,
+                    "juzgado": row.juzgado,
+                    "fecha_sentencia": row.fecha_sentencia.strftime("%d/%m/%Y") if row.fecha_sentencia else "",
+                    "contenido_fallo": row.contenido_fallo,
+                    "representante_legal_eps": row.representante_legal_eps or "",
+                    "nivel_escalamiento": 4,
+                    "patient_key": patient_key
+                }
+            
+            # No se encontró tutela favorable
+            return {
+                "puede_desacatar": False,
+                "requisitos_faltantes": ["tutela_favorable"],
+                "mensaje": "Para solicitar desacato se requiere una tutela favorable previa que no se haya cumplido",
+                "nivel_escalamiento": 4
+            }
+            
+        except Exception as e:
+            logger.error(f"Error validando requisitos de desacato: {e}")
+            return {
+                "puede_desacatar": False,
                 "error": f"Error verificando requisitos: {str(e)}"
             }
 
@@ -614,6 +688,119 @@ class ClaimGenerator:
                 "nivel_escalamiento": 3
             }
 
+    def generar_desacato(self, patient_key: str, datos_tutela_adicionales: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """
+        Genera un incidente de desacato por incumplimiento de tutela.
+        REQUIERE tutela favorable previa registrada en la tabla tutelas.
+        """
+        try:
+            logger.info(f"Iniciando generación de desacato para paciente: {patient_key}")
+            
+            # 1. Verificar requisitos de desacato
+            validacion = self.validar_requisitos_desacato(patient_key)
+            
+            if not validacion.get("puede_desacatar"):
+                return {
+                    "success": False,
+                    "error": validacion.get("mensaje", "No se cumplen los requisitos para desacato"),
+                    "requisitos_faltantes": validacion.get("requisitos_faltantes", []),
+                    "patient_key": patient_key,
+                    "tipo_documento": "desacato",
+                    "nivel_escalamiento": 4
+                }
+            
+            # 2. Obtener datos del paciente
+            datos_paciente = self.obtener_datos_paciente(patient_key)
+            campos_faltantes = self.validar_datos_tutela(datos_paciente)
+            
+            if campos_faltantes:
+                return {
+                    "success": False,
+                    "error": f"Faltan campos requeridos para desacato: {', '.join(campos_faltantes)}",
+                    "campos_faltantes": campos_faltantes,
+                    "patient_key": patient_key,
+                    "tipo_documento": "desacato",
+                    "nivel_escalamiento": 4
+                }
+            
+            # 3. Combinar datos del paciente con datos de la tutela
+            datos_completos = {**datos_paciente}
+            datos_completos.update({
+                "numero_tutela": validacion["numero_tutela"],
+                "juzgado": validacion["juzgado"],
+                "fecha_sentencia": validacion["fecha_sentencia"],
+                "contenido_fallo": validacion["contenido_fallo"]
+            })
+            
+            # Agregar datos adicionales si se proporcionan (como representante legal)
+            if datos_tutela_adicionales:
+                datos_completos.update(datos_tutela_adicionales)
+            
+            # Representante legal EPS por defecto si no se proporciona
+            if not datos_completos.get("representante_legal_eps"):
+                if validacion.get("representante_legal_eps"):
+                    datos_completos["representante_legal_eps"] = validacion["representante_legal_eps"]
+                else:
+                    datos_completos["representante_legal_eps"] = f"Representante Legal de {datos_paciente.get('eps_estandarizada', 'EPS')}"
+            
+            # 4. Obtener y formatear prompt
+            prompt_template = prompt_manager.get_prompt_by_module_and_function("CLAIM", "desacato")
+            if not prompt_template:
+                logger.error("Prompt CLAIM.desacato no encontrado")
+                return {
+                    "success": False,
+                    "error": "Prompt CLAIM.desacato no disponible en el sistema",
+                    "patient_key": patient_key,
+                    "tipo_documento": "desacato",
+                    "nivel_escalamiento": 4
+                }
+            
+            try:
+                prompt_formateado = prompt_template.format(**datos_completos)
+                logger.debug(f"Prompt formateado correctamente para desacato {patient_key}")
+            except KeyError as e:
+                logger.error(f"Error al formatear prompt de desacato: variable {e} no encontrada")
+                return {
+                    "success": False,
+                    "error": f"Error en template del prompt: falta variable {e}",
+                    "patient_key": patient_key,
+                    "tipo_documento": "desacato",
+                    "nivel_escalamiento": 4
+                }
+            
+            # 5. Generar texto con LLM
+            logger.info(f"Enviando prompt a LLM para generar desacato...")
+            texto_generado = self.llm_core.ask_text(prompt_formateado)
+            
+            # 6. Preparar respuesta exitosa
+            resultado = {
+                "success": True,
+                "tipo_reclamacion": "desacato",
+                "texto_reclamacion": texto_generado.strip(),
+                "datos_utilizados": datos_completos,
+                "fecha_generacion": datetime.now().isoformat(),
+                "patient_key": patient_key,
+                "nivel_escalamiento": 4,
+                "numero_tutela_referencia": validacion["numero_tutela"],
+                "juzgado": validacion["juzgado"],
+                "requiere_pdf": True,
+                "requiere_firma_paciente": True,
+                "entidad_destinataria": validacion["juzgado"]
+            }
+            
+            logger.info(f"Desacato generado exitosamente para paciente {patient_key}")
+            return resultado
+            
+        except Exception as e:
+            logger.error(f"Error inesperado generando desacato para {patient_key}: {e}")
+            return {
+                "success": False,
+                "error": f"Error inesperado: {str(e)}",
+                "tipo_reclamacion": "desacato",
+                "patient_key": patient_key,
+                "nivel_escalamiento": 4
+            }
+
     def obtener_preview_datos(self, patient_key: str, 
                              tipo_documento: str = "reclamacion_eps") -> Dict[str, Any]:
         """Obtiene un preview de los datos que se usarían para generar el documento."""
@@ -625,6 +812,13 @@ class ClaimGenerator:
                 campos_faltantes = self.validar_datos_supersalud(datos)
             elif tipo_documento == "tutela":
                 campos_faltantes = self.validar_datos_tutela(datos)
+            elif tipo_documento == "desacato":
+                # Para desacato, también validar requisitos de tutela previa
+                validacion_desacato = self.validar_requisitos_desacato(patient_key)
+                if not validacion_desacato.get("puede_desacatar"):
+                    campos_faltantes = ["tutela_favorable_previa"]
+                else:
+                    campos_faltantes = self.validar_datos_tutela(datos)
             else:
                 campos_faltantes = self.validar_datos_eps(datos)
             
@@ -686,11 +880,25 @@ def generar_tutela(patient_key: str,
     return claim_generator.generar_tutela(patient_key, gestiones_previas)
 
 
+def generar_desacato(patient_key: str, datos_tutela_adicionales: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Función de conveniencia para generar desacato con validación de requisitos."""
+    if not claim_generator:
+        return {"success": False, "error": "ClaimGenerator no disponible"}
+    return claim_generator.generar_desacato(patient_key, datos_tutela_adicionales)
+
+
 def validar_requisitos_escalamiento(patient_key: str, tipo_escalamiento: str) -> Dict[str, Any]:
     """Función de conveniencia para validar requisitos de escalamiento."""
     if not claim_generator:
         return {"puede_escalar": False, "error": "ClaimGenerator no disponible"}
     return claim_generator.validar_requisitos_escalamiento(patient_key, tipo_escalamiento)
+
+
+def validar_requisitos_desacato(patient_key: str) -> Dict[str, Any]:
+    """Función de conveniencia para validar requisitos de desacato."""
+    if not claim_generator:
+        return {"puede_desacatar": False, "error": "ClaimGenerator no disponible"}
+    return claim_generator.validar_requisitos_desacato(patient_key)
 
 
 def preview_datos_paciente(patient_key: str, 
@@ -732,6 +940,73 @@ def validar_disponibilidad_supersalud() -> Dict[str, Any]:
                 "generar_reclamacion_supersalud()",
                 "validar_datos_supersalud()",
                 "preview_datos_paciente(tipo='reclamacion_supersalud')"
+            ]
+        }
+        
+    except Exception as e:
+        return {
+            "disponible": False,
+            "error": f"Error verificando disponibilidad: {e}",
+            "solucion": "Revisar configuración y logs del sistema"
+        }
+
+
+def validar_disponibilidad_desacato() -> Dict[str, Any]:
+    """
+    Valida si el sistema puede generar incidentes de desacato.
+    
+    Returns:
+        Dict con información sobre disponibilidad
+    """
+    try:
+        if not claim_generator:
+            return {
+                "disponible": False,
+                "error": "ClaimGenerator no inicializado",
+                "solucion": "Verificar configuración del sistema"
+            }
+        
+        # Verificar prompt de desacato
+        prompt_desacato = prompt_manager.get_prompt_by_module_and_function("CLAIM", "desacato")
+        if not prompt_desacato:
+            return {
+                "disponible": False,
+                "error": "Prompt para desacato no encontrado",
+                "solucion": "Ejecutar el INSERT SQL del prompt en BigQuery"
+            }
+        
+        # Verificar prompt de recolección de datos de desacato
+        prompt_recoleccion = prompt_manager.get_prompt_by_module_and_function("DATA", "recoleccion_desacato")
+        if not prompt_recoleccion:
+            return {
+                "disponible": False,
+                "error": "Prompt para recolección de datos de desacato no encontrado",
+                "solucion": "Ejecutar el INSERT SQL del prompt de recolección en BigQuery"
+            }
+        
+        # Verificar tabla de tutelas (simulada - en producción usar BigQuery)
+        try:
+            query = f"""
+            SELECT COUNT(*) as count
+            FROM `{PROJECT_ID}.{DATASET_ID}.tutelas`
+            LIMIT 1
+            """
+            results = claim_generator.bq_client.query(query).result()
+            # Si llega aquí, la tabla existe
+        except Exception:
+            return {
+                "disponible": False,
+                "error": "Tabla 'tutelas' no encontrada",
+                "solucion": "Crear la tabla tutelas en BigQuery"
+            }
+        
+        return {
+            "disponible": True,
+            "mensaje": "Sistema listo para generar incidentes de desacato",
+            "funciones_disponibles": [
+                "generar_desacato()",
+                "validar_requisitos_desacato()",
+                "preview_datos_paciente(tipo='desacato')"
             ]
         }
         

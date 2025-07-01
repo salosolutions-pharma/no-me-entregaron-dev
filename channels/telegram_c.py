@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
+from patient_module.patient_module import PatientModule
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -28,7 +29,8 @@ try:
     from BYC.consentimiento import ConsentManager
     from processor_image_prescription.pip_processor import PIPProcessor
     from claim_manager.data_collection import ClaimManager
-    from claim_manager.claim_generator import generar_reclamacion_eps, generar_tutela, generar_reclamacion_supersalud, validar_disponibilidad_supersalud
+    from claim_manager.claim_generator import generar_reclamacion_eps, generar_tutela, generar_reclamacion_supersalud, validar_disponibilidad_supersalud, generar_desacato, validar_requisitos_desacato
+
 except ImportError as e:
     print(f"Error al importar módulos: {e}")
     sys.exit(1)
@@ -183,7 +185,58 @@ async def log_user_message(session_id: str, message_text: str,
             session_id, message_text, "user", message_type
         )
 
+async def handle_escalamiento_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Maneja respuestas del usuario sobre escalamiento."""
+    chat_id = update.effective_chat.id
+    user_message = update.message.text.strip().lower()
+    patient_key = context.user_data.get("patient_key")
+    session_id = context.user_data.get("session_id")
+    escalamientos_disponibles = context.user_data.get("escalamientos_disponibles", [])
 
+    if not patient_key:
+        return False
+
+    try:
+        if user_message in ["supersalud", "superintendencia"] and "supersalud" in escalamientos_disponibles:
+            context.user_data.pop("esperando_escalamiento", None)
+            context.user_data.pop("escalamientos_disponibles", None)
+            await generar_reclamacion_supersalud_flow(patient_key, chat_id, context, session_id)
+            return True
+            
+        elif user_message in ["tutela", "accion de tutela"] and "tutela" in escalamientos_disponibles:
+            context.user_data.pop("esperando_escalamiento", None)
+            context.user_data.pop("escalamientos_disponibles", None)
+            await generar_tutela_flow(patient_key, chat_id, context, session_id)
+            return True
+            
+        elif user_message in ["desacato", "incidente de desacato"] and "desacato" in escalamientos_disponibles:
+            context.user_data.pop("esperando_escalamiento", None)
+            context.user_data.pop("escalamientos_disponibles", None)
+            await generar_desacato_flow(patient_key, chat_id, context, session_id)
+            return True
+            
+        elif user_message in ["no", "no gracias", "ahora no", "no por ahora"]:
+            context.user_data.pop("esperando_escalamiento", None)
+            context.user_data.pop("escalamientos_disponibles", None)
+            await send_and_log_message(
+                chat_id,
+                "✅ Perfecto. Si más adelante necesitas escalar tu caso, solo escríbeme y te ayudo.",
+                context
+            )
+            return True
+        else:
+            # Respuesta no reconocida
+            await send_and_log_message(
+                chat_id,
+                "No entendí tu respuesta. Por favor, responde con 'supersalud', 'tutela', 'desacato' o 'no'.",
+                context
+            )
+            return True
+
+    except Exception as e:
+        logger.error(f"Error manejando respuesta de escalamiento: {e}")
+        return False
+    
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Maneja mensajes de texto del usuario."""
     chat_id = update.effective_chat.id
@@ -219,6 +272,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if handled:
                 return
 
+        if context.user_data.get("esperando_escalamiento"):
+            handled = await handle_escalamiento_response(update, context)
+            if handled:
+                return
+            
         if consent_manager:
             response = consent_manager.get_bot_response(user_message, session_context)
             keyboard = None
@@ -324,12 +382,13 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     data = query.data
-    session_id = context.user_data.get("session_id")
+    session_id = data.split("_", 2)[-1] if data.startswith("followup_yes_") or data.startswith("followup_no_") else None
+
 
     logger.info(f"Callback recibido: {data} para sesión: {session_id}")
 
     if not session_id:
-        await query.edit_message_text("Tu sesión ha expirado. Por favor, inicia una nueva conversación.")
+        await query.edit_message_text("No se han encontrado reclamaciones correspondientes al proceso")
         return
 
     if data.startswith("consent_"):
@@ -342,8 +401,30 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     elif data.startswith("regimen_"):
         regimen_type = "Contributivo" if "contributivo" in data else "Subsidiado"
         await handle_regimen_selection(query, context, regimen_type)
-    else:
-        await query.edit_message_text("Opción no reconocida.")
+    elif data.startswith("followup_yes_") or data.startswith("followup_no_"):
+        session_id = data[len("followup_yes_"):] if data.startswith("followup_yes_") else data[len("followup_no_"):]
+        logger.info(f"🟢 Acción followup detectada para sesión: {session_id}")
+        if data.startswith("followup_yes_"):
+            try:
+                pm = PatientModule()
+                success = pm.update_reclamation_status(session_id, "resuelto")
+                if success:
+                    await query.edit_message_text("✅ Tu caso ha sido marcado como *resuelto*.")
+                else:
+                    await query.edit_message_text("⚠️ Hubo un error marcando tu caso. Intenta de nuevo.")
+            except Exception as e:
+                logger.error(f"Error actualizando reclamación: {e}")
+                await query.edit_message_text("❌ Error interno. Por favor inténtalo más tarde.")
+        else:  # followup_no
+            await query.edit_message_text(
+                "Entendido, no has recibido los medicamentos.\n\n¿Deseas escalar tu caso?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🚀 Sí, escalar", callback_data=f"escalate_{session_id}")],
+                    [InlineKeyboardButton("❌ No, gracias", callback_data=f"no_escalate_{session_id}")]
+                ])
+            )
+        return
+
 
 
 async def handle_consent_response(query, context: ContextTypes.DEFAULT_TYPE, 
@@ -629,22 +710,23 @@ async def save_reclamacion_to_database(patient_key: str, tipo_accion: str,
                                      nivel_escalamiento: int, 
                                      resultado_claim_generator: Dict[str, Any] = None) -> bool:
     """
-    VERSIÓN ACTUALIZADA que soporta URLs de documentos para tutelas.
+    ✅ VERSIÓN SEGURA que usa add_reclamacion_safe() en lugar de DELETE+INSERT.
+    Es MUCHO más rápida y no arriesga perder datos.
     """
     try:
-        from processor_image_prescription.bigquery_pip import get_bigquery_client, _convert_bq_row_to_dict_recursive
+        from processor_image_prescription.bigquery_pip import get_bigquery_client, _convert_bq_row_to_dict_recursive, add_reclamacion_safe
         from google.cloud import bigquery
-        from datetime import datetime
         
+        logger.info(f"💾 Guardando reclamación {tipo_accion} para paciente {patient_key}")
+        
+        # ✅ 1. Obtener medicamentos no entregados (MUY RÁPIDO)
         client = get_bigquery_client()
-        
         from processor_image_prescription.bigquery_pip import PROJECT_ID, DATASET_ID, TABLE_ID
         table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
         
-        # 1. Obtener datos actuales del paciente
         get_query = f"""
-            SELECT * FROM `{table_reference}`
-            WHERE paciente_clave = @patient_key
+            SELECT prescripciones FROM `{table_reference}`
+            WHERE paciente_clave = @patient_key LIMIT 1
         """
         
         job_config = bigquery.QueryJobConfig(
@@ -652,32 +734,25 @@ async def save_reclamacion_to_database(patient_key: str, tipo_accion: str,
         )
         
         results = client.query(get_query, job_config=job_config).result()
-        current_data = None
+        med_no_entregados_from_prescriptions = ""
         
         for row in results:
-            current_data = _convert_bq_row_to_dict_recursive(row)
+            prescripciones = row.prescripciones if row.prescripciones else []
+            if prescripciones:
+                ultima_prescripcion = prescripciones[-1]
+                medicamentos = ultima_prescripcion.get("medicamentos", [])
+                
+                meds_no_entregados = []
+                for med in medicamentos:
+                    if isinstance(med, dict) and med.get("entregado") == "no entregado":
+                        nombre = med.get("nombre", "")
+                        if nombre:
+                            meds_no_entregados.append(nombre)
+                
+                med_no_entregados_from_prescriptions = ", ".join(meds_no_entregados)
             break
-        
-        if not current_data:
-            logger.error(f"Paciente {patient_key} no encontrado para guardar reclamación.")
-            return False
-        
-        # Obtener medicamentos no entregados de prescripciones
-        med_no_entregados_from_prescriptions = ""
-        if current_data.get("prescripciones"):
-            ultima_prescripcion = current_data["prescripciones"][-1]
-            medicamentos = ultima_prescripcion.get("medicamentos", [])
-            
-            meds_no_entregados = []
-            for med in medicamentos:
-                if isinstance(med, dict) and med.get("entregado") == "no entregado":
-                    nombre = med.get("nombre", "")
-                    if nombre:
-                        meds_no_entregados.append(nombre)
-            
-            med_no_entregados_from_prescriptions = ", ".join(meds_no_entregados)
-        
-        # 2. Preparar nueva reclamación CON soporte para URL de documento
+
+        # ✅ 2. Preparar nueva reclamación
         nueva_reclamacion = {
             "med_no_entregados": med_no_entregados_from_prescriptions,
             "tipo_accion": tipo_accion,
@@ -690,30 +765,18 @@ async def save_reclamacion_to_database(patient_key: str, tipo_accion: str,
             "fecha_revision": None,   # Se llena cuando hay respuesta
         }
         
-        # 3. Agregar a reclamaciones existentes
-        reclamaciones_actuales = current_data.get("reclamaciones", [])
-        reclamaciones_actuales.append(nueva_reclamacion)
-        current_data["reclamaciones"] = reclamaciones_actuales
+        # ✅ 3. USAR FUNCIÓN SEGURA (sin DELETE peligroso)
+        success = add_reclamacion_safe(patient_key, nueva_reclamacion)
         
-        # 4. DELETE + INSERT para actualizar
-        delete_query = f"""
-            DELETE FROM `{table_reference}`
-            WHERE paciente_clave = @patient_key
-        """
-        
-        delete_job = client.query(delete_query, job_config=job_config)
-        delete_job.result()
-        logger.info(f"Registro {patient_key} eliminado para actualizar reclamaciones.")
-        
-        # 5. INSERT con nueva reclamación
-        from processor_image_prescription.bigquery_pip import load_table_from_json_direct
-        load_table_from_json_direct([current_data], table_reference)
-        
-        logger.info(f"Reclamación {tipo_accion} (nivel {nivel_escalamiento}) guardada exitosamente para paciente {patient_key}")
-        return True
+        if success:
+            logger.info(f"✅ Reclamación {tipo_accion} (nivel {nivel_escalamiento}) guardada exitosamente")
+        else:
+            logger.error(f"❌ Error guardando reclamación {tipo_accion}")
+            
+        return success
         
     except Exception as e:
-        logger.error(f"Error guardando reclamación en base de datos para paciente {patient_key}: {e}")
+        logger.error(f"❌ Error en save_reclamacion_to_database: {e}")
         return False
     
 async def generar_reclamacion_supersalud_flow(patient_key: str, chat_id: int, 
@@ -963,6 +1026,373 @@ async def manejar_escalamiento_manual(update: Update, context: ContextTypes.DEFA
             context
         )
 
+async def generar_desacato_flow(patient_key: str, chat_id: int, 
+                               context: ContextTypes.DEFAULT_TYPE, 
+                               session_id: str) -> Dict[str, Any]:
+    """
+    Flujo completo para generar incidente de desacato.
+    Incluye recolección de datos de tutela previa + generación de PDF.
+    """
+    try:
+        logger.info(f"Iniciando flujo de desacato para paciente: {patient_key}")
+        
+        # 1. Verificar requisitos básicos de desacato
+        validacion = validar_requisitos_desacato(patient_key)
+        
+        if not validacion.get("puede_desacatar"):
+            requisitos_faltantes = validacion.get("requisitos_faltantes", [])
+            mensaje_error = validacion.get("mensaje", "No se cumplen los requisitos para desacato")
+            
+            await send_and_log_message(
+                chat_id, 
+                f"⚠️ **No se puede proceder con el desacato**\n\n"
+                f"{mensaje_error}\n\n"
+                f"📋 Requisitos faltantes: {', '.join(requisitos_faltantes)}", 
+                context
+            )
+            return {"success": False, "error": mensaje_error}
+        
+        # 2. Si ya tiene tutela registrada, generar desacato directo
+        if validacion.get("numero_tutela"):
+            logger.info(f"Tutela ya registrada para {patient_key}, generando desacato directo")
+            resultado = await generar_desacato_directo_flow(patient_key, chat_id, context, session_id, validacion)
+            return resultado
+        
+        # 3. Si no tiene tutela registrada, recolectar datos
+        await send_and_log_message(
+            chat_id,
+            "⚖️ **Generación de Incidente de Desacato**\n\n"
+            "Para generar tu incidente de desacato necesito algunos datos específicos de la tutela que ganaste.\n\n"
+            "📋 Empecemos a recopilar la información:",
+            context
+        )
+        
+        # Iniciar recolección de datos de tutela
+        context.user_data["collecting_tutela_data"] = True
+        context.user_data["tutela_data"] = {}
+        
+        await recolectar_siguiente_campo_tutela(chat_id, context, patient_key)
+        
+        return {"success": True, "message": "Iniciando recolección de datos de tutela"}
+        
+    except Exception as e:
+        logger.error(f"Error en flujo de desacato para paciente {patient_key}: {e}")
+        await send_and_log_message(
+            chat_id,
+            f"⚠️ Ocurrió un error procesando tu solicitud de desacato. "
+            f"Nuestro equipo revisará tu caso manualmente.",
+            context
+        )
+        return {"success": False, "error": f"Error inesperado: {str(e)}"}
+
+async def generar_desacato_directo_flow(patient_key: str, chat_id: int, 
+                                       context: ContextTypes.DEFAULT_TYPE, 
+                                       session_id: str, validacion_tutela: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Genera desacato cuando ya se tienen todos los datos de la tutela.
+    """
+    try:
+        from processor_image_prescription.pdf_generator import generar_pdf_desacato
+        from processor_image_prescription.bigquery_pip import save_document_url_to_reclamacion
+        
+        # Generar incidente de desacato
+        resultado_desacato = generar_desacato(patient_key)
+        
+        if resultado_desacato["success"]:
+            # Generar PDF si es necesario
+            if resultado_desacato.get("requiere_pdf"):
+                pdf_result = generar_pdf_desacato(resultado_desacato)
+                
+                if pdf_result.get("success"):
+                    pdf_url = pdf_result.get("pdf_url")
+                    
+                    # Guardar reclamación en base de datos
+                    success_saved = await save_reclamacion_to_database(
+                        patient_key=patient_key,
+                        tipo_accion="desacato",
+                        texto_reclamacion=resultado_desacato["texto_reclamacion"],
+                        estado_reclamacion="pendiente_radicacion",
+                        nivel_escalamiento=4,
+                        resultado_claim_generator=resultado_desacato
+                    )
+                    
+                    if success_saved and pdf_url:
+                        # Guardar URL del PDF en la reclamación
+                        save_document_url_to_reclamacion(
+                            patient_key=patient_key,
+                            nivel_escalamiento=4,
+                            url_documento=pdf_url,
+                            tipo_documento="desacato"
+                        )
+                        
+                        logger.info(f"Desacato y PDF generados para paciente {patient_key}: {pdf_url}")
+                        
+                        # Mensaje con instrucciones para el paciente
+                        mensaje_desacato = (
+                            "⚖️ **Incidente de Desacato generado exitosamente**\n\n"
+                            f"📄 **Tutela referencia:** {validacion_tutela.get('numero_tutela', 'N/A')}\n"
+                            f"🏛️ **Juzgado:** {validacion_tutela.get('juzgado', 'N/A')}\n\n"
+                            "📋 **Instrucciones importantes:**\n"
+                            "1. **Descargar** el documento PDF que te enviaremos\n"
+                            "2. **Imprimir** el documento en papel\n"
+                            "3. **Firmar** en el lugar indicado\n"
+                            "4. **Radicar** en el mismo juzgado que concedió tu tutela\n\n"
+                            "📞 **¿Necesitas ayuda?** Responde a este mensaje si tienes dudas.\n\n"
+                            "⚠️ **Importante:** Este documento debe ser firmado por ti y radicado personalmente."
+                        )
+                        
+                        await send_and_log_message(chat_id, mensaje_desacato, context)
+                        
+                        # Enviar el PDF como enlace
+                        try:
+                            await send_and_log_message(
+                                chat_id, 
+                                f"📎 **Enlace a tu incidente de desacato:**\n\n{pdf_url}\n\n"
+                                f"💡 Descarga el archivo, imprímelo, fírmalo y radícalo en el juzgado.", 
+                                context
+                            )
+                        except Exception as send_error:
+                            logger.warning(f"Error enviando PDF: {send_error}")
+                            await send_and_log_message(
+                                chat_id,
+                                "📎 Tu incidente de desacato ha sido generado. "
+                                "Te contactaremos para enviártelo.",
+                                context
+                            )
+                        
+                        if session_id:
+                            await log_user_message(session_id, "Desacato y PDF generados exitosamente", "desacato_generated")
+                        
+                        return {"success": True, "message": "Desacato y PDF generados", "pdf_url": pdf_url}
+                    else:
+                        logger.error(f"Error guardando desacato para paciente {patient_key}")
+                        return {"success": False, "error": "Error guardando desacato en base de datos"}
+                else:
+                    # Desacato generado pero PDF falló
+                    logger.warning(f"Desacato generado pero PDF falló para paciente {patient_key}")
+                    
+                    # Guardar solo el desacato sin PDF
+                    success_saved = await save_reclamacion_to_database(
+                        patient_key=patient_key,
+                        tipo_accion="desacato",
+                        texto_reclamacion=resultado_desacato["texto_reclamacion"],
+                        estado_reclamacion="pendiente_radicacion",
+                        nivel_escalamiento=4,
+                        resultado_claim_generator=resultado_desacato
+                    )
+                    
+                    if success_saved:
+                        await send_and_log_message(
+                            chat_id,
+                            "⚖️ **Incidente de desacato generado exitosamente**\n\n"
+                            "📄 El texto de tu desacato está listo.\n"
+                            "📞 Te contactaremos para enviarte el documento.",
+                            context
+                        )
+                        return {"success": True, "message": "Desacato generado (PDF pendiente)"}
+                    else:
+                        return {"success": False, "error": "Error guardando desacato"}
+            else:
+                # No requiere PDF, solo guardar texto
+                success_saved = await save_reclamacion_to_database(
+                    patient_key=patient_key,
+                    tipo_accion="desacato",
+                    texto_reclamacion=resultado_desacato["texto_reclamacion"],
+                    estado_reclamacion="pendiente_radicacion",
+                    nivel_escalamiento=4,
+                    resultado_claim_generator=resultado_desacato
+                )
+                
+                if success_saved:
+                    await send_and_log_message(
+                        chat_id,
+                        "⚖️ **Incidente de desacato generado exitosamente**\n\n"
+                        "📄 Tu desacato está listo para radicar.\n"
+                        "📞 Te contactaremos con las instrucciones.",
+                        context
+                    )
+                    return {"success": True, "message": "Desacato generado"}
+                else:
+                    return {"success": False, "error": "Error guardando desacato"}
+        else:
+            error_msg = resultado_desacato.get("error", "Error desconocido")
+            logger.error(f"Error generando desacato: {error_msg}")
+            return {"success": False, "error": error_msg}
+            
+    except Exception as e:
+        logger.error(f"Error en flujo directo de desacato para paciente {patient_key}: {e}")
+        return {"success": False, "error": f"Error inesperado: {str(e)}"}
+
+async def recolectar_siguiente_campo_tutela(chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
+                                           patient_key: str) -> None:
+    """Solicita el siguiente campo faltante para los datos de tutela."""
+    if not claim_manager:
+        await send_and_log_message(chat_id, "Error del sistema. Por favor, intenta más tarde.", context)
+        return
+
+    tutela_data = context.user_data.get("tutela_data", {})
+    
+    try:
+        field_prompt = claim_manager.get_next_missing_field_prompt_desacato(patient_key, tutela_data)
+        
+        if field_prompt.get("field_name"):
+            # Aún faltan campos - continuar
+            field_name = field_prompt["field_name"]
+            context.user_data["waiting_for_tutela_field"] = field_name
+            
+            await send_and_log_message(chat_id, field_prompt["prompt_text"], context)
+        else:
+            # Todos los campos completos - proceder a generar desacato
+            logger.info(f"Todos los campos de tutela completos para paciente {patient_key}")
+            
+            # Guardar datos de tutela en BigQuery
+            success_saved = claim_manager.save_tutela_data_to_bigquery(patient_key, tutela_data)
+            
+            if success_saved:
+                await send_and_log_message(
+                    chat_id,
+                    "✅ **Datos de tutela recopilados correctamente**\n\n"
+                    "🔄 Generando tu incidente de desacato...",
+                    context
+                )
+                
+                # Limpiar datos temporales
+                context.user_data.pop("collecting_tutela_data", None)
+                context.user_data.pop("tutela_data", None)
+                context.user_data.pop("waiting_for_tutela_field", None)
+                
+                # Generar desacato directo
+                session_id = context.user_data.get("session_id")
+                resultado = await generar_desacato_directo_flow(
+                    patient_key, chat_id, context, session_id, tutela_data
+                )
+                
+                if not resultado.get("success"):
+                    await send_and_log_message(
+                        chat_id,
+                        "⚠️ Hubo un problema generando tu desacato. "
+                        "Nuestro equipo revisará tu caso manualmente.",
+                        context
+                    )
+            else:
+                await send_and_log_message(
+                    chat_id,
+                    "⚠️ Hubo un problema guardando los datos de tu tutela. "
+                    "Por favor, intenta nuevamente.",
+                    context
+                )
+                
+    except Exception as e:
+        logger.error(f"Error recolectando campo de tutela: {e}")
+        await send_and_log_message(
+            chat_id,
+            "⚠️ Ocurrió un error. Por favor, intenta nuevamente.",
+            context
+        )
+
+async def handle_tutela_field_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Maneja las respuestas de texto para campos de datos de tutela."""
+    chat_id = update.effective_chat.id
+    current_field = context.user_data.get("waiting_for_tutela_field")
+    patient_key = context.user_data.get("patient_key")
+    user_response = update.message.text.strip() if update.message.text else ""
+
+    if not current_field or not patient_key or not claim_manager:
+        return False
+
+    try:
+        tutela_data = context.user_data.get("tutela_data", {})
+        
+        # Normalizar la respuesta según el campo
+        if current_field == "fecha_sentencia":
+            normalized_date = claim_manager._normalize_date(user_response)
+            if not normalized_date:
+                await send_and_log_message(
+                    chat_id,
+                    ("❌ Formato de fecha inválido. Por favor, ingresa la fecha de la sentencia en formato "
+                     "DD/MM/AAAA (ej. 15/03/2025) o AAAA-MM-DD (ej. 2025-03-15)."),
+                    context
+                )
+                return True
+            tutela_data[current_field] = normalized_date
+        else:
+            # Manejar respuestas especiales
+            if current_field == "representante_legal_eps" and user_response.lower() in ["no lo sé", "no sé", "no se", "no lo se"]:
+                # Usar EPS como representante por defecto
+                patient_record = claim_manager._get_patient_data(patient_key)
+                eps_name = patient_record.get("eps_estandarizada", "EPS") if patient_record else "EPS"
+                tutela_data[current_field] = f"Representante Legal de {eps_name}"
+            else:
+                normalized_value = claim_manager._normalize_tutela_field_value(current_field, user_response)
+                tutela_data[current_field] = normalized_value
+
+        # Guardar datos actualizados
+        context.user_data["tutela_data"] = tutela_data
+        context.user_data.pop("waiting_for_tutela_field", None)
+        
+        # Continuar con el siguiente campo
+        await recolectar_siguiente_campo_tutela(chat_id, context, patient_key)
+        return True
+
+    except Exception as e:
+        logger.error(f"Error al procesar respuesta de campo de tutela '{current_field}': {e}", exc_info=True)
+        await send_and_log_message(
+            chat_id, 
+            "Ocurrió un error procesando tu respuesta. Por favor, inténtalo de nuevo.", 
+            context
+        )
+        return True
+
+async def evaluar_escalamiento_automatico(patient_key: str, chat_id: int, 
+                                        context: ContextTypes.DEFAULT_TYPE, 
+                                        session_id: str) -> None:
+    """
+    Evalúa automáticamente si el paciente puede escalar y ofrece opciones.
+    Se ejecuta después de generar la reclamación EPS.
+    """
+    try:
+        from claim_manager.claim_generator import validar_requisitos_escalamiento
+        
+        # Verificar qué escalamientos están disponibles
+        escalamientos_disponibles = []
+        
+        # Verificar Supersalud
+        validacion_supersalud = validar_requisitos_escalamiento(patient_key, "supersalud")
+        if validacion_supersalud.get("puede_escalar"):
+            escalamientos_disponibles.append("supersalud")
+        
+        # Verificar Tutela
+        validacion_tutela = validar_requisitos_escalamiento(patient_key, "tutela")
+        if validacion_tutela.get("puede_escalar"):
+            escalamientos_disponibles.append("tutela")
+        
+        # Verificar Desacato
+        validacion_desacato = validar_requisitos_escalamiento(patient_key, "desacato")
+        if validacion_desacato.get("puede_escalar"):
+            escalamientos_disponibles.append("desacato")
+        
+        # Ofrecer escalamientos disponibles
+        if escalamientos_disponibles:
+            mensaje = "🔄 **Opciones de escalamiento disponibles:**\n\n"
+            
+            if "supersalud" in escalamientos_disponibles:
+                mensaje += "• Puedes generar una queja ante la **Superintendencia de Salud**\n"
+            if "tutela" in escalamientos_disponibles:
+                mensaje += "• Puedes generar una **Acción de Tutela**\n"
+            if "desacato" in escalamientos_disponibles:
+                mensaje += "• Puedes generar un **Incidente de Desacato**\n"
+            
+            mensaje += "\n💬 ¿Te gustaría proceder con algún escalamiento? Solo responde con 'supersalud', 'tutela' o 'desacato'."
+            
+            # Guardar estado para próxima respuesta
+            context.user_data["esperando_escalamiento"] = True
+            context.user_data["escalamientos_disponibles"] = escalamientos_disponibles
+            
+            await send_and_log_message(chat_id, mensaje, context)
+            
+    except Exception as e:
+        logger.error(f"Error evaluando escalamiento automático: {e}")
+
 async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_TYPE, patient_key: str) -> None:
     """Obtiene y solicita el siguiente campo faltante al usuario."""
     field_prompt = claim_manager.get_next_missing_field_prompt(patient_key)
@@ -1065,7 +1495,9 @@ async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_
         # session_id = context.user_data.get("session_id")
         # if session_id:
         #     close_user_session(session_id, context, reason="process_completed_with_claim")
-        
+        if success_saved:
+            await evaluar_escalamiento_automatico(patient_key, chat_id, context, session_id)
+
         logger.info(f"Proceso completo finalizado para paciente {patient_key} - sesión MANTIENE ABIERTA")
 
 
@@ -1109,6 +1541,10 @@ async def handle_informante_selection(query, context: ContextTypes.DEFAULT_TYPE,
 async def handle_field_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Maneja las respuestas de texto a campos faltantes."""
     chat_id = update.effective_chat.id
+
+    if context.user_data.get("collecting_tutela_data"):
+        return await handle_tutela_field_response(update, context)
+    
     current_field = context.user_data.get("waiting_for_field")
     patient_key = context.user_data.get("patient_key")
     user_response = update.message.text.strip() if update.message.text else ""
@@ -1173,14 +1609,15 @@ async def handle_field_response(update: Update, context: ContextTypes.DEFAULT_TY
         return True
 
 
-
 def setup_handlers(application: Application) -> None:
-    """Configura los manejadores de mensajes y callbacks."""
+    """Configura los manejadores de mensajes y callbacks (ACTUALIZADO para desacato)."""
+    # ✅ CÓDIGO EXISTENTE SIN CAMBIOS
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.CONTACT, process_contact))
     application.add_handler(CallbackQueryHandler(handle_callback_query))
     application.add_handler(MessageHandler(filters.PHOTO, process_photo))
-    logger.info("Manejadores configurados.")
+    
+    logger.info("Manejadores configurados (incluyendo comando /escalar).")
 
 
 def setup_job_queue(application: Application) -> None:
@@ -1260,4 +1697,3 @@ def main() -> None:
 
 if __name__ == "__main__":
      main()
-

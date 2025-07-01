@@ -1,6 +1,7 @@
 import logging
 import re
 from typing import Any, Dict, List, Optional
+from datetime import datetime
 
 from google.api_core.exceptions import GoogleAPIError
 from google.cloud import bigquery
@@ -15,6 +16,7 @@ from processor_image_prescription.bigquery_pip import (
     PROJECT_ID,
     DATASET_ID,
     TABLE_ID,
+    load_table_from_json_direct,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,15 @@ class ClaimManager:
         "informante",
     ]
 
+    # ✨ NUEVO: Campos específicos para desacato
+    REQUIRED_FIELDS_DESACATO = [
+        "numero_tutela",
+        "juzgado", 
+        "fecha_sentencia",
+        "contenido_fallo",
+        "representante_legal_eps"
+    ]
+
     FIELD_DISPLAY_NAMES = {
         "tipo_documento": "tipo de documento",
         "numero_documento": "número de documento",
@@ -58,6 +69,15 @@ class ClaimManager:
         "farmacia": "farmacia donde recoges medicamentos",
         "sede_farmacia": "sede o punto de entrega específico",
         "informante": "información sobre quién está haciendo esta solicitud",
+    }
+
+    # ✨ NUEVO: Nombres de campos para desacato
+    FIELD_DISPLAY_NAMES_DESACATO = {
+        "numero_tutela": "número de la acción de tutela",
+        "juzgado": "nombre completo del juzgado que concedió la tutela", 
+        "fecha_sentencia": "fecha de la sentencia de tutela",
+        "contenido_fallo": "contenido específico de lo que ordenó el juez",
+        "representante_legal_eps": "nombre del representante legal de la EPS"
     }
 
     PHARMACY_STANDARDIZATION_MAP = {
@@ -107,18 +127,19 @@ class ClaimManager:
             raise ClaimManagerError(f"Error inesperado al obtener datos del paciente: {e}") from e
 
     def get_next_missing_field_prompt(self, patient_key: str) -> Dict[str, Optional[str]]:
-        """Genera dinámicamente un prompt para el siguiente campo faltante usando el LLM Core."""
+        """✅ VERSIÓN OPTIMIZADA con cache de prompts estáticos."""
         try:
             patient_record = self._get_patient_data(patient_key)
             if not patient_record:
                 return {
                     "field_name": None,
-                    "prompt_text": f"⚠️ No se encontró ningún paciente con la clave '{patient_key}'. ¿Podrías verificar y enviarla nuevamente?",
+                    "prompt_text": f"⚠️ No se encontró paciente {patient_key}. Verifica la clave.",
                 }
 
             datos_confirmados = []
             campo_faltante = None
 
+            # ✅ MISMA LÓGICA de verificación de campos
             for field in self.REQUIRED_FIELDS_ORDER:
                 value = patient_record.get(field)
 
@@ -127,7 +148,7 @@ class ClaimManager:
                         value[0].get("nombre") and value[0].get("parentesco")):
                         parentesco = value[0]["parentesco"]
                         display_text = ("Paciente" if parentesco == "Mismo paciente" 
-                                      else f"{value[0]['nombre']} ({parentesco})")
+                                    else f"{value[0]['nombre']} ({parentesco})")
                         datos_confirmados.append(f"- Informante: {display_text}")
                     else:
                         campo_faltante = "informante"
@@ -156,41 +177,148 @@ class ClaimManager:
                     campo_faltante = field
                     break
             else:
+                # ✅ TODOS LOS CAMPOS COMPLETOS
                 return {
                     "field_name": None,
                     "prompt_text": "✅ Ya hemos recopilado toda la información necesaria para tu reclamación. ¡Gracias por tu colaboración!",
                 }
 
-            claim_prompt_template = prompt_manager.get_prompt_by_module_and_function("DATA", "recoleccion_campos")
-            if not claim_prompt_template:
-                logger.error("Prompt 'CLAIM' no encontrado en manual_instrucciones.")
+            # ✅ USAR PROMPTS ESTÁTICOS (sin LLM) para campos comunes
+            STATIC_PROMPTS = {
+                "correo": "📧 Para continuar con tu reclamación, necesito tu **correo electrónico**. ¿Me lo puedes compartir, por favor?",
+                "telefono_contacto": "📱 Para continuar, necesito tu **número de teléfono** de contacto. ¿Me lo puedes compartir?",
+                "ciudad": "🏙️ ¿En qué **ciudad** resides actualmente?",
+                "direccion": "🏠 ¿Cuál es tu **dirección** de residencia completa?",
+                "regimen": "🏥 ¿Cuál es tu **régimen de salud**: Contributivo o Subsidiado?",
+                "farmacia": "🏥 ¿En qué **farmacia** recoges habitualmente tus medicamentos? (Ejemplo: Cruz Verde, Copidrogas, Audifarma)",
+                "sede_farmacia": "📍 ¿Cuál es la **sede específica** de la farmacia donde recoges tus medicamentos?",
+                "nombre_paciente": "👤 Para continuar, necesito tu **nombre completo**. ¿Me lo puedes compartir?",
+                "tipo_documento": "🆔 ¿Cuál es tu **tipo de documento**? (CC, TI, CE, PP)",
+                "numero_documento": "🔢 ¿Cuál es tu **número de documento**?",
+                "fecha_nacimiento": "📅 ¿Podrías indicarme tu **fecha de nacimiento** en formato DD/MM/AAAA? (ejemplo: 15/03/1990)",
+            }
+            
+            # ✅ SI es un campo común, usar prompt estático (MUY RÁPIDO)
+            if campo_faltante in STATIC_PROMPTS:
+                logger.info(f"⚡ Usando prompt estático para campo '{campo_faltante}' (sin LLM)")
                 return {
                     "field_name": campo_faltante,
-                    "prompt_text": f"Para continuar, necesito que me indiques tu {self._get_field_display_name(campo_faltante)}. ¿Me lo puedes compartir, por favor?",
+                    "prompt_text": STATIC_PROMPTS[campo_faltante]
                 }
 
-            datos_confirmados_str = "\n".join(datos_confirmados) if datos_confirmados else "Ninguno confirmado aún."
-            full_prompt = claim_prompt_template.format(
-                datos_confirmados_str=datos_confirmados_str,
-                campo_faltante=self._get_field_display_name(campo_faltante),
-            )
-
+            # ✅ SOLO para campos especiales, usar LLM
             try:
+                claim_prompt_template = prompt_manager.get_prompt_by_module_and_function("DATA", "recoleccion_campos")
+                if not claim_prompt_template:
+                    logger.warning("Prompt DATA.recoleccion_campos no encontrado, usando estático")
+                    return {
+                        "field_name": campo_faltante,
+                        "prompt_text": f"Para continuar, necesito que me indiques tu {self._get_field_display_name(campo_faltante)}. ¿Me lo puedes compartir, por favor? 😊",
+                    }
+
+                datos_confirmados_str = "\n".join(datos_confirmados) if datos_confirmados else "Ninguno confirmado aún."
+                full_prompt = claim_prompt_template.format(
+                    datos_confirmados_str=datos_confirmados_str,
+                    campo_faltante=self._get_field_display_name(campo_faltante),
+                )
+
+                logger.info(f"🤖 Usando LLM para campo especial '{campo_faltante}'")
                 generated_question = self.llm_core.ask_text(full_prompt)
-                logger.info(f"Pregunta generada por LLM para campo '{campo_faltante}'.")
                 return {"field_name": campo_faltante, "prompt_text": generated_question}
+                
             except Exception as llm_error:
-                logger.error(f"Error al generar pregunta con LLM para '{campo_faltante}': {llm_error}")
+                logger.error(f"Error LLM para '{campo_faltante}': {llm_error}")
                 return {
                     "field_name": campo_faltante,
                     "prompt_text": f"Para continuar, necesito que me indiques tu {self._get_field_display_name(campo_faltante)}. ¿Me lo puedes compartir, por favor? 😊",
                 }
 
         except Exception as e:
-            logger.exception(f"Error inesperado en get_next_missing_field_prompt para '{patient_key}'.")
+            logger.exception(f"Error en get_next_missing_field_prompt para '{patient_key}'.")
             return {
                 "field_name": None,
-                "prompt_text": "😓 Ocurrió un error inesperado al generar tu pregunta. Por favor, inténtalo nuevamente.",
+                "prompt_text": "😓 Ocurrió un error. Por favor, inténtalo nuevamente.",
+            }
+
+    # ✨ NUEVA FUNCIÓN: Para recolectar datos específicos de desacato
+    def get_next_missing_field_prompt_desacato(self, patient_key: str, datos_tutela_actuales: Dict[str, Any] = None) -> Dict[str, Optional[str]]:
+        """
+        Genera dinámicamente un prompt para el siguiente campo faltante de desacato usando el LLM Core.
+        
+        Args:
+            patient_key: Clave del paciente
+            datos_tutela_actuales: Datos de tutela ya recolectados
+            
+        Returns:
+            Dict con field_name y prompt_text para el siguiente campo faltante
+        """
+        try:
+            # Obtener datos del paciente
+            patient_record = self._get_patient_data(patient_key)
+            if not patient_record:
+                return {
+                    "field_name": None,
+                    "prompt_text": f"⚠️ No se encontró ningún paciente con la clave '{patient_key}'. ¿Podrías verificar y enviarla nuevamente?",
+                }
+
+            # Combinar datos actuales con los proporcionados
+            if not datos_tutela_actuales:
+                datos_tutela_actuales = {}
+
+            datos_confirmados = []
+            campo_faltante = None
+
+            # Verificar campos específicos de desacato
+            for field in self.REQUIRED_FIELDS_DESACATO:
+                value = datos_tutela_actuales.get(field)
+
+                if value and str(value).strip():
+                    display_name = self.FIELD_DISPLAY_NAMES_DESACATO.get(field, field)
+                    datos_confirmados.append(f"- {display_name}: {value}")
+                else:
+                    campo_faltante = field
+                    break
+            else:
+                # Todos los campos están completos
+                return {
+                    "field_name": None,
+                    "prompt_text": "✅ Ya tenemos toda la información necesaria sobre tu tutela para generar el incidente de desacato. ¡Gracias por tu colaboración!",
+                }
+
+            # Obtener prompt para recolección de desacato
+            desacato_prompt_template = prompt_manager.get_prompt_by_module_and_function("DATA", "recoleccion_desacato")
+            if not desacato_prompt_template:
+                logger.error("Prompt 'DATA.recoleccion_desacato' no encontrado en manual_instrucciones.")
+                field_display_name = self.FIELD_DISPLAY_NAMES_DESACATO.get(campo_faltante, campo_faltante)
+                return {
+                    "field_name": campo_faltante,
+                    "prompt_text": f"Para continuar con el incidente de desacato, necesito que me indiques {field_display_name}. ¿Me lo puedes compartir, por favor?",
+                }
+
+            datos_confirmados_str = "\n".join(datos_confirmados) if datos_confirmados else "Ningún dato de tutela confirmado aún."
+            
+            full_prompt = desacato_prompt_template.format(
+                datos_confirmados_str=datos_confirmados_str,
+                campo_faltante=campo_faltante,
+            )
+
+            try:
+                generated_question = self.llm_core.ask_text(full_prompt)
+                logger.info(f"Pregunta generada por LLM para campo de desacato '{campo_faltante}'.")
+                return {"field_name": campo_faltante, "prompt_text": generated_question}
+            except Exception as llm_error:
+                logger.error(f"Error al generar pregunta con LLM para '{campo_faltante}': {llm_error}")
+                field_display_name = self.FIELD_DISPLAY_NAMES_DESACATO.get(campo_faltante, campo_faltante)
+                return {
+                    "field_name": campo_faltante,
+                    "prompt_text": f"Para continuar con el incidente de desacato, necesito que me indiques {field_display_name}. ¿Me lo puedes compartir, por favor? 😊",
+                }
+
+        except Exception as e:
+            logger.exception(f"Error inesperado en get_next_missing_field_prompt_desacato para '{patient_key}'.")
+            return {
+                "field_name": None,
+                "prompt_text": "😓 Ocurrió un error inesperado al generar tu pregunta sobre el desacato. Por favor, inténtalo nuevamente.",
             }
 
     def _get_field_display_name(self, field_name: str) -> str:
@@ -354,6 +482,25 @@ Respuesta:"""
 
         return str(value).strip()
 
+    # ✨ NUEVA FUNCIÓN: Normalizar valores específicos para campos de tutela
+    def _normalize_tutela_field_value(self, field_name: str, value: Any) -> Any:
+        """Normaliza valores específicos para campos de tutela."""
+        if value is None:
+            return None
+
+        if field_name == "fecha_sentencia":
+            return self._normalize_date(value)
+
+        # Campos de texto para tutela
+        tutela_text_fields = [
+            "numero_tutela", "juzgado", "contenido_fallo", "representante_legal_eps"
+        ]
+        
+        if field_name in tutela_text_fields:
+            return str(value).strip()
+
+        return str(value).strip()
+
     def _standardize_response(self, user_response: str, mapping: Dict[str, str]) -> str:
         """Aplica un mapeo de estandarización a la respuesta del usuario."""
         response_lower = str(user_response).lower().strip()
@@ -363,73 +510,180 @@ Respuesta:"""
         return user_response
 
     def update_informante_with_merge(self, patient_key: str, 
-                                   new_informante: List[Dict[str, Any]]) -> bool:
-        """Actualiza el campo 'informante' (REPEATED RECORD) usando MERGE"""
-        if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
-            raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
-
-        client = get_bigquery_client()
-        table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
-
+                               new_informante: List[Dict[str, Any]]) -> bool:
+        """
+        ✅ VERSIÓN OPTIMIZADA que usa la función segura ya implementada.
+        Reemplaza el MERGE complejo por UPDATE simple.
+        """
         try:
-            get_query = f"""
-                SELECT * FROM `{table_reference}`
-                WHERE paciente_clave = @patient_key
-            """
-            job_config = bigquery.QueryJobConfig(
-                query_parameters=[bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)]
-            )
-            results = client.query(get_query, job_config=job_config).result()
-            current_data = None
-            for row in results:
-                current_data = _convert_bq_row_to_dict_recursive(row)
-                break
+            from processor_image_prescription.bigquery_pip import update_single_field_safe
+            
+            logger.info(f"🔄 Actualizando informante para paciente {patient_key}")
+            
+            # ✅ USAR función segura ya implementada (es mucho más rápida)
+            success = update_single_field_safe(patient_key, "informante", new_informante)
+            
+            if success:
+                logger.info(f"✅ Informante actualizado para paciente {patient_key}")
+            else:
+                logger.error(f"❌ Error actualizando informante para {patient_key}")
+                
+            return success
+            
+        except Exception as e:
+            logger.error(f"❌ Error en update_informante_with_merge: {e}")
+            return False
 
-            if not current_data:
-                logger.error(f"Paciente {patient_key} no encontrado para actualizar informante.")
+
+    # ✨ NUEVA FUNCIÓN: Guardar datos de tutela en tabla tutelas
+    def save_tutela_data_to_bigquery(self, patient_key: str, tutela_data: Dict[str, Any]) -> bool:
+        """
+        Guarda los datos de la tutela en la tabla tutelas de BigQuery.
+        
+        Args:
+            patient_key: Clave del paciente
+            tutela_data: Datos de la tutela a guardar
+            
+        Returns:
+            bool: True si se guardó correctamente
+        """
+        try:
+            # Preparar registro para BigQuery
+            tutela_record = {
+                "paciente_clave": patient_key,
+                "numero_tutela": tutela_data.get("numero_tutela", ""),
+                "juzgado": tutela_data.get("juzgado", ""),
+                "fecha_sentencia": tutela_data.get("fecha_sentencia"),  # Ya debe estar en formato YYYY-MM-DD
+                "contenido_fallo": tutela_data.get("contenido_fallo", ""),
+                "estado_tutela": "favorable",  # Por defecto, ya que se va a hacer desacato
+                "representante_legal_eps": tutela_data.get("representante_legal_eps", ""),
+                "created_at": datetime.now().isoformat()
+            }
+            
+            # Tabla de tutelas
+            table_reference = f"{PROJECT_ID}.{DATASET_ID}.tutelas"
+            
+            # Insertar usando load_table_from_json_direct
+            load_table_from_json_direct([tutela_record], table_reference)
+            
+            logger.info(f"Datos de tutela guardados para paciente {patient_key}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error guardando datos de tutela para paciente {patient_key}: {e}")
+            return False
+        
+    def update_tutela_pdf_info(self, patient_key: str, numero_tutela: str, 
+                          pdf_info: Dict[str, Any]) -> bool:
+        """
+        NUEVA FUNCIÓN: Actualiza la información del PDF generado en la tabla tutelas.
+        """
+        try:
+            from processor_image_prescription.bigquery_pip import get_bigquery_client
+            from google.cloud import bigquery
+            
+            client = get_bigquery_client()
+            table_reference = f"{PROJECT_ID}.{DATASET_ID}.tutelas"
+
+            # UPDATE seguro que actualiza solo los campos del PDF
+            update_query = f"""
+            UPDATE `{table_reference}`
+            SET 
+                pdf_generado = TRUE,
+                fecha_generacion_pdf = CURRENT_TIMESTAMP(),
+                url_documento_pdf = @url_documento,
+                filename_pdf = @filename,
+                size_pdf_bytes = @size_bytes
+            WHERE paciente_clave = @patient_key 
+            AND numero_tutela = @numero_tutela
+            """
+
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key),
+                    bigquery.ScalarQueryParameter("numero_tutela", "STRING", numero_tutela),
+                    bigquery.ScalarQueryParameter("url_documento", "STRING", pdf_info.get("pdf_url", "")),
+                    bigquery.ScalarQueryParameter("filename", "STRING", pdf_info.get("pdf_filename", "")),
+                    bigquery.ScalarQueryParameter("size_bytes", "INTEGER", pdf_info.get("file_size_bytes", 0))
+                ]
+            )
+
+            logger.info(f"🔄 Actualizando info PDF para tutela {numero_tutela} del paciente {patient_key}")
+            
+            query_job = client.query(update_query, job_config=job_config)
+            query_job.result()
+
+            rows_affected = getattr(query_job, 'num_dml_affected_rows', 0)
+            if rows_affected == 0:
+                logger.warning(f"No se encontró tutela {numero_tutela} para paciente {patient_key}")
                 return False
 
-            current_data["informante"] = new_informante
+            logger.info(f"✅ Información de PDF actualizada exitosamente")
+            return True
 
-            struct_sql = []
-            for item in new_informante:
-                import json
-                nombre = json.dumps(item["nombre"])
-                parentesco = json.dumps(item["parentesco"])
-                identificacion = json.dumps(item["identificacion"])
-                struct_sql.append(
-                    f"STRUCT({nombre} AS nombre, "
-                    f"{parentesco} AS parentesco, "
-                    f"{identificacion} AS identificacion)"
-                )
-            array_sql = "[" + ", ".join(struct_sql) + "]"
+        except Exception as e:
+            logger.error(f"❌ Error actualizando info PDF de tutela: {e}")
+            return False
 
-            merge_query = f"""
-            MERGE `{table_reference}` T
-            USING (
-            SELECT
-                @patient_key AS paciente_clave,
-                {array_sql} AS informante
-            ) S
-            ON T.paciente_clave = S.paciente_clave
-            WHEN MATCHED THEN
-                UPDATE SET informante = S.informante
-            WHEN NOT MATCHED THEN
-                INSERT (paciente_clave, informante)
-                VALUES (S.paciente_clave, S.informante)
+    def get_tutelas_con_pdf_para_desacato(self, patient_key: str) -> List[Dict[str, Any]]:
+        """
+        NUEVA FUNCIÓN: Obtiene tutelas favorables con PDF generado para desacato.
+        """
+        try:
+            from processor_image_prescription.bigquery_pip import get_bigquery_client
+            from google.cloud import bigquery
+            
+            client = get_bigquery_client()
+            table_reference = f"{PROJECT_ID}.{DATASET_ID}.tutelas"
+
+            query = f"""
+            SELECT 
+                numero_tutela,
+                juzgado, 
+                fecha_sentencia,
+                contenido_fallo,
+                representante_legal_eps,
+                pdf_generado,
+                url_documento_pdf,
+                filename_pdf,
+                fecha_generacion_pdf
+            FROM `{table_reference}`
+            WHERE paciente_clave = @patient_key 
+            AND estado_tutela = 'favorable'
+            AND pdf_generado = TRUE
+            AND url_documento_pdf IS NOT NULL
+            AND url_documento_pdf != ''
+            ORDER BY fecha_generacion_pdf DESC
             """
+            
             job_config = bigquery.QueryJobConfig(
                 query_parameters=[
                     bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)
                 ]
             )
-            client.query(merge_query, job_config=job_config).result()
-            logger.info(f"Informante MERGE actualizado para paciente {patient_key}")
-            return True
-
+            
+            results = client.query(query, job_config=job_config).result()
+            tutelas_disponibles = []
+            
+            for row in results:
+                tutela_info = {
+                    "numero_tutela": row.numero_tutela,
+                    "juzgado": row.juzgado,
+                    "fecha_sentencia": row.fecha_sentencia.strftime("%d/%m/%Y") if row.fecha_sentencia else "",
+                    "contenido_fallo": row.contenido_fallo or "",
+                    "representante_legal_eps": row.representante_legal_eps or "",
+                    "pdf_url": row.url_documento_pdf,
+                    "pdf_filename": row.filename_pdf,
+                    "fecha_pdf": row.fecha_generacion_pdf.isoformat() if row.fecha_generacion_pdf else ""
+                }
+                tutelas_disponibles.append(tutela_info)
+            
+            logger.info(f"✅ Encontradas {len(tutelas_disponibles)} tutelas con PDF para desacato")
+            return tutelas_disponibles
+            
         except Exception as e:
-            logger.error(f"Error actualizando informante: {e}")
-            return False
+            logger.error(f"❌ Error obteniendo tutelas con PDF: {e}")
+            return []
 
 
 try:

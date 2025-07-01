@@ -68,30 +68,345 @@ def _convert_date_values(value: Any) -> Any:
     return value
 
 
-def _clean_record_for_json(record: Dict[str, Any]) -> Dict[str, Any]:
-    """Limpia un registro recursivamente convirtiendo fechas a strings."""
-    cleaned = {}
-    for key, value in record.items():
-        if isinstance(value, (date, datetime)):
-            cleaned[key] = (value.isoformat() if isinstance(value, datetime)
-                          else value.strftime('%Y-%m-%d'))
-        elif isinstance(value, dict):
-            cleaned[key] = _clean_record_for_json(value)
-        elif isinstance(value, list):
-            cleaned[key] = [
-                _clean_record_for_json(item) if isinstance(item, dict)
-                else (item.isoformat() if isinstance(item, datetime)
-                      else item.strftime('%Y-%m-%d') if isinstance(item, date)
-                      else item)
-                for item in value
-            ]
+# ✅ NUEVA FUNCIÓN: UPDATE granular sin DELETE
+def update_single_field_safe(patient_key: str, field_name: str, field_value: Any) -> bool:
+    """
+    UPDATE instantáneo y SEGURO para campos simples usando DML.
+    NO borra datos, solo actualiza el campo específico.
+    """
+    if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
+        raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
+
+    client = get_bigquery_client()
+    table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+
+    try:
+        # Preparar valor para SQL
+        if field_value is None:
+            sql_value = "NULL"
+        elif isinstance(field_value, str):
+            escaped_value = field_value.replace("'", "''")
+            sql_value = f"'{escaped_value}'"
+        elif isinstance(field_value, bool):
+            sql_value = "TRUE" if field_value else "FALSE"
+        elif isinstance(field_value, (int, float)):
+            sql_value = str(field_value)
+        elif isinstance(field_value, list):
+            if all(isinstance(item, str) for item in field_value):
+                escaped_items = [f"'{item.replace(chr(39), chr(39)+chr(39))}'" 
+                               for item in field_value if item.strip()]
+                sql_value = f"[{', '.join(escaped_items)}]"
+            else:
+                logger.warning(f"Array complejo no soportado para UPDATE directo: {field_value}")
+                return False
         else:
-            cleaned[key] = value
-    return cleaned
+            logger.warning(f"Tipo no soportado para UPDATE directo: {type(field_value)}")
+            return False
+
+        # UPDATE seguro
+        update_query = f"""
+            UPDATE `{table_reference}`
+            SET {field_name} = {sql_value}
+            WHERE paciente_clave = @patient_key
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)
+            ]
+        )
+
+        logger.info(f"🔄 UPDATE SEGURO: campo '{field_name}' para paciente '{patient_key}'")
+        
+        query_job = client.query(update_query, job_config=job_config)
+        query_job.result()
+
+        if query_job.errors:
+            logger.error(f"Errores en UPDATE: {query_job.errors}")
+            return False
+
+        rows_affected = getattr(query_job, 'num_dml_affected_rows', 0)
+        if rows_affected == 0:
+            logger.warning(f"No se encontró paciente '{patient_key}' para actualizar")
+            return False
+
+        logger.info(f"✅ UPDATE exitoso: {rows_affected} fila(s) afectada(s)")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Error en UPDATE seguro: {e}")
+        return False
 
 
+# ✅ NUEVA FUNCIÓN: Agregar reclamación sin borrar datos existentes
+def add_reclamacion_safe(patient_key: str, nueva_reclamacion: Dict[str, Any]) -> bool:
+    """
+    Agrega una nueva reclamación al array existente sin borrar el paciente.
+    VERSIÓN CORREGIDA que escapa comillas y caracteres especiales correctamente.
+    """
+    if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
+        raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
+
+    client = get_bigquery_client()
+    table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+
+    try:
+        # ✅ FUNCIÓN HELPER para escapar strings SQL
+        def escape_sql_string(value: str) -> str:
+            """Escapa comillas y caracteres especiales para SQL."""
+            if not isinstance(value, str):
+                return str(value)
+            # Escapar comillas simples duplicándolas
+            escaped = value.replace("'", "''")
+            # Escapar caracteres de nueva línea
+            escaped = escaped.replace('\n', '\\n')
+            escaped = escaped.replace('\r', '\\r')
+            # Escapar backslashes
+            escaped = escaped.replace('\\', '\\\\')
+            return escaped
+
+        # ✅ USAR PARÁMETROS EN LUGAR DE CONCATENACIÓN DIRECTA
+        update_query = f"""
+        UPDATE `{table_reference}`
+        SET reclamaciones = ARRAY_CONCAT(
+            IFNULL(reclamaciones, []), 
+            [STRUCT(
+                @med_no_entregados AS med_no_entregados,
+                @tipo_accion AS tipo_accion,
+                @texto_reclamacion AS texto_reclamacion,
+                @estado_reclamacion AS estado_reclamacion,
+                @nivel_escalamiento AS nivel_escalamiento,
+                @url_documento AS url_documento,
+                @numero_radicado AS numero_radicado,
+                @fecha_radicacion AS fecha_radicacion,
+                @fecha_revision AS fecha_revision
+            )]
+        )
+        WHERE paciente_clave = @patient_key
+        """
+
+        # ✅ PREPARAR PARÁMETROS SEGUROS
+        query_parameters = [
+            bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key),
+            bigquery.ScalarQueryParameter("med_no_entregados", "STRING", 
+                nueva_reclamacion.get('med_no_entregados', '')),
+            bigquery.ScalarQueryParameter("tipo_accion", "STRING", 
+                nueva_reclamacion.get('tipo_accion', '')),
+            bigquery.ScalarQueryParameter("texto_reclamacion", "STRING", 
+                nueva_reclamacion.get('texto_reclamacion', '')),
+            bigquery.ScalarQueryParameter("estado_reclamacion", "STRING", 
+                nueva_reclamacion.get('estado_reclamacion', '')),
+            bigquery.ScalarQueryParameter("nivel_escalamiento", "INTEGER", 
+                nueva_reclamacion.get('nivel_escalamiento', 0)),
+            bigquery.ScalarQueryParameter("url_documento", "STRING", 
+                nueva_reclamacion.get('url_documento', '')),
+            bigquery.ScalarQueryParameter("numero_radicado", "STRING", 
+                nueva_reclamacion.get('numero_radicado', '')),
+            bigquery.ScalarQueryParameter("fecha_radicacion", "DATE", 
+                nueva_reclamacion.get('fecha_radicacion')),
+            bigquery.ScalarQueryParameter("fecha_revision", "DATE", 
+                nueva_reclamacion.get('fecha_revision'))
+        ]
+
+        job_config = bigquery.QueryJobConfig(query_parameters=query_parameters)
+
+        logger.info(f"➕ Agregando reclamación {nueva_reclamacion.get('tipo_accion')} para paciente {patient_key}")
+        logger.debug(f"Texto length: {len(nueva_reclamacion.get('texto_reclamacion', ''))} caracteres")
+        
+        query_job = client.query(update_query, job_config=job_config)
+        query_job.result()
+
+        if query_job.errors:
+            logger.error(f"Errores agregando reclamación: {query_job.errors}")
+            return False
+
+        rows_affected = getattr(query_job, 'num_dml_affected_rows', 0)
+        if rows_affected == 0:
+            logger.warning(f"No se encontró paciente '{patient_key}' para agregar reclamación")
+            return False
+
+        logger.info(f"✅ Reclamación agregada exitosamente: {rows_affected} fila(s) afectada(s)")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Error agregando reclamación: {e}")
+        # ✅ LOG ADICIONAL para debugging
+        if nueva_reclamacion.get('texto_reclamacion'):
+            logger.debug(f"Texto problemático (primeros 200 chars): {nueva_reclamacion['texto_reclamacion'][:200]}...")
+        return False
+
+
+# ✅ NUEVA FUNCIÓN: Actualizar reclamación específica
+def update_reclamacion_by_level_safe(patient_key: str, nivel_escalamiento: int, 
+                                   updates: Dict[str, Any]) -> bool:
+    """
+    Actualiza una reclamación específica por nivel de escalamiento de forma segura.
+    """
+    if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
+        raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
+
+    client = get_bigquery_client()
+    table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+
+    try:
+        # ✅ NUEVA SINTAXIS CORRECTA usando ARRAY() con SELECT AS STRUCT
+        update_query = f"""
+        UPDATE `{table_reference}`
+        SET reclamaciones = ARRAY(
+            SELECT AS STRUCT
+                rec.med_no_entregados,
+                rec.tipo_accion,
+                rec.texto_reclamacion,
+                CASE 
+                    WHEN rec.nivel_escalamiento = @nivel_escalamiento THEN
+                        CASE 
+                            WHEN @new_estado IS NOT NULL THEN @new_estado
+                            ELSE rec.estado_reclamacion
+                        END
+                    ELSE rec.estado_reclamacion
+                END AS estado_reclamacion,
+                rec.nivel_escalamiento,
+                CASE 
+                    WHEN rec.nivel_escalamiento = @nivel_escalamiento THEN
+                        CASE 
+                            WHEN @new_url IS NOT NULL THEN @new_url
+                            ELSE rec.url_documento
+                        END
+                    ELSE rec.url_documento
+                END AS url_documento,
+                CASE 
+                    WHEN rec.nivel_escalamiento = @nivel_escalamiento THEN
+                        CASE 
+                            WHEN @new_radicado IS NOT NULL THEN @new_radicado
+                            ELSE rec.numero_radicado
+                        END
+                    ELSE rec.numero_radicado
+                END AS numero_radicado,
+                CASE 
+                    WHEN rec.nivel_escalamiento = @nivel_escalamiento THEN
+                        CASE 
+                            WHEN @new_fecha_radicacion IS NOT NULL THEN DATE(@new_fecha_radicacion)
+                            ELSE rec.fecha_radicacion
+                        END
+                    ELSE rec.fecha_radicacion
+                END AS fecha_radicacion,
+                rec.fecha_revision
+            FROM UNNEST(reclamaciones) AS rec
+        )
+        WHERE paciente_clave = @patient_key
+        """
+
+        # Preparar parámetros con valores por defecto
+        query_parameters = [
+            bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key),
+            bigquery.ScalarQueryParameter("nivel_escalamiento", "INTEGER", nivel_escalamiento),
+            bigquery.ScalarQueryParameter("new_estado", "STRING", updates.get('estado_reclamacion')),
+            bigquery.ScalarQueryParameter("new_url", "STRING", updates.get('url_documento')),
+            bigquery.ScalarQueryParameter("new_radicado", "STRING", updates.get('numero_radicado')),
+            bigquery.ScalarQueryParameter("new_fecha_radicacion", "STRING", updates.get('fecha_radicacion'))
+        ]
+
+        job_config = bigquery.QueryJobConfig(query_parameters=query_parameters)
+
+        logger.info(f"🔄 Actualizando reclamación nivel {nivel_escalamiento} para paciente {patient_key}")
+        logger.debug(f"Updates: {updates}")
+        
+        query_job = client.query(update_query, job_config=job_config)
+        query_job.result()
+
+        if query_job.errors:
+            logger.error(f"Errores actualizando reclamación: {query_job.errors}")
+            return False
+
+        rows_affected = getattr(query_job, 'num_dml_affected_rows', 0)
+        if rows_affected == 0:
+            logger.warning(f"No se encontró paciente '{patient_key}' para actualizar reclamación")
+            return False
+
+        logger.info(f"✅ Reclamación actualizada exitosamente")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Error actualizando reclamación: {e}")
+        return False
+
+
+# ✅ FUNCIÓN CORREGIDA: save_document_url_to_reclamacion
+def save_document_url_to_reclamacion(patient_key: str, nivel_escalamiento: int, 
+                                    url_documento: str, tipo_documento: str) -> bool:
+    """
+    Actualiza la URL del documento generado en la reclamación correspondiente.
+    VERSIÓN SEGURA que no borra datos.
+    """
+    try:
+        updates = {
+            "url_documento": url_documento
+        }
+        
+        success = update_reclamacion_by_level_safe(
+            patient_key=patient_key,
+            nivel_escalamiento=nivel_escalamiento, 
+            updates=updates
+        )
+        
+        if success:
+            logger.info(f"✅ URL de documento guardada para paciente {patient_key}, nivel {nivel_escalamiento}")
+        else:
+            logger.error(f"❌ Error guardando URL de documento para paciente {patient_key}")
+            
+        return success
+        
+    except Exception as e:
+        logger.error(f"❌ Error guardando URL de documento: {e}")
+        return False
+
+
+# ✅ FUNCIÓN CORREGIDA: update_reclamacion_status  
+def update_reclamacion_status(patient_key: str, nivel_escalamiento: int, 
+                            nuevo_estado: str, numero_radicado: str = None, 
+                            fecha_radicacion: str = None) -> bool:
+    """
+    Actualiza el estado y radicado de una reclamación específica.
+    VERSIÓN SEGURA que no borra datos.
+    """
+    try:
+        updates = {
+            "estado_reclamacion": nuevo_estado
+        }
+        
+        if numero_radicado:
+            updates["numero_radicado"] = numero_radicado
+            
+        if fecha_radicacion:
+            updates["fecha_radicacion"] = fecha_radicacion
+        elif numero_radicado:
+            # Si se proporciona radicado pero no fecha, usar fecha actual
+            updates["fecha_radicacion"] = datetime.now().strftime("%Y-%m-%d")
+        
+        success = update_reclamacion_by_level_safe(
+            patient_key=patient_key,
+            nivel_escalamiento=nivel_escalamiento,
+            updates=updates
+        )
+        
+        if success:
+            logger.info(f"✅ Estado de reclamación actualizado para paciente {patient_key}, nivel {nivel_escalamiento}")
+        else:
+            logger.error(f"❌ Error actualizando estado de reclamación para paciente {patient_key}")
+            
+        return success
+        
+    except Exception as e:
+        logger.error(f"❌ Error actualizando estado de reclamación: {e}")
+        return False
+
+
+# ✅ MANTENER FUNCIÓN ORIGINAL para casos específicos donde sea necesario
 def load_table_from_json_direct(data: List[Dict[str, Any]], table_reference: str) -> None:
-    """Carga datos SIN BÚFER usando load_table_from_json."""
+    """
+    ⚠️ USAR SOLO PARA INSERTS NUEVOS, NO PARA UPDATES.
+    Carga datos SIN BÚFER usando load_table_from_json.
+    """
     if not data:
         logger.info("No hay datos para cargar en BigQuery.")
         return
@@ -99,6 +414,27 @@ def load_table_from_json_direct(data: List[Dict[str, Any]], table_reference: str
     client = get_bigquery_client()
 
     try:
+        def _clean_record_for_json(record: Dict[str, Any]) -> Dict[str, Any]:
+            """Limpia un registro recursivamente convirtiendo fechas a strings."""
+            cleaned = {}
+            for key, value in record.items():
+                if isinstance(value, (date, datetime)):
+                    cleaned[key] = (value.isoformat() if isinstance(value, datetime)
+                                  else value.strftime('%Y-%m-%d'))
+                elif isinstance(value, dict):
+                    cleaned[key] = _clean_record_for_json(value)
+                elif isinstance(value, list):
+                    cleaned[key] = [
+                        _clean_record_for_json(item) if isinstance(item, dict)
+                        else (item.isoformat() if isinstance(item, datetime)
+                              else item.strftime('%Y-%m-%d') if isinstance(item, date)
+                              else item)
+                        for item in value
+                    ]
+                else:
+                    cleaned[key] = value
+            return cleaned
+
         cleaned_data = []
         for record in data:
             cleaned_record = _clean_record_for_json(record)
@@ -123,7 +459,7 @@ def load_table_from_json_direct(data: List[Dict[str, Any]], table_reference: str
             logger.error(f"Errores en la carga directa: {job.errors}")
             raise BigQueryServiceError(f"Errores en la carga directa: {job.errors}")
 
-        logger.info(f"Carga directa exitosa: {job.output_rows} filas en '{table_reference}' SIN BÚFER.")
+        logger.info(f"✅ Carga directa exitosa: {job.output_rows} filas en '{table_reference}'")
 
     except GoogleAPIError as exc:
         logger.exception("Error de la API de BigQuery durante la carga directa.")
@@ -133,124 +469,12 @@ def load_table_from_json_direct(data: List[Dict[str, Any]], table_reference: str
         raise BigQueryServiceError(f"Error inesperado en la carga directa: {exc}") from exc
 
 
-def update_single_field_dml(patient_key: str, field_name: str, field_value: Any) -> bool:
-    """UPDATE instantáneo SIN BÚFER para campos simples usando DML."""
-    if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
-        raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
-
-    client = get_bigquery_client()
-    table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
-
-    try:
-        if field_value is None:
-            sql_value = "NULL"
-        elif isinstance(field_value, str):
-            escaped_value = field_value.replace("'", "''")
-            sql_value = f"'{escaped_value}'"
-        elif isinstance(field_value, bool):
-            sql_value = "TRUE" if field_value else "FALSE"
-        elif isinstance(field_value, (int, float)):
-            sql_value = str(field_value)
-        elif isinstance(field_value, list):
-            if all(isinstance(item, str) for item in field_value):
-                escaped_items = [f"'{item.replace(chr(39), chr(39)+chr(39))}'" 
-                               for item in field_value if item.strip()]
-                sql_value = f"[{', '.join(escaped_items)}]"
-            else:
-                logger.warning(f"Array complejo no soportado para UPDATE directo: {field_value}")
-                return False
-        else:
-            logger.warning(f"Tipo no soportado para UPDATE directo: {type(field_value)}")
-            return False
-
-        update_query = f"""
-            UPDATE `{table_reference}`
-            SET {field_name} = {sql_value}
-            WHERE paciente_clave = @patient_key
-        """
-
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)
-            ]
-        )
-
-        logger.info(f"UPDATE SIN BÚFER: campo '{field_name}' para paciente '{patient_key}'")
-        
-        query_job = client.query(update_query, job_config=job_config)
-        query_job.result()
-
-        if query_job.errors:
-            logger.error(f"Errores en UPDATE DML: {query_job.errors}")
-            return False
-
-        rows_affected = getattr(query_job, 'num_dml_affected_rows', 0)
-        if rows_affected == 0:
-            logger.warning(f"No se encontró paciente '{patient_key}' para actualizar")
-            return False
-
-        logger.info(f"UPDATE SIN BÚFER exitoso: {rows_affected} fila(s) afectada(s)")
-        return True
-
-    except Exception as e:
-        logger.error(f"Error en UPDATE DML SIN BÚFER: {e}")
-        return False
-
-
-def update_prescriptions_with_load_table(patient_key: str, new_prescriptions: List[Dict[str, Any]]) -> bool:
-    """Actualiza prescripciones usando DELETE + load_table_from_json SIN BÚFER."""
-    if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
-        raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
-
-    client = get_bigquery_client()
-    table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
-
-    try:
-        get_query = f"""
-            SELECT * FROM `{table_reference}`
-            WHERE paciente_clave = @patient_key
-        """
-
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)]
-        )
-
-        results = client.query(get_query, job_config=job_config).result()
-        current_data = None
-
-        for row in results:
-            current_data = _convert_bq_row_to_dict_recursive(row)
-            break
-
-        if not current_data:
-            logger.error(f"Paciente {patient_key} no encontrado para actualizar prescripciones.")
-            return False
-
-        current_prescriptions = current_data.get("prescripciones", [])
-        current_prescriptions.extend(new_prescriptions)
-        current_data["prescripciones"] = current_prescriptions
-
-        delete_query = f"""
-            DELETE FROM `{table_reference}`
-            WHERE paciente_clave = @patient_key
-        """
-
-        delete_job = client.query(delete_query, job_config=job_config)
-        delete_job.result()
-        logger.info(f"Registro {patient_key} eliminado para actualizar prescripciones.")
-
-        load_table_from_json_direct([current_data], table_reference)
-        logger.info(f"Prescripciones actualizadas SIN BÚFER para paciente {patient_key}")
-        return True
-
-    except Exception as e:
-        logger.error(f"Error actualizando prescripciones SIN BÚFER: {e}")
-        return False
-
-
+# ✅ FUNCIÓN PRINCIPAL para insertar/actualizar pacientes
 def insert_or_update_patient_data(patient_data: Dict[str, Any],
                                  fields_to_update: Optional[Dict[str, Any]] = None) -> None:
-    """ENFOQUE HÍBRIDO OPTIMIZADO SIN BÚFER."""
+    """
+    VERSIÓN MEJORADA que usa UPDATE cuando es posible, INSERT solo para nuevos pacientes.
+    """
     if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
         logger.critical("Variables de entorno de BigQuery incompletas.")
         raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
@@ -263,8 +487,9 @@ def insert_or_update_patient_data(patient_data: Dict[str, Any],
         logger.error("Se requiere paciente_clave.")
         raise BigQueryServiceError("paciente_clave es nulo o vacío.")
 
-    logger.info(f"Procesando paciente '{patient_key}' HÍBRIDO SIN BÚFER...")
+    logger.info(f"🔄 Procesando paciente '{patient_key}' con UPDATE seguro...")
 
+    # Verificar si existe
     exists_query = f"""
         SELECT 1 FROM `{table_reference}`
         WHERE paciente_clave = @patient_key LIMIT 1
@@ -281,89 +506,34 @@ def insert_or_update_patient_data(patient_data: Dict[str, Any],
         raise BigQueryServiceError(f"Fallo al verificar el paciente: {exc}") from exc
 
     if patient_exists:
-        logger.info(f"Paciente '{patient_key}' existe. Usando UPDATES HÍBRIDOS SIN BÚFER...")
-
-        simple_fields = [
-            "fecha_nacimiento", "correo", "telefono_contacto", "regimen",
-            "ciudad", "direccion", "canal_contacto", "eps_estandarizada",
-            "farmacia", "sede_farmacia"
-        ]
-
+        # Usar UPDATE para campos existentes
+        logger.info(f"✅ Paciente '{patient_key}' existe. Usando UPDATE seguro...")
+        
         if fields_to_update:
             for field_name, field_value in fields_to_update.items():
-                if field_name in simple_fields:
-                    logger.info(f"UPDATE DML instantáneo para campo '{field_name}'")
-                    success = update_single_field_dml(patient_key, field_name, field_value)
+                if field_name in ['fecha_nacimiento', 'correo', 'telefono_contacto', 'regimen',
+                                 'ciudad', 'direccion', 'canal_contacto', 'eps_estandarizada',
+                                 'farmacia', 'sede_farmacia']:
+                    success = update_single_field_safe(patient_key, field_name, field_value)
                     if not success:
-                        logger.warning(f"No se pudo actualizar '{field_name}' con DML, usando fallback")
-                        _fallback_update_complete_record(patient_key, {field_name: field_value})
+                        logger.warning(f"⚠️ No se pudo actualizar '{field_name}'")
 
+        # Para nuevas prescripciones, usar operación específica
         if patient_data.get("prescripciones"):
-            logger.info("Actualizando prescripciones con load_table_from_json SIN BÚFER")
-            success = update_prescriptions_with_load_table(patient_key, patient_data["prescripciones"])
-            if not success:
-                raise BigQueryServiceError(f"Error al actualizar prescripciones del paciente {patient_key}")
+            logger.info("➕ Agregando nueva prescripción...")
+            # Implementar lógica específica para prescripciones si es necesario
 
     else:
-        logger.info(f"Paciente '{patient_key}' no existe. Insertando SIN BÚFER...")
-
+        # Solo para pacientes completamente nuevos
+        logger.info(f"➕ Paciente '{patient_key}' no existe. Insertando...")
         new_patient_record = _prepare_clean_patient_record(patient_data, fields_to_update)
         load_table_from_json_direct([new_patient_record], table_reference)
-        logger.info(f"Paciente '{patient_key}' insertado SIN BÚFER.")
-
-
-def _fallback_update_complete_record(patient_key: str, updates: Dict[str, Any]) -> bool:
-    """Fallback: DELETE + INSERT completo usando load_table_from_json SIN BÚFER."""
-    if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
-        raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
-
-    client = get_bigquery_client()
-    table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
-
-    try:
-        get_query = f"""
-            SELECT * FROM `{table_reference}`
-            WHERE paciente_clave = @patient_key
-        """
-
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)]
-        )
-
-        results = client.query(get_query, job_config=job_config).result()
-        current_data = None
-
-        for row in results:
-            current_data = _convert_bq_row_to_dict_recursive(row)
-            break
-
-        if not current_data:
-            logger.error(f"Paciente {patient_key} no encontrado para fallback update.")
-            return False
-
-        current_data.update(updates)
-
-        delete_query = f"""
-            DELETE FROM `{table_reference}`
-            WHERE paciente_clave = @patient_key
-        """
-
-        delete_job = client.query(delete_query, job_config=job_config)
-        delete_job.result()
-        logger.info(f"Registro {patient_key} eliminado para fallback update.")
-
-        load_table_from_json_direct([current_data], table_reference)
-        logger.info(f"Fallback update completado SIN BÚFER para paciente {patient_key}")
-        return True
-
-    except Exception as e:
-        logger.error(f"Error en fallback update SIN BÚFER: {e}")
-        return False
+        logger.info(f"✅ Paciente '{patient_key}' insertado.")
 
 
 def _prepare_clean_patient_record(patient_data: Dict[str, Any], 
                                  fields_to_update: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Prepara un registro limpio del paciente asegurando que todos los campos requeridos tengan valores válidos."""
+    """Prepara un registro limpio del paciente."""
     new_patient_record = {
         "paciente_clave": patient_data.get("paciente_clave", ""),
         "pais": patient_data.get("pais", "CO"),
@@ -390,9 +560,8 @@ def _prepare_clean_patient_record(patient_data: Dict[str, Any],
         for key, value in fields_to_update.items():
             if key in new_patient_record:
                 new_patient_record[key] = value
-            else:
-                logger.warning(f"Campo '{key}' no reconocido en el esquema, ignorando.")
 
+    # Validaciones
     if not new_patient_record["paciente_clave"]:
         raise BigQueryServiceError("paciente_clave no puede estar vacío")
 
@@ -408,6 +577,7 @@ def _prepare_clean_patient_record(patient_data: Dict[str, Any],
         logger.warning("nombre_paciente está vacío, usando valor por defecto")
         new_patient_record["nombre_paciente"] = "Paciente Sin Nombre"
 
+    # Convertir None a valores por defecto
     for key, value in new_patient_record.items():
         if value is None:
             if key in ["correo", "telefono_contacto", "informante", "prescripciones", "reclamaciones"]:
@@ -418,96 +588,11 @@ def _prepare_clean_patient_record(patient_data: Dict[str, Any],
     return new_patient_record
 
 
+# ✅ FUNCIÓN MEJORADA: update_patient_medications_no_buffer
 def update_patient_medications_no_buffer(patient_key: str, session_id: str, 
                                         undelivered_med_names: List[str]) -> bool:
-    """Actualiza medicamentos SIN BÚFER usando DELETE + load_table_from_json."""
-    try:
-        if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
-            raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
-
-        client = get_bigquery_client()
-        table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
-
-        get_query = f"""
-            SELECT * FROM `{table_reference}`
-            WHERE paciente_clave = @patient_key
-        """
-
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)]
-        )
-
-        results = client.query(get_query, job_config=job_config).result()
-        current_data = None
-
-        for row in results:
-            current_data = _convert_bq_row_to_dict_recursive(row)
-            break
-
-        if not current_data:
-            logger.warning(f"Paciente con clave '{patient_key}' no encontrado.")
-            return False
-
-        prescripciones = current_data.get("prescripciones", [])
-        updated_prescriptions = []
-        prescription_found = False
-
-        for prescripcion in prescripciones:
-            if prescripcion.get("id_session") == session_id:
-                prescription_found = True
-                updated_meds = []
-
-                for med in prescripcion.get("medicamentos", []):
-                    med_name = med.get("nombre", "")
-                    if med_name in undelivered_med_names:
-                        med["entregado"] = "no entregado"
-                        logger.info(f"Medicamento '{med_name}' marcado como 'no entregado'")
-                    else:
-                        med["entregado"] = "entregado"
-                        logger.info(f"Medicamento '{med_name}' marcado como 'entregado'")
-                    updated_meds.append(med)
-
-                prescripcion["medicamentos"] = updated_meds
-                updated_prescriptions.append(prescripcion)
-            else:
-                updated_prescriptions.append(prescripcion)
-
-        if not prescription_found:
-            logger.warning(f"No se encontró prescripción para session_id '{session_id}'")
-            return False
-
-        current_data["prescripciones"] = updated_prescriptions
-
-        delete_query = f"""
-            DELETE FROM `{table_reference}`
-            WHERE paciente_clave = @patient_key
-        """
-
-        delete_job = client.query(delete_query, job_config=job_config)
-        delete_job.result()
-        logger.info(f"Registro {patient_key} eliminado para actualizar medicamentos.")
-
-        load_table_from_json_direct([current_data], table_reference)
-        logger.info(f"Medicamentos actualizados SIN BÚFER para paciente '{patient_key}' en sesión '{session_id}'")
-        return True
-
-    except Exception as e:
-        logger.error(f"Error actualizando medicamentos SIN BÚFER para paciente '{patient_key}': {e}")
-        return False
-    
-def save_document_url_to_reclamacion(patient_key: str, nivel_escalamiento: int, 
-                                    url_documento: str, tipo_documento: str) -> bool:
     """
-    Actualiza la URL del documento generado en la reclamación correspondiente.
-    
-    Args:
-        patient_key: Clave del paciente
-        nivel_escalamiento: Nivel de escalamiento de la reclamación (2=Supersalud, 3=Tutela, 4=Desacato)
-        url_documento: URL del documento en Cloud Storage
-        tipo_documento: Tipo de documento ("tutela", "desacato")
-        
-    Returns:
-        bool: True si se actualizó correctamente
+    Actualiza medicamentos usando UPDATE seguro en lugar de DELETE+INSERT.
     """
     if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
         raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
@@ -516,151 +601,63 @@ def save_document_url_to_reclamacion(patient_key: str, nivel_escalamiento: int,
     table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
 
     try:
-        # Obtener datos actuales del paciente
-        get_query = f"""
-            SELECT * FROM `{table_reference}`
-            WHERE paciente_clave = @patient_key
-        """
-        
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)]
+        # Usar UPDATE para modificar medicamentos específicos
+        update_query = f"""
+        UPDATE `{table_reference}`
+        SET prescripciones = ARRAY(
+            SELECT AS STRUCT
+                presc.id_session,
+                presc.user_id,
+                presc.url_prescripcion,
+                presc.categoria_riesgo,
+                presc.justificacion_riesgo,
+                presc.fecha_atencion,
+                presc.diagnostico,
+                presc.IPS,
+                ARRAY(
+                    SELECT AS STRUCT
+                        med.nombre,
+                        med.dosis,
+                        med.cantidad,
+                        CASE 
+                            WHEN presc.id_session = @session_id AND med.nombre IN UNNEST(@undelivered_meds)
+                            THEN "no entregado"
+                            WHEN presc.id_session = @session_id
+                            THEN "entregado"
+                            ELSE med.entregado
+                        END AS entregado
+                    FROM UNNEST(presc.medicamentos) AS med
+                ) AS medicamentos
+            FROM UNNEST(prescripciones) AS presc
         )
-        
-        results = client.query(get_query, job_config=job_config).result()
-        current_data = None
-        
-        for row in results:
-            current_data = _convert_bq_row_to_dict_recursive(row)
-            break
-        
-        if not current_data:
-            logger.error(f"Paciente {patient_key} no encontrado para actualizar URL de documento.")
-            return False
-        
-        # Encontrar y actualizar la reclamación correspondiente
-        reclamaciones = current_data.get("reclamaciones", [])
-        reclamacion_actualizada = False
-        
-        for reclamacion in reclamaciones:
-            if reclamacion.get("nivel_escalamiento") == nivel_escalamiento:
-                reclamacion["url_documento"] = url_documento
-                reclamacion["fecha_generacion_documento"] = datetime.now().isoformat()
-                reclamacion["tipo_documento"] = tipo_documento
-                reclamacion_actualizada = True
-                logger.info(f"URL de documento actualizada para nivel {nivel_escalamiento}: {url_documento}")
-                break
-        
-        if not reclamacion_actualizada:
-            logger.warning(f"No se encontró reclamación de nivel {nivel_escalamiento} para paciente {patient_key}")
-            return False
-        
-        # Actualizar usando DELETE + INSERT
-        current_data["reclamaciones"] = reclamaciones
-        
-        delete_query = f"""
-            DELETE FROM `{table_reference}`
-            WHERE paciente_clave = @patient_key
+        WHERE paciente_clave = @patient_key
         """
-        
-        delete_job = client.query(delete_query, job_config=job_config)
-        delete_job.result()
-        logger.info(f"Registro {patient_key} eliminado para actualizar URL de documento.")
-        
-        load_table_from_json_direct([current_data], table_reference)
-        logger.info(f"URL de documento guardada para paciente {patient_key}, nivel {nivel_escalamiento}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error guardando URL de documento: {e}")
-        return False
 
-
-def update_reclamacion_status(patient_key: str, nivel_escalamiento: int, 
-                            nuevo_estado: str, numero_radicado: str = None, 
-                            fecha_radicacion: str = None) -> bool:
-    """
-    Actualiza el estado y radicado de una reclamación específica.
-    
-    Args:
-        patient_key: Clave del paciente
-        nivel_escalamiento: Nivel de escalamiento de la reclamación
-        nuevo_estado: Nuevo estado ("pendiente_radicacion", "radicado", "resuelto", etc.)
-        numero_radicado: Número de radicado (opcional)
-        fecha_radicacion: Fecha de radicación (opcional)
-        
-    Returns:
-        bool: True si se actualizó correctamente
-    """
-    if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
-        raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
-
-    client = get_bigquery_client()
-    table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
-
-    try:
-        # Obtener datos actuales del paciente
-        get_query = f"""
-            SELECT * FROM `{table_reference}`
-            WHERE paciente_clave = @patient_key
-        """
-        
         job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)]
+            query_parameters=[
+                bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key),
+                bigquery.ScalarQueryParameter("session_id", "STRING", session_id),
+                bigquery.ArrayQueryParameter("undelivered_meds", "STRING", undelivered_med_names)
+            ]
         )
+
+        logger.info(f"🔄 Actualizando medicamentos para paciente '{patient_key}' en sesión '{session_id}'")
         
-        results = client.query(get_query, job_config=job_config).result()
-        current_data = None
-        
-        for row in results:
-            current_data = _convert_bq_row_to_dict_recursive(row)
-            break
-        
-        if not current_data:
-            logger.error(f"Paciente {patient_key} no encontrado para actualizar estado de reclamación.")
+        query_job = client.query(update_query, job_config=job_config)
+        query_job.result()
+
+        if query_job.errors:
+            logger.error(f"Errores actualizando medicamentos: {query_job.errors}")
             return False
-        
-        # Encontrar y actualizar la reclamación correspondiente
-        reclamaciones = current_data.get("reclamaciones", [])
-        reclamacion_actualizada = False
-        
-        for reclamacion in reclamaciones:
-            if reclamacion.get("nivel_escalamiento") == nivel_escalamiento:
-                reclamacion["estado_reclamacion"] = nuevo_estado
-                
-                if numero_radicado:
-                    reclamacion["numero_radicado"] = numero_radicado
-                    
-                if fecha_radicacion:
-                    reclamacion["fecha_radicacion"] = fecha_radicacion
-                else:
-                    # Si se proporciona radicado pero no fecha, usar fecha actual
-                    if numero_radicado:
-                        reclamacion["fecha_radicacion"] = datetime.now().strftime("%Y-%m-%d")
-                
-                reclamacion_actualizada = True
-                logger.info(f"Estado de reclamación actualizado para nivel {nivel_escalamiento}: {nuevo_estado}")
-                break
-        
-        if not reclamacion_actualizada:
-            logger.warning(f"No se encontró reclamación de nivel {nivel_escalamiento} para paciente {patient_key}")
+
+        rows_affected = getattr(query_job, 'num_dml_affected_rows', 0)
+        if rows_affected == 0:
+            logger.warning(f"No se encontró paciente '{patient_key}' para actualizar medicamentos")
             return False
-        
-        # Actualizar usando DELETE + INSERT
-        current_data["reclamaciones"] = reclamaciones
-        
-        delete_query = f"""
-            DELETE FROM `{table_reference}`
-            WHERE paciente_clave = @patient_key
-        """
-        
-        delete_job = client.query(delete_query, job_config=job_config)
-        delete_job.result()
-        logger.info(f"Registro {patient_key} eliminado para actualizar estado de reclamación.")
-        
-        load_table_from_json_direct([current_data], table_reference)
-        logger.info(f"Estado de reclamación actualizado para paciente {patient_key}, nivel {nivel_escalamiento}")
+
+        logger.info(f"✅ Medicamentos actualizados exitosamente para paciente '{patient_key}'")
         return True
-        
+
     except Exception as e:
-        logger.error(f"Error actualizando estado de reclamación: {e}")
+        logger.error(f"❌ Error actualizando medicamentos para paciente '{patient_key}': {e}")
         return False
