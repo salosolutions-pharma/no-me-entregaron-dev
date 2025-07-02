@@ -2,13 +2,19 @@ import os
 import logging
 import json
 from datetime import date
-from typing import Dict
+from typing import Dict, List, Any, Optional
 
 import requests
 from google.cloud import bigquery
 
 from llm_core import LLMCore
-from claim_manager.claim_generator import ClaimGenerator
+from claim_manager.claim_generator import (
+    ClaimGenerator,
+    generar_reclamacion_eps,
+    generar_reclamacion_supersalud,
+    generar_tutela,
+    generar_desacato
+)
 
 # Configuración de logging
 target = os.getenv('LOG_TARGET', 'stdout')
@@ -16,61 +22,56 @@ if target == 'stdout':
     logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class PatientModuleError(Exception):
-    pass
 
 class PatientModule:
-    """
-    Módulo encargado del seguimiento diario y del análisis de respuesta del paciente.
-    """
     def __init__(self):
         self.bq = bigquery.Client()
         self.project = os.getenv('PROJECT_ID')
         self.dataset = os.getenv('DATASET_ID')
         self.table = os.getenv('TABLE_ID')
         self.api_url = os.getenv('API_RECEPCIONISTA_URL')
-        self.llm_core = LLMCore()
-        self.claimgen = ClaimGenerator()
 
     def check_and_send_followups(self, today: date = None) -> None:
         """
-        Envia el primer mensaje de seguimiento a todos los pacientes con revisión pendiente.
+        Envía mensajes de seguimiento usando session_id.
+        El escalamiento automático se delega completamente al ClaimManager.
         """
         today = today or date.today()
         sql = f"""
-        SELECT pres.user_id AS user_id, rec.id_session AS session_id
+        SELECT 
+            t.paciente_clave,
+            pres.user_id AS user_id,
+            pres.id_session AS session_id  -- ✅ USAR id_session (campo correcto)
         FROM `{self.project}.{self.dataset}.{self.table}` AS t,
              UNNEST(t.prescripciones) AS pres,
              UNNEST(t.reclamaciones) AS rec
         WHERE rec.fecha_revision = '{today.isoformat()}'
           AND rec.estado_reclamacion != 'resuelto'
         """
-        logger.info(f"Buscando reclamaciones pendientes para {today}")
+        
         for row in self.bq.query(sql).result():
             user_id = row.user_id
-            session_id = row.session_id
+            patient_key = row.paciente_clave
+            session_id = row.session_id  # ✅ OBTENER SESSION_ID
+            
             try:
                 self.send_message(
-                    user_id, session_id,
+                    user_id, session_id,  # ✅ PASAR SESSION_ID EN LUGAR DE PATIENT_KEY
                     "Hola, ¿ya le entregaron los medicamentos relacionados con su solicitud?",
                     buttons=[
-                        {"label": "✅ Sí", "action": "followup_yes"},
-                        {"label": "❌ No", "action": "followup_no"},
+                        {"text": "✅ Sí", "callback_data": f"followup_yes_{session_id}"},   # ✅ USAR SESSION_ID
+                        {"text": "❌ No", "callback_data": f"followup_no_{session_id}"},    # ✅ USAR SESSION_ID
                     ]
                 )
-                logger.info(f"Mensaje inicial enviado a sesión {user_id}")
+                logger.info(f"Mensaje enviado a {user_id} para session {session_id} (paciente {patient_key})")
             except Exception as e:
-                logger.error(f"Error al enviar mensaje a {user_id}: {e}")
+                logger.error(f"Error enviando mensaje: {e}")
 
-
-    def send_message(self, user_id: str, session_id:str, text: str, buttons: list = None) -> None:
-        """
-        Envía un mensaje a través de la API recepcionista.
-        Si recibe la lista `buttons`, la incluye en el payload.
-        """
+    def send_message(self, user_id: str, session_id: str, text: str, buttons: list = None) -> None:
+        """Envía mensaje via API recepcionista."""
         payload = {
             "user_id": f"TL_{user_id}",
-            "session_id": f"{session_id}",
+            "session_id": session_id,  # ✅ USAR SESSION_ID REAL
             "message": text
         }
         if buttons:
@@ -78,17 +79,28 @@ class PatientModule:
 
         resp = requests.post(f"{self.api_url}/send_message", json=payload)
         if resp.status_code != 200:
-            logger.error(f"Error al enviar mensaje a {user_id}: {resp.text}")
+            logger.error(f"Error enviando mensaje: {resp.text}")
 
     def update_reclamation_status(self, session_id: str, new_status: str) -> bool:
-            
+        """
+        Actualiza estado de reclamación a resuelto usando session_id.
+        NUEVA VERSIÓN: Busca el patient_key internamente usando session_id.
+        """
         try:
-            table_ref = f"{self.project}.{self.dataset}.{self.table}"
+            # 1. BUSCAR PATIENT_KEY USANDO SESSION_ID
+            patient_key = self._get_patient_key_by_session_id(session_id)
+            if not patient_key:
+                logger.error(f"No se encontró patient_key para session_id: {session_id}")
+                return False
+            
+            logger.info(f"✅ Session {session_id} corresponde a patient_key: {patient_key}")
+            
+            # 2. ACTUALIZAR ESTADO USANDO PATIENT_KEY
             sql = f"""
-            UPDATE `{table_ref}` AS t
+            UPDATE `{self.project}.{self.dataset}.{self.table}` AS t
             SET reclamaciones = ARRAY(
                 SELECT
-                    IF(r.id_session = '{session_id}',
+                    IF(r.estado_reclamacion != 'resuelto',
                         STRUCT(
                             r.med_no_entregados,
                             r.tipo_accion,
@@ -105,53 +117,57 @@ class PatientModule:
                     )
                 FROM UNNEST(t.reclamaciones) AS r
             )
-            WHERE EXISTS (
-                SELECT 1 FROM UNNEST(t.reclamaciones) AS r
-                WHERE r.id_session = '{session_id}'
-            )
+            WHERE paciente_clave = '{patient_key}'
             """
             self.bq.query(sql).result()
-            logger.info(f"Actualizado estado de reclamación para {session_id} a {new_status}")
+            logger.info(f"✅ Estado actualizado a '{new_status}' para paciente {patient_key}")
             return True
+            
         except Exception as e:
-            logger.error(f"Error actualizando reclamación {session_id}: {e}")
-            return False    
+            logger.error(f"Error actualizando estado para session {session_id}: {e}")
+            return False
 
-    def _escalation_protocol(self, session_id: str) -> None:
+    def _get_patient_key_by_session_id(self, session_id: str) -> Optional[str]:
         """
-        Aplica el protocolo de escalamiento según categoría de riesgo y nivel.
+        NUEVA FUNCIÓN: Busca el patient_key usando el session_id
+        
+        Args:
+            session_id: ID de la sesión
+            
+        Returns:
+            patient_key si se encuentra, None si no existe
         """
-        data = self._get_patient_data(session_id)
-        riesgo = data['categoria_riesgo']
-        nivel = data['nivel_escalamiento']
-        if riesgo == 'simple':
-            self.claimgen.generar_reclamacion_supersalud(data)
-        elif riesgo == 'priorizado':
-            if nivel < 4:
-                self.claimgen.generar_reclamacion_supersalud(data)
-            else:
-                self.claimgen.generar_tutela(data)
-        else:
-            if nivel == 1:
-                self.claimgen.generar_reclamacion_supersalud(data)
-            else:
-                self.claimgen.generar_tutela(data)
-        self.send_message(session_id, "He iniciado el proceso de escalamiento según tu categoría de riesgo.")
-
-    def _get_patient_data(self, session_id: str) -> Dict:
-        """
-        Recupera categoría y nivel de escalamiento desde BigQuery.
-        """
-        table_ref = f"{self.project}.{self.dataset}.{self.table}"
-        sql = f"""
-        SELECT rec.categoria_riesgo, rec.nivel_escalamiento
-        FROM `{table_ref}` AS t,
-             UNNEST(t.prescripciones) AS pres,
-             UNNEST(t.reclamaciones) AS rec
-        WHERE pres.id_session = '{session_id}'
-        LIMIT 1
-        """
-        rows = list(self.bq.query(sql).result())
-        if not rows:
-            raise PatientModuleError(f"No existe paciente para sesión {session_id}")
-        return dict(rows[0])
+        try:
+            # Buscar en prescripciones
+            sql = f"""
+            SELECT 
+                paciente_clave
+            FROM `{self.project}.{self.dataset}.{self.table}` AS t,
+                 UNNEST(t.prescripciones) AS pres
+            WHERE pres.id_session = '{session_id}'
+            LIMIT 1
+            """
+            
+            results = self.bq.query(sql).result()
+            for row in results:
+                return row.paciente_clave
+            
+            # Si no se encuentra en prescripciones, buscar en reclamaciones
+            sql_reclamaciones = f"""
+            SELECT 
+                paciente_clave
+            FROM `{self.project}.{self.dataset}.{self.table}` AS t,
+                 UNNEST(t.reclamaciones) AS rec
+            WHERE rec.id_session = '{session_id}'
+            LIMIT 1
+            """
+            
+            results_rec = self.bq.query(sql_reclamaciones).result()
+            for row in results_rec:
+                return row.paciente_clave
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error buscando patient_key para session_id {session_id}: {e}")
+            return None

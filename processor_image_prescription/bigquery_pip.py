@@ -331,7 +331,78 @@ def update_reclamacion_by_level_safe(patient_key: str, nivel_escalamiento: int,
         logger.error(f"❌ Error actualizando reclamación: {e}")
         return False
 
+# FUNCIÓN FALTANTE PARA AGREGAR AL FINAL DE bigquery_pip.py
 
+def update_reclamacion_by_session_safe(patient_key: str, session_id: str, 
+                                      updates: Dict[str, Any]) -> bool:
+    """
+    Actualiza una reclamación específica por session_id de forma segura.
+    NUEVA FUNCIÓN para corregir el error en claim_generator.py
+    """
+    if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
+        raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
+
+    client = get_bigquery_client()
+    table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+
+    try:
+        update_query = f"""
+        UPDATE `{table_reference}`
+        SET reclamaciones = ARRAY(
+            SELECT AS STRUCT
+                rec.med_no_entregados,
+                rec.tipo_accion,
+                rec.texto_reclamacion,
+                CASE 
+                    WHEN rec.id_session = @session_id THEN
+                        COALESCE(@new_estado, rec.estado_reclamacion)
+                    ELSE rec.estado_reclamacion
+                END AS estado_reclamacion,
+                rec.nivel_escalamiento,
+                CASE 
+                    WHEN rec.id_session = @session_id THEN
+                        COALESCE(@new_url, rec.url_documento)
+                    ELSE rec.url_documento
+                END AS url_documento,
+                rec.numero_radicado,
+                rec.fecha_radicacion,
+                rec.fecha_revision,
+                rec.id_session
+            FROM UNNEST(reclamaciones) AS rec
+        )
+        WHERE paciente_clave = @patient_key
+        """
+
+        query_parameters = [
+            bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key),
+            bigquery.ScalarQueryParameter("session_id", "STRING", session_id),
+            bigquery.ScalarQueryParameter("new_estado", "STRING", updates.get('estado_reclamacion')),
+            bigquery.ScalarQueryParameter("new_url", "STRING", updates.get('url_documento'))
+        ]
+
+        job_config = bigquery.QueryJobConfig(query_parameters=query_parameters)
+
+        logger.info(f"🔄 Actualizando reclamación session_id {session_id} para paciente {patient_key}")
+        
+        query_job = client.query(update_query, job_config=job_config)
+        query_job.result()
+
+        if query_job.errors:
+            logger.error(f"Errores actualizando reclamación por session: {query_job.errors}")
+            return False
+
+        rows_affected = getattr(query_job, 'num_dml_affected_rows', 0)
+        if rows_affected == 0:
+            logger.warning(f"No se encontró paciente '{patient_key}' con session_id '{session_id}' para actualizar reclamación")
+            return False
+
+        logger.info(f"✅ Reclamación actualizada exitosamente por session_id")
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Error actualizando reclamación por session_id: {e}")
+        return False
+    
 def save_document_url_to_reclamacion(patient_key: str, nivel_escalamiento: int = None, session_id: str = None, 
                                     url_documento: str = "", tipo_documento: str = "") -> bool:
     """

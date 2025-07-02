@@ -84,9 +84,9 @@ async def send_message(req: Request):
         logger.info(f"Intentando enviar mensaje Telegram a chat_id: +{chat_id} y sesion {session_id}")
         try:
             if buttons:
-                # construye InlineKeyboardMarkup
+                # ✅ ARREGLO: usar "text" y "callback_data"
                 kb = [
-                    [InlineKeyboardButton(btn["label"], callback_data=f"{btn['action']}_{session_id}")]
+                    [InlineKeyboardButton(btn["text"], callback_data=btn["callback_data"])]
                     for btn in buttons
                 ]
                 reply_markup = InlineKeyboardMarkup(kb)

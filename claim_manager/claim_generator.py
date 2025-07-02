@@ -1016,3 +1016,584 @@ def validar_disponibilidad_desacato() -> Dict[str, Any]:
             "error": f"Error verificando disponibilidad: {e}",
             "solucion": "Revisar configuración y logs del sistema"
         }
+
+# AÑADIR AL FINAL DE claim_generator.py
+
+def auto_escalate_patient(session_id: str) -> Dict[str, Any]:
+    """
+    FUNCIÓN PRINCIPAL DE ESCALAMIENTO AUTOMÁTICO
+    
+    NUEVA VERSIÓN: Acepta session_id y busca el patient_key internamente
+    
+    Args:
+        session_id: ID de la sesión (ej: "TL_573226743144_20250702_091518")
+    
+    Returns:
+        Dict con resultado del escalamiento automático
+    """
+    try:
+        logger.info(f"🔄 Iniciando escalamiento automático para session_id: {session_id}")
+        
+        # 1. BUSCAR PATIENT_KEY USANDO SESSION_ID
+        patient_key = _obtener_patient_key_por_session_id(session_id)
+        if not patient_key:
+            return {"success": False, "error": "Paciente no encontrado para esta sesión"}
+        
+        logger.info(f"✅ Session {session_id} corresponde a patient_key: {patient_key}")
+        
+        # 2. OBTENER DATOS COMPLETOS DEL PACIENTE
+        datos_paciente = _obtener_datos_paciente_para_escalamiento(patient_key)
+        if not datos_paciente:
+            return {"success": False, "error": "Datos del paciente no encontrados"}
+        
+        # 3. DETERMINAR AUTOMÁTICAMENTE QUÉ ESCALAMIENTO HACER
+        decision_escalamiento = _determinar_siguiente_escalamiento_automatico(datos_paciente)
+        
+        logger.info(f"Decisión de escalamiento para {patient_key}: {decision_escalamiento}")
+        
+        # 4. EJECUTAR EL ESCALAMIENTO SEGÚN LA DECISIÓN
+        if decision_escalamiento["accion"] == "generar":
+            tipo = decision_escalamiento["tipo"]
+            resultado = _ejecutar_escalamiento_especifico(patient_key, tipo)
+            
+        elif decision_escalamiento["accion"] == "generar_multiple":
+            tipos = decision_escalamiento["tipos"]
+            resultado = _ejecutar_escalamiento_multiple(patient_key, tipos)
+            
+        elif decision_escalamiento["accion"] == "mantener":
+            return {
+                "success": True, 
+                "tipo": "sin_escalamiento",
+                "razon": decision_escalamiento["razon"]
+            }
+            
+        elif decision_escalamiento["accion"] == "error":
+            return {
+                "success": False,
+                "error": decision_escalamiento["razon"]
+            }
+            
+        else:
+            return {
+                "success": False,
+                "error": f"Acción no reconocida: {decision_escalamiento['accion']}"
+            }
+        
+        # 5. GUARDAR RESULTADO EN BIGQUERY SI FUE EXITOSO
+        if resultado.get("success"):
+            guardado = _guardar_escalamiento_en_bd(
+                patient_key, 
+                resultado, 
+                decision_escalamiento["nivel_escalamiento"],
+                session_id
+            )
+            
+            if guardado:
+                logger.info(f"✅ Escalamiento completo para {patient_key}: {resultado.get('tipo_reclamacion', resultado.get('tipo', 'desconocido'))}")
+                return {
+                    "success": True,
+                    "tipo": resultado.get('tipo_reclamacion', resultado.get('tipo', 'desconocido')),
+                    "nivel_escalamiento": decision_escalamiento["nivel_escalamiento"],
+                    "razon": decision_escalamiento["razon"],
+                    "patient_key": patient_key  # ✅ Incluir para logging
+                }
+            else:
+                return {"success": False, "error": "Error guardando escalamiento en BigQuery"}
+        
+        return resultado
+        
+    except Exception as e:
+        logger.error(f"Error en auto_escalate_patient para session_id {session_id}: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def _obtener_patient_key_por_session_id(session_id: str) -> Optional[str]:
+    """
+    NUEVA FUNCIÓN: Busca el patient_key usando el session_id
+    
+    Args:
+        session_id: ID de la sesión (ej: "TL_573226743144_20250702_091518")
+        
+    Returns:
+        patient_key si se encuentra, None si no existe
+    """
+    try:
+        client = get_bigquery_client()
+        
+        # Buscar en prescripciones que tengan ese session_id
+        sql = f"""
+        SELECT 
+            paciente_clave
+        FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}` AS t,
+             UNNEST(t.prescripciones) AS pres
+        WHERE pres.id_session = @session_id
+        LIMIT 1
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("session_id", "STRING", session_id)
+            ]
+        )
+        
+        results = client.query(sql, job_config=job_config).result()
+        
+        for row in results:
+            logger.info(f"🔍 Session {session_id} encontrado → patient_key: {row.paciente_clave}")
+            return row.paciente_clave
+        
+        # Si no se encuentra en prescripciones, buscar en reclamaciones
+        sql_reclamaciones = f"""
+        SELECT 
+            paciente_clave
+        FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}` AS t,
+             UNNEST(t.reclamaciones) AS rec
+        WHERE rec.id_session = @session_id
+        LIMIT 1
+        """
+        
+        results_rec = client.query(sql_reclamaciones, job_config=job_config).result()
+        
+        for row in results_rec:
+            logger.info(f"🔍 Session {session_id} encontrado en reclamaciones → patient_key: {row.paciente_clave}")
+            return row.paciente_clave
+        
+        logger.warning(f"❌ No se encontró patient_key para session_id: {session_id}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error buscando patient_key para session_id {session_id}: {e}")
+        return None
+    
+def _obtener_datos_paciente_para_escalamiento(patient_key: str) -> Optional[Dict]:
+    """
+    Obtiene TODOS los datos necesarios para determinar escalamiento.
+    Equivalente a obtener_datos_paciente_para_escalamiento del EscalamientoAutomatico.
+    """
+    try:
+        client = get_bigquery_client()
+        
+        sql = f"""
+        SELECT 
+            paciente_clave,
+            nombre_paciente,
+            tipo_documento,
+            numero_documento,
+            ciudad,
+            direccion,
+            telefono_contacto,
+            correo,
+            eps_estandarizada,
+            farmacia,
+            sede_farmacia,
+            
+            -- Datos de prescripción más reciente
+            (
+                SELECT presc.categoria_riesgo 
+                FROM UNNEST(prescripciones) AS presc 
+                ORDER BY presc.fecha_atencion DESC 
+                LIMIT 1
+            ) as categoria_riesgo,
+            
+            (
+                SELECT presc.diagnostico 
+                FROM UNNEST(prescripciones) AS presc 
+                ORDER BY presc.fecha_atencion DESC 
+                LIMIT 1
+            ) as diagnostico,
+            
+            -- Medicamentos no entregados de la última reclamación
+            (
+                SELECT rec.med_no_entregados 
+                FROM UNNEST(reclamaciones) AS rec 
+                ORDER BY rec.fecha_radicacion DESC 
+                LIMIT 1
+            ) as med_no_entregados,
+            
+            -- Todas las reclamaciones para análisis de escalamiento
+            reclamaciones
+            
+        FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
+        WHERE paciente_clave = @patient_key
+        LIMIT 1
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)
+            ]
+        )
+        
+        results = client.query(sql, job_config=job_config).result()
+        
+        for row in results:
+            return {
+                'paciente_clave': row.paciente_clave,
+                'nombre_paciente': row.nombre_paciente,
+                'tipo_documento': row.tipo_documento,
+                'numero_documento': row.numero_documento,
+                'ciudad': row.ciudad,
+                'direccion': row.direccion,
+                'telefono_contacto': _format_array_to_string(row.telefono_contacto),
+                'correo': _format_array_to_string(row.correo),
+                'eps_estandarizada': row.eps_estandarizada,
+                'farmacia': row.farmacia,
+                'sede_farmacia': row.sede_farmacia,
+                'categoria_riesgo': row.categoria_riesgo or 'simple',
+                'diagnostico': row.diagnostico or '',
+                'med_no_entregados': row.med_no_entregados or '',
+                'reclamaciones': list(row.reclamaciones) if row.reclamaciones else []
+            }
+        
+        logger.warning(f"No se encontraron datos para patient_key: {patient_key}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error obteniendo datos del paciente para escalamiento {patient_key}: {e}")
+        return None
+
+
+def _determinar_siguiente_escalamiento_automatico(datos_paciente: Dict) -> Dict[str, Any]:
+    """
+    LÓGICA PRINCIPAL DE ESCALAMIENTO AUTOMÁTICO
+    
+    Replica exactamente la lógica del EscalamientoAutomatico que ya funcionaba.
+    Determina automáticamente el siguiente escalamiento según categoría de riesgo y historial.
+    """
+    try:
+        categoria_riesgo = datos_paciente.get('categoria_riesgo', 'simple').lower()
+        reclamaciones = datos_paciente.get('reclamaciones', [])
+        
+        # Ordenar reclamaciones por nivel de escalamiento
+        reclamaciones_ordenadas = sorted(
+            reclamaciones, 
+            key=lambda x: x.get('nivel_escalamiento', 0)
+        )
+        
+        if not reclamaciones_ordenadas:
+            # Primer escalamiento - siempre empezar con EPS
+            return _generar_accion_inicial(categoria_riesgo)
+        
+        ultima_reclamacion = reclamaciones_ordenadas[-1]
+        nivel_actual = ultima_reclamacion.get('nivel_escalamiento', 1)
+        tipo_actual = ultima_reclamacion.get('tipo_accion', '')
+        estado_actual = ultima_reclamacion.get('estado_reclamacion', '')
+        
+        # Si está resuelto, no escalar
+        if estado_actual == 'resuelto':
+            return {"accion": "mantener", "razon": "Caso resuelto"}
+        
+        # Evaluar según categoría de riesgo usando la lógica original
+        if categoria_riesgo == "simple":
+            return _evaluar_escalamiento_simple(nivel_actual, tipo_actual)
+        elif categoria_riesgo == "priorizado":
+            return _evaluar_escalamiento_priorizado(nivel_actual, tipo_actual)
+        elif categoria_riesgo == "vital":
+            return _evaluar_escalamiento_vital(nivel_actual, tipo_actual)
+        
+        return {"accion": "error", "razon": "Categoría de riesgo no reconocida"}
+        
+    except Exception as e:
+        logger.error(f"Error determinando escalamiento automático: {e}")
+        return {"accion": "error", "razon": f"Error técnico: {str(e)}"}
+
+
+def _generar_accion_inicial(categoria_riesgo: str) -> Dict[str, Any]:
+    """Genera la primera acción según la categoría de riesgo."""
+    if categoria_riesgo == "vital":
+        plazo = 1  # 24 horas
+    else:  # simple y priorizado
+        plazo = 5  # 5 días
+        
+    return {
+        "accion": "generar",
+        "tipo": "reclamacion_eps", 
+        "nivel_escalamiento": 1,
+        "plazo_dias": plazo,
+        "razon": f"Escalamiento inicial EPS - {categoria_riesgo} (nivel 1)"
+    }
+
+
+def _evaluar_escalamiento_simple(nivel_actual: int, tipo_actual: str) -> Dict[str, Any]:
+    """
+    Escalamiento para riesgo SIMPLE:
+    Nivel 1: EPS (5 días) → Nivel 2: Supersalud (20 días) → Nivel 3+: EPS + Supersalud (cada 20 días)
+    """
+    if nivel_actual == 1 and tipo_actual == "reclamacion_eps":
+        return {
+            "accion": "generar",
+            "tipo": "reclamacion_supersalud",
+            "nivel_escalamiento": 2,
+            "plazo_dias": 20,
+            "razon": "Simple: EPS sin respuesta → Supersalud nivel 2"
+        }
+    
+    elif nivel_actual == 2 and tipo_actual == "reclamacion_supersalud":
+        return {
+            "accion": "generar_multiple",
+            "tipos": ["reclamacion_eps", "reclamacion_supersalud"],
+            "nivel_escalamiento": 3,
+            "plazo_dias": 20,
+            "razon": "Simple: Supersalud sin respuesta → EPS+Supersalud nivel 3"
+        }
+    
+    elif nivel_actual >= 3:
+        return {
+            "accion": "generar_multiple",
+            "tipos": ["reclamacion_eps", "reclamacion_supersalud"],
+            "nivel_escalamiento": nivel_actual + 1,
+            "plazo_dias": 20,
+            "razon": f"Simple: Insistencia EPS+Supersalud nivel {nivel_actual + 1}"
+        }
+    
+    return {"accion": "mantener", "razon": "Simple: Situación no contemplada"}
+
+
+def _evaluar_escalamiento_priorizado(nivel_actual: int, tipo_actual: str) -> Dict[str, Any]:
+    """
+    Escalamiento para riesgo PRIORIZADO:
+    Nivel 1: EPS → Nivel 2: Supersalud → Nivel 3: EPS+Supersalud → Nivel 4: Tutela → Nivel 5+: Desacato
+    """
+    if nivel_actual == 1 and tipo_actual == "reclamacion_eps":
+        return {
+            "accion": "generar",
+            "tipo": "reclamacion_supersalud",
+            "nivel_escalamiento": 2,
+            "plazo_dias": 20,
+            "razon": "Priorizado: EPS sin respuesta → Supersalud nivel 2"
+        }
+    
+    elif nivel_actual == 2 and tipo_actual == "reclamacion_supersalud":
+        return {
+            "accion": "generar_multiple",
+            "tipos": ["reclamacion_eps", "reclamacion_supersalud"],
+            "nivel_escalamiento": 3,
+            "plazo_dias": 20,
+            "razon": "Priorizado: Supersalud sin respuesta → EPS+Supersalud nivel 3"
+        }
+    
+    elif nivel_actual == 3:
+        return {
+            "accion": "generar",
+            "tipo": "tutela",
+            "nivel_escalamiento": 4,
+            "plazo_dias": 15,
+            "razon": "Priorizado: EPS+Supersalud sin respuesta → Tutela nivel 4"
+        }
+    
+    elif nivel_actual == 4 and tipo_actual == "tutela":
+        return {
+            "accion": "generar",
+            "tipo": "desacato",
+            "nivel_escalamiento": 5,
+            "plazo_dias": 10,
+            "razon": "Priorizado: Tutela incumplida → Desacato nivel 5"
+        }
+    
+    elif nivel_actual >= 5 and tipo_actual == "desacato":
+        return {
+            "accion": "generar",
+            "tipo": "desacato",
+            "nivel_escalamiento": nivel_actual + 1,
+            "plazo_dias": 10,
+            "razon": f"Priorizado: Desacato previo incumplido → Desacato nivel {nivel_actual + 1}"
+        }
+    
+    return {"accion": "mantener", "razon": "Priorizado: Situación no contemplada"}
+
+
+def _evaluar_escalamiento_vital(nivel_actual: int, tipo_actual: str) -> Dict[str, Any]:
+    """
+    Escalamiento para riesgo VITAL:
+    Nivel 1: EPS (24h) → Nivel 2: Supersalud (24h) → Nivel 3: Tutela → Nivel 4+: Desacato
+    """
+    if nivel_actual == 1 and tipo_actual == "reclamacion_eps":
+        return {
+            "accion": "generar",
+            "tipo": "reclamacion_supersalud",
+            "nivel_escalamiento": 2,
+            "plazo_dias": 1,
+            "razon": "Vital: EPS sin respuesta (24h) → Supersalud nivel 2"
+        }
+    
+    elif nivel_actual == 2 and tipo_actual == "reclamacion_supersalud":
+        return {
+            "accion": "generar",
+            "tipo": "tutela",
+            "nivel_escalamiento": 3,
+            "plazo_dias": 15,
+            "razon": "Vital: Supersalud sin respuesta (24h) → Tutela nivel 3"
+        }
+    
+    elif nivel_actual == 3 and tipo_actual == "tutela":
+        return {
+            "accion": "generar",
+            "tipo": "desacato",
+            "nivel_escalamiento": 4,
+            "plazo_dias": 5,
+            "razon": "Vital: Tutela incumplida → Desacato nivel 4"
+        }
+    
+    elif nivel_actual >= 4 and tipo_actual == "desacato":
+        return {
+            "accion": "generar",
+            "tipo": "desacato",
+            "nivel_escalamiento": nivel_actual + 1,
+            "plazo_dias": 5,
+            "razon": f"Vital: Desacato previo incumplido → Desacato nivel {nivel_actual + 1}"
+        }
+    
+    return {"accion": "mantener", "razon": "Vital: Situación no contemplada"}
+
+
+def _ejecutar_escalamiento_especifico(patient_key: str, tipo: str) -> Dict[str, Any]:
+    """Ejecuta un solo tipo de escalamiento usando las funciones existentes."""
+    try:
+        if tipo == "reclamacion_eps":
+            return generar_reclamacion_eps(patient_key)
+        elif tipo == "reclamacion_supersalud":
+            return generar_reclamacion_supersalud(patient_key)
+        elif tipo == "tutela":
+            return generar_tutela(patient_key)
+        elif tipo == "desacato":
+            return generar_desacato(patient_key)
+        else:
+            return {"success": False, "error": f"Tipo de escalamiento no reconocido: {tipo}"}
+        
+    except Exception as e:
+        logger.error(f"Error ejecutando escalamiento {tipo} para {patient_key}: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def _ejecutar_escalamiento_multiple(patient_key: str, tipos: List[str]) -> Dict[str, Any]:
+    """Ejecuta múltiples tipos de escalamiento."""
+    resultados = []
+    exitos = 0
+    
+    for tipo in tipos:
+        resultado = _ejecutar_escalamiento_especifico(patient_key, tipo)
+        resultados.append({
+            "tipo": tipo,
+            "resultado": resultado
+        })
+        
+        if resultado.get("success"):
+            exitos += 1
+    
+    # Retornar el formato esperado por el escalamiento múltiple
+    if exitos > 0:
+        tipos_exitosos = [r["tipo"] for r in resultados if r["resultado"].get("success")]
+        return {
+            "success": True,
+            "tipo": f"multiple_{'+'.join(tipos_exitosos)}",
+            "total_generados": exitos,
+            "total_intentados": len(tipos),
+            "resultados": resultados
+        }
+    else:
+        return {
+            "success": False,
+            "error": "Ningún escalamiento fue exitoso",
+            "resultados": resultados
+        }
+
+
+# claim_generator.py - dentro de la función _guardar_escalamiento_en_bd
+
+def _guardar_escalamiento_en_bd(patient_key: str, resultado: Dict, nivel_escalamiento: int, current_session_id: str) -> bool:
+    """
+    Guarda el resultado del escalamiento en BigQuery.
+    Maneja tanto escalamientos simples como múltiples.
+    """
+    try:
+        client = get_bigquery_client()
+
+        # Si es escalamiento múltiple, guardar cada resultado por separado
+        if resultado.get("tipo", "").startswith("multiple_") and "resultados" in resultado:
+            for item in resultado["resultados"]:
+                if item["resultado"].get("success"):
+                    _guardar_escalamiento_individual( # <--- Esta llamada estaba incompleta
+                        client, patient_key, item["resultado"], nivel_escalamiento, current_session_id
+                    ) # <--- ¡Aquí faltaba el paréntesis de cierre!
+            return True # <--- Esta línea debería estar correctamente indentada para el 'if' principal
+        else:
+            # Escalamiento simple
+            return _guardar_escalamiento_individual(client, patient_key, resultado, nivel_escalamiento,current_session_id)
+
+    except Exception as e:
+        logger.error(f"Error guardando escalamiento para {patient_key}: {e}", exc_info=True) # <-- Ya corregimos el paréntesis aquí
+        return False
+
+
+def _guardar_escalamiento_individual(client, patient_key: str, resultado: Dict, nivel: int, current_session_id) -> bool:
+    """Guarda un escalamiento individual en BigQuery."""
+    try:
+        # Escapar texto para SQL
+        texto_escaped = resultado["texto_reclamacion"].replace("'", "''")
+        
+        # Calcular próxima fecha de revisión según el tipo
+        tipo = resultado.get("tipo", resultado.get("tipo_reclamacion", ""))
+        
+        dias_revision = 5
+        if "supersalud" in tipo:
+            dias_revision = 20
+        elif "tutela" in tipo:
+            dias_revision = 15
+        elif "desacato" in tipo:
+            dias_revision = 10
+        
+        sql = f"""
+        UPDATE `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}` AS t
+        SET reclamaciones = ARRAY_CONCAT(
+            ARRAY( -- Reconstruye las reclamaciones existentes, actualizando la previa
+                SELECT AS STRUCT
+                    r.med_no_entregados,
+                    r.tipo_accion,
+                    r.texto_reclamacion,
+                    CASE
+                        -- Si es la reclamación EPS que se está escalando (usando el id_session de la conversación)
+                        -- y su estado no es 'resuelto' o 'escalado', la cambiamos a 'escalado'.
+                        WHEN r.tipo_accion = 'reclamacion_eps'
+                             AND r.id_session = '{current_session_id}' -- <--- Usa el id de la conversación actual
+                             AND r.estado_reclamacion NOT IN ('resuelto', 'escalado')
+                        THEN 'escalado'
+                        ELSE r.estado_reclamacion
+                    END AS estado_reclamacion,
+                    r.nivel_escalamiento,
+                    r.url_documento,
+                    r.numero_radicado,
+                    r.fecha_radicacion,
+                    r.fecha_revision,
+                    r.id_session
+                FROM UNNEST(t.reclamaciones) AS r
+            ),
+            [STRUCT( -- Añade la nueva reclamación de escalamiento
+                '{resultado.get("medicamentos_afectados", "")}' AS med_no_entregados,
+                '{tipo}' AS tipo_accion,
+                '''{texto_escaped}''' AS texto_reclamacion,
+                'pendiente_radicacion' AS estado_reclamacion, -- La nueva reclamación inicia pendiente
+                {nivel} AS nivel_escalamiento,
+                '' AS url_documento,
+                '' AS numero_radicado, -- El radicado de la nueva reclamación se asigna después si aplica
+                CURRENT_DATE() AS fecha_radicacion,
+                DATE_ADD(CURRENT_DATE(), INTERVAL {dias_revision} DAY) AS fecha_revision,
+                '{current_session_id}' AS id_session -- <--- USA EL ID DE LA CONVERSACIÓN ACTUAL
+            )]
+        )
+        WHERE paciente_clave = '{patient_key}'
+        """
+        
+        client.query(sql).result()
+        logger.info(f"Escalamiento {tipo} guardado para {patient_key} en nivel {nivel}. Reclamación previa actualizada. Session ID de la nueva reclamación: {current_session_id}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error guardando escalamiento individual: {e}", exc_info=True)
+        return False
+
+
+def _format_array_to_string(array_field) -> str:
+    """Convierte arrays de BigQuery a string para uso en prompts."""
+    if isinstance(array_field, list):
+        return ", ".join(str(item) for item in array_field if item)
+    return str(array_field) if array_field else ""
