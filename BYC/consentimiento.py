@@ -19,7 +19,6 @@ class ConsentManager:
     def _convert_to_telegram_format(self, text: str) -> str:
         """Convierte formato markdown estándar a formato Telegram."""
         import re
-        # **texto** → *texto*
         text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
         return text
 
@@ -74,6 +73,8 @@ Responde ahora como el asistente "No Me Entregaron":
     def _build_session_context(self, session_context: Dict[str, Any]) -> str:
         """Construye una descripción del contexto de la sesión actual para el LLM."""
         context_lines = []
+        canal = session_context.get("canal", "DESCONOCIDO")
+        context_lines.append(f"🌐 Canal de comunicación: {canal}") 
 
         if session_context.get("phone_shared"):
             context_lines.append("✅ El usuario YA compartió su número de teléfono")

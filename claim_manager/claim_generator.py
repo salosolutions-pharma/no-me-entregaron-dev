@@ -13,6 +13,14 @@ from processor_image_prescription.bigquery_pip import (
 )
 from google.cloud import bigquery
 
+REQUIRED_TUTELA_FIELDS = [
+    "numero_sentencia",
+    "fecha_sentencia", 
+    "fecha_radicacion_tutela",
+    "juzgado",
+    "ciudad"
+]
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,8 +59,8 @@ class ClaimGenerator:
         "numero_documento",
         "eps_estandarizada",
         "med_no_entregados",
-        #"diagnostico"
     ]
+
     
     CAMPOS_ADICIONALES_SUPERSALUD = ["ciudad", "direccion", "telefono_contacto", "correo"]
     CAMPOS_ADICIONALES_TUTELA = ["ciudad", "direccion"]
@@ -372,7 +380,8 @@ class ClaimGenerator:
 
     def validar_requisitos_desacato(self, patient_key: str) -> Dict[str, Any]:
         """
-        Valida si un paciente tiene tutela favorable para poder solicitar desacato.
+        Valida si un paciente tiene datos de tutela para poder solicitar desacato.
+        ✅ MODIFICADO: Ahora usa tabla tutelas simplificada.
         
         Args:
             patient_key: Clave del paciente
@@ -381,48 +390,26 @@ class ClaimGenerator:
             Dict con información sobre si puede solicitar desacato
         """
         try:
-            # Verificar que exista tutela favorable en la tabla tutelas
-            query = f"""
-            SELECT 
-                numero_tutela,
-                juzgado, 
-                fecha_sentencia,
-                contenido_fallo,
-                estado_tutela,
-                representante_legal_eps
-            FROM `{PROJECT_ID}.{DATASET_ID}.tutelas`
-            WHERE paciente_clave = @patient_key 
-              AND estado_tutela = 'favorable'
-            ORDER BY fecha_sentencia DESC
-            LIMIT 1
-            """
+            # ✅ USAR función simplificada para obtener datos
+            datos_tutela = _obtener_datos_tutela_para_desacato(patient_key)
             
-            job_config = bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)
-                ]
-            )
-            
-            results = self.bq_client.query(query, job_config=job_config).result()
-            
-            for row in results:
+            if datos_tutela and datos_tutela.get("numero_sentencia") and datos_tutela.get("juzgado"):
                 return {
                     "puede_desacatar": True,
-                    "numero_tutela": row.numero_tutela,
-                    "juzgado": row.juzgado,
-                    "fecha_sentencia": row.fecha_sentencia.strftime("%d/%m/%Y") if row.fecha_sentencia else "",
-                    "contenido_fallo": row.contenido_fallo,
-                    "representante_legal_eps": row.representante_legal_eps or "",
-                    "nivel_escalamiento": 4,
+                    "numero_sentencia": datos_tutela["numero_sentencia"],
+                    "juzgado": datos_tutela["juzgado"],
+                    "fecha_sentencia": datos_tutela["fecha_sentencia"],
+                    "ciudad": datos_tutela.get("ciudad", ""),
+                    "nivel_escalamiento": 5,
                     "patient_key": patient_key
                 }
             
-            # No se encontró tutela favorable
+            # ✅ NO tiene datos de tutela
             return {
                 "puede_desacatar": False,
-                "requisitos_faltantes": ["tutela_favorable"],
-                "mensaje": "Para solicitar desacato se requiere una tutela favorable previa que no se haya cumplido",
-                "nivel_escalamiento": 4
+                "requisitos_faltantes": ["datos_tutela"],
+                "mensaje": "Para solicitar desacato se requieren los datos de una tutela favorable previa",
+                "nivel_escalamiento": 5
             }
             
         except Exception as e:
@@ -440,6 +427,26 @@ class ClaimGenerator:
             
             # 1. Obtener datos del paciente
             datos_paciente = self.obtener_datos_paciente(patient_key)
+            
+            # 1.5. Determinar prompt según historial (NUEVO)
+            nivel_escalamiento = 1  # Por defecto
+            if gestiones_previas and isinstance(gestiones_previas, list) and len(gestiones_previas) > 0:
+                # Si hay gestiones previas, intentar extraer nivel
+                try:
+                    nivel_escalamiento = int(gestiones_previas[0]) if str(gestiones_previas[0]).isdigit() else 1
+                except:
+                    nivel_escalamiento = 1
+            
+            tipo_prompt = self._determinar_prompt_escalamiento(patient_key, tipo_documento, nivel_escalamiento)
+            logger.info(f"Usando prompt: {tipo_prompt} (base: {tipo_documento})")
+            
+            # 1.6. Agregar datos específicos según tipo de prompt (NUEVO)
+            if tipo_prompt.endswith("_escalado"):
+                datos_paciente["gestiones_previas"] = self._obtener_gestiones_previas_texto(patient_key)
+            
+            if tipo_prompt in ["desacato2", "desacato3"]:
+                datos_desacatos = self._obtener_datos_desacatos_previos_metodo(patient_key)
+                datos_paciente.update(datos_desacatos)
             
             # 2. Validar datos según tipo de documento
             if tipo_documento == "tutela":
@@ -466,8 +473,12 @@ class ClaimGenerator:
                     "tipo_documento": tipo_documento
                 }
             
-            # 3. Obtener y formatear prompt
-            prompt_template = prompt_manager.get_prompt_by_module_and_function("CLAIM", tipo_documento)
+            # 3. Obtener y formatear prompt (MODIFICADO para usar tipo_prompt)
+            prompt_template = prompt_manager.get_prompt_by_module_and_function("CLAIM", tipo_prompt)
+            if not prompt_template:
+                logger.warning(f"Prompt {tipo_prompt} no encontrado, usando base {tipo_documento}")
+                prompt_template = prompt_manager.get_prompt_by_module_and_function("CLAIM", tipo_documento)
+                
             if not prompt_template:
                 logger.error(f"Prompt CLAIM.{tipo_documento} no encontrado")
                 return {
@@ -493,10 +504,52 @@ class ClaimGenerator:
             logger.info(f"Enviando prompt a LLM para generar {tipo_documento}...")
             texto_generado = self.llm_core.ask_text(prompt_formateado)
             
-            # 5. Preparar respuesta exitosa
+            pdf_url = ""
+            pdf_filename = ""
+            pdf_result: Dict[str, Any] = {} # Initialize pdf_result here
+            
+            if tipo_documento in ["tutela", "desacato"]:
+                try:
+                    logger.info(f"🔄 Generando PDF para {tipo_documento}...")
+                    
+                    if tipo_documento == "tutela":
+                        from processor_image_prescription.pdf_generator import generar_pdf_tutela
+                        temp_resultado = {
+                            "success": True,
+                            "tipo_reclamacion": "tutela",
+                            "texto_reclamacion": texto_generado.strip(),
+                            "patient_key": patient_key
+                        }
+                        pdf_result = generar_pdf_tutela(temp_resultado)
+                        
+                    elif tipo_documento == "desacato":
+                        from processor_image_prescription.pdf_generator import generar_pdf_desacato
+                        temp_resultado = {
+                            "success": True,
+                            "tipo_reclamacion": "desacato", 
+                            "texto_reclamacion": texto_generado.strip(),
+                            "patient_key": patient_key,
+                            "numero_sentencia_referencia": datos_paciente.get("numero_sentencia", ""),
+                            "juzgado": datos_paciente.get("juzgado", "")
+                        }
+                        pdf_result = generar_pdf_desacato(temp_resultado)
+                    
+                    if pdf_result and pdf_result.get("success"):
+                        pdf_url = pdf_result["pdf_url"]
+                        pdf_filename = pdf_result["pdf_filename"]
+                        logger.info(f"✅ PDF generado automáticamente: {pdf_url}")
+                    else:
+                        error_msg = pdf_result.get("error") if pdf_result else "Unknown error"
+                        logger.error(f"❌ Error generando PDF: {error_msg}")
+                        
+                except Exception as pdf_error:
+                    logger.error(f"❌ Error en generación automática de PDF {tipo_documento}: {pdf_error}")
+            
+            # ✅ PREPARAR respuesta exitosa CON información del PDF
             resultado = {
                 "success": True,
                 "tipo_reclamacion": tipo_documento,
+                "prompt_usado": tipo_prompt,
                 "texto_reclamacion": texto_generado.strip(),
                 "datos_utilizados": datos_paciente,
                 "fecha_generacion": datetime.now().isoformat(),
@@ -505,6 +558,16 @@ class ClaimGenerator:
                 "plazo_respuesta": datos_paciente.get("plazo_respuesta", ""),
                 "medicamentos_afectados": datos_paciente.get("med_no_entregados", "")
             }
+            
+            # ✅ AGREGAR información del PDF si se generó
+            if pdf_url:
+                resultado["pdf_url"] = pdf_url
+                resultado["pdf_filename"] = pdf_filename
+                resultado["requiere_pdf"] = True
+                resultado["requiere_firma_paciente"] = True
+                logger.info(f"✅ Resultado incluye PDF: {pdf_url}")
+            else:
+                logger.warning(f"⚠️ Resultado SIN PDF para {tipo_documento}")
             
             # Agregar campos específicos según tipo
             if tipo_documento == "reclamacion_supersalud":
@@ -516,9 +579,9 @@ class ClaimGenerator:
             else:
                 resultado["entidad_destinataria"] = datos_paciente.get("eps_estandarizada", "")
             
+            
             logger.info(f"{tipo_documento} generada exitosamente para paciente {patient_key}")
             return resultado
-            
         except ClaimGeneratorError:
             raise
         except Exception as e:
@@ -602,10 +665,11 @@ class ClaimGenerator:
             }
 
     def generar_tutela(self, patient_key: str, 
-                      gestiones_previas: Optional[List[str]] = None) -> Dict[str, Any]:
+                  gestiones_previas: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         Genera una acción de tutela por vulneración del derecho a la salud.
         REQUIERE reclamaciones EPS y opcionalmente Supersalud previas con radicado.
+        ✅ MODIFICADO: Genera PDF automáticamente.
         """
         try:
             logger.info(f"Iniciando generación de tutela para paciente: {patient_key}")
@@ -676,6 +740,21 @@ class ClaimGenerator:
                 resultado["requiere_pdf"] = True
                 resultado["requiere_firma_paciente"] = True
                 
+                # ✅ AGREGAR: Generar PDF automáticamente para tutela
+                try:
+                    from processor_image_prescription.pdf_generator import generar_pdf_tutela
+                    pdf_result = generar_pdf_tutela(resultado)
+                    
+                    if pdf_result.get("success"):
+                        resultado["pdf_url"] = pdf_result["pdf_url"]
+                        resultado["pdf_filename"] = pdf_result["pdf_filename"]
+                        logger.info(f"✅ PDF de tutela generado exitosamente: {pdf_result['pdf_url']}")
+                    else:
+                        logger.error(f"❌ Error generando PDF de tutela: {pdf_result.get('error')}")
+                        
+                except Exception as e:
+                    logger.error(f"Error en generación automática de PDF tutela: {e}")
+                
             return resultado
             
         except Exception as e:
@@ -691,27 +770,40 @@ class ClaimGenerator:
     def generar_desacato(self, patient_key: str, datos_tutela_adicionales: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """
         Genera un incidente de desacato por incumplimiento de tutela.
-        REQUIERE tutela favorable previa registrada en la tabla tutelas.
+        ✅ MODIFICADO: Valida TODOS los campos antes de generar.
         """
         try:
             logger.info(f"Iniciando generación de desacato para paciente: {patient_key}")
+            logger.info(f"Datos tutela adicionales recibidos: {datos_tutela_adicionales}")
+
+            # 1. ✅ VALIDAR DATOS COMPLETOS ANTES DE CONTINUAR
+            logger.info(f"🔍 Validando datos de tutela completos...")
+            validacion = validar_datos_tutela_completos(patient_key)
+            logger.info(f"Resultado validación: {validacion}")
             
-            # 1. Verificar requisitos de desacato
-            validacion = self.validar_requisitos_desacato(patient_key)
-            
-            if not validacion.get("puede_desacatar"):
+            if not validacion["completo"]:
+                logger.warning(f"❌ Datos de tutela incompletos: {validacion['campos_faltantes']}")
+
                 return {
                     "success": False,
-                    "error": validacion.get("mensaje", "No se cumplen los requisitos para desacato"),
-                    "requisitos_faltantes": validacion.get("requisitos_faltantes", []),
+                    "error": "Datos de tutela incompletos para generar desacato",
+                    "requiere_recoleccion_tutela": True,
+                    "campos_faltantes": validacion["campos_faltantes"],
                     "patient_key": patient_key,
                     "tipo_documento": "desacato",
-                    "nivel_escalamiento": 4
+                    "nivel_escalamiento": 5
                 }
-            
-            # 2. Obtener datos del paciente
+            logger.info(f"✅ Datos de tutela completos, continuando...")
+            # 2. Usar datos validados
+            datos_tutela_adicionales = validacion["datos_existentes"]
+            logger.info(f"Datos tutela a usar: {datos_tutela_adicionales}")
+
+            logger.info(f"🔍 Obteniendo datos del paciente...")
             datos_paciente = self.obtener_datos_paciente(patient_key)
+            logger.info(f"✅ Datos paciente obtenidos")
+
             campos_faltantes = self.validar_datos_tutela(datos_paciente)
+            logger.info(f"Campos faltantes paciente: {campos_faltantes}")
             
             if campos_faltantes:
                 return {
@@ -720,31 +812,27 @@ class ClaimGenerator:
                     "campos_faltantes": campos_faltantes,
                     "patient_key": patient_key,
                     "tipo_documento": "desacato",
-                    "nivel_escalamiento": 4
+                    "nivel_escalamiento": 5
                 }
             
-            # 3. Combinar datos del paciente con datos de la tutela
+            # 3. Combinar datos del paciente con datos de tutela simplificados
             datos_completos = {**datos_paciente}
             datos_completos.update({
-                "numero_tutela": validacion["numero_tutela"],
-                "juzgado": validacion["juzgado"],
-                "fecha_sentencia": validacion["fecha_sentencia"],
-                "contenido_fallo": validacion["contenido_fallo"]
+                "numero_sentencia": datos_tutela_adicionales["numero_sentencia"],      # ✅ NUEVO
+                "juzgado": datos_tutela_adicionales["juzgado"], 
+                "fecha_sentencia": datos_tutela_adicionales["fecha_sentencia"],
+                "fecha_radicacion_tutela": datos_tutela_adicionales["fecha_radicacion_tutela"],  # ✅ NUEVO
+                "ciudad_tutela": datos_tutela_adicionales.get("ciudad", datos_paciente.get("ciudad", "")),
             })
             
-            # Agregar datos adicionales si se proporcionan (como representante legal)
-            if datos_tutela_adicionales:
-                datos_completos.update(datos_tutela_adicionales)
-            
-            # Representante legal EPS por defecto si no se proporciona
-            if not datos_completos.get("representante_legal_eps"):
-                if validacion.get("representante_legal_eps"):
-                    datos_completos["representante_legal_eps"] = validacion["representante_legal_eps"]
-                else:
-                    datos_completos["representante_legal_eps"] = f"Representante Legal de {datos_paciente.get('eps_estandarizada', 'EPS')}"
+            # Representante legal se construye automáticamente
+            datos_completos["representante_legal_eps"] = f"Representante Legal de {datos_paciente.get('eps_estandarizada', 'EPS')}"
             
             # 4. Obtener y formatear prompt
+            logger.info(f"🔍 Obteniendo prompt de desacato...")
             prompt_template = prompt_manager.get_prompt_by_module_and_function("CLAIM", "desacato")
+            logger.info(f"Prompt template obtenido: {prompt_template is not None}")
+
             if not prompt_template:
                 logger.error("Prompt CLAIM.desacato no encontrado")
                 return {
@@ -752,8 +840,10 @@ class ClaimGenerator:
                     "error": "Prompt CLAIM.desacato no disponible en el sistema",
                     "patient_key": patient_key,
                     "tipo_documento": "desacato",
-                    "nivel_escalamiento": 4
+                    "nivel_escalamiento": 5
                 }
+            logger.info(f"🔍 Formateando prompt con datos completos...")
+            logger.info(f"Datos completos para prompt: {list(datos_completos.keys())}")
             
             try:
                 prompt_formateado = prompt_template.format(**datos_completos)
@@ -765,7 +855,7 @@ class ClaimGenerator:
                     "error": f"Error en template del prompt: falta variable {e}",
                     "patient_key": patient_key,
                     "tipo_documento": "desacato",
-                    "nivel_escalamiento": 4
+                    "nivel_escalamiento": 5
                 }
             
             # 5. Generar texto con LLM
@@ -780,13 +870,27 @@ class ClaimGenerator:
                 "datos_utilizados": datos_completos,
                 "fecha_generacion": datetime.now().isoformat(),
                 "patient_key": patient_key,
-                "nivel_escalamiento": 4,
-                "numero_tutela_referencia": validacion["numero_tutela"],
-                "juzgado": validacion["juzgado"],
+                "nivel_escalamiento": 5,
+                "numero_sentencia_referencia": datos_tutela_adicionales["numero_sentencia"],
+                "juzgado": datos_tutela_adicionales["juzgado"],
                 "requiere_pdf": True,
                 "requiere_firma_paciente": True,
-                "entidad_destinataria": validacion["juzgado"]
+                "entidad_destinataria": datos_tutela_adicionales["juzgado"]
             }
+            
+            try:
+                from processor_image_prescription.pdf_generator import generar_pdf_desacato
+                pdf_result = generar_pdf_desacato(resultado)
+                
+                if pdf_result.get("success"):
+                    resultado["pdf_url"] = pdf_result["pdf_url"]
+                    resultado["pdf_filename"] = pdf_result["pdf_filename"]
+                    logger.info(f"✅ PDF de desacato generado exitosamente: {pdf_result['pdf_url']}")
+                else:
+                    logger.error(f"❌ Error generando PDF de desacato: {pdf_result.get('error')}")
+                    
+            except Exception as e:
+                logger.error(f"Error en generación automática de PDF desacato: {e}")
             
             logger.info(f"Desacato generado exitosamente para paciente {patient_key}")
             return resultado
@@ -798,9 +902,132 @@ class ClaimGenerator:
                 "error": f"Error inesperado: {str(e)}",
                 "tipo_reclamacion": "desacato",
                 "patient_key": patient_key,
-                "nivel_escalamiento": 4
+                "nivel_escalamiento": 5
             }
-
+        
+    def _determinar_prompt_escalamiento(self, patient_key: str, tipo_base: str, 
+                                  nivel: int) -> str:
+        """
+        Determina prompt según historial: base o escalado.
+        
+        Args:
+            patient_key: Clave del paciente
+            tipo_base: Tipo base (reclamacion_eps, reclamacion_supersalud, desacato)
+            nivel: Nivel actual
+            
+        Returns:
+            Nombre del prompt a usar
+        """
+        try:
+            query = f"""
+            SELECT reclamaciones
+            FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
+            WHERE paciente_clave = @patient_key
+            """
+            
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)
+                ]
+            )
+            
+            results = self.bq_client.query(query, job_config=job_config).result()
+            
+            for row in results:
+                reclamaciones = row.reclamaciones if row.reclamaciones else []
+                
+                if tipo_base == "reclamacion_eps":
+                    count = len([r for r in reclamaciones 
+                            if r.get("tipo_accion") == "reclamacion_eps" 
+                            and r.get("nivel_escalamiento", 0) < nivel])
+                    return "reclamacion_eps_escalado" if count > 0 else "reclamacion_eps"
+                    
+                elif tipo_base == "reclamacion_supersalud":
+                    count = len([r for r in reclamaciones 
+                            if r.get("tipo_accion") == "reclamacion_supersalud" 
+                            and r.get("nivel_escalamiento", 0) < nivel])
+                    return "reclamacion_supersalud_escalado" if count > 0 else "reclamacion_supersalud"
+                    
+                elif tipo_base == "desacato":
+                    desacatos = [r for r in reclamaciones if r.get("tipo_accion") == "desacato"]
+                    count = len(desacatos)
+                    
+                    if count == 0:
+                        return "desacato"
+                    elif count == 1:
+                        return "desacato2"
+                    else:
+                        return "desacato3"
+            
+            return tipo_base
+            
+        except Exception as e:
+            logger.error(f"Error determinando prompt escalamiento: {e}")
+            return tipo_base
+        
+    def _obtener_gestiones_previas_texto(self, patient_key: str) -> str:
+        """Obtiene texto de gestiones previas para prompts escalados."""
+        try:
+            radicados_eps = self._obtener_radicados_previos(patient_key, ["reclamacion_eps"])
+            radicados_supersalud = self._obtener_radicados_previos(patient_key, ["reclamacion_supersalud"])
+            
+            gestiones = []
+            
+            for radicado in radicados_eps:
+                fecha = radicado.get("fecha_radicacion", "")
+                numero = radicado.get("numero_radicado", "")
+                gestiones.append(f"Reclamación ante EPS radicada el {fecha} (No. {numero}) sin respuesta satisfactoria")
+            
+            for radicado in radicados_supersalud:
+                fecha = radicado.get("fecha_radicacion", "")
+                numero = radicado.get("numero_radicado", "")
+                gestiones.append(f"Queja ante Superintendencia radicada el {fecha} (No. {numero}) sin resolución")
+            
+            return ". ".join(gestiones) if gestiones else "Gestiones previas realizadas sin éxito"
+            
+        except Exception as e:
+            logger.error(f"Error obteniendo gestiones previas: {e}")
+            return "Múltiples gestiones previas realizadas sin respuesta satisfactoria"    
+        
+    def _obtener_datos_desacatos_previos_metodo(self, patient_key: str) -> Dict[str, str]:
+        """Obtiene fechas/números de desacatos previos para desacato2 y desacato3."""
+        try:
+            query = f"""
+            SELECT reclamaciones
+            FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
+            WHERE paciente_clave = @patient_key
+            """
+            
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)
+                ]
+            )
+            
+            results = self.bq_client.query(query, job_config=job_config).result()
+            
+            for row in results:
+                reclamaciones = row.reclamaciones if row.reclamaciones else []
+                desacatos = [r for r in reclamaciones if r.get("tipo_accion") == "desacato"]
+                desacatos.sort(key=lambda x: x.get("fecha_radicacion", ""))
+                
+                datos = {}
+                if len(desacatos) >= 1:
+                    datos["primer_desacato_fecha"] = desacatos[0].get("fecha_radicacion", "")
+                    datos["primer_desacato_numero"] = desacatos[0].get("numero_radicado", "")
+                    
+                if len(desacatos) >= 2:
+                    datos["segundo_desacato_fecha"] = desacatos[1].get("fecha_radicacion", "")
+                    datos["segundo_desacato_numero"] = desacatos[1].get("numero_radicado", "")
+                    
+                return datos
+            
+            return {}
+            
+        except Exception as e:
+            logger.error(f"Error obteniendo datos desacatos previos: {e}")
+            return {}
+            
     def obtener_preview_datos(self, patient_key: str, 
                              tipo_documento: str = "reclamacion_eps") -> Dict[str, Any]:
         """Obtiene un preview de los datos que se usarían para generar el documento."""
@@ -858,6 +1085,40 @@ if claim_generator:
 
 
 # Funciones de conveniencia para uso externo
+def verificar_requisitos_desacato_completos(patient_key: str) -> Dict[str, Any]:
+    """
+    Función de conveniencia para verificar si se puede generar desacato.
+    
+    Args:
+        patient_key: Clave del paciente
+        
+    Returns:
+        Dict con información completa sobre requisitos
+    """
+    if not claim_generator:
+        return {
+            "puede_generar": False,
+            "error": "ClaimGenerator no disponible"
+        }
+    
+    try:
+        validacion = validar_datos_tutela_completos(patient_key)
+        
+        return {
+            "puede_generar": validacion["completo"],
+            "campos_faltantes": validacion.get("campos_faltantes", []),
+            "datos_existentes": validacion.get("datos_existentes", {}),
+            "mensaje": validacion["mensaje"],
+            "patient_key": patient_key
+        }
+        
+    except Exception as e:
+        return {
+            "puede_generar": False,
+            "error": str(e),
+            "patient_key": patient_key
+        }
+    
 def generar_reclamacion_eps(patient_key: str) -> Dict[str, Any]:
     """Función de conveniencia para generar reclamación EPS."""
     if not claim_generator:
@@ -1017,8 +1278,6 @@ def validar_disponibilidad_desacato() -> Dict[str, Any]:
             "solucion": "Revisar configuración y logs del sistema"
         }
 
-# AÑADIR AL FINAL DE claim_generator.py
-
 def auto_escalate_patient(session_id: str) -> Dict[str, Any]:
     """
     FUNCIÓN PRINCIPAL DE ESCALAMIENTO AUTOMÁTICO
@@ -1051,9 +1310,32 @@ def auto_escalate_patient(session_id: str) -> Dict[str, Any]:
         
         logger.info(f"Decisión de escalamiento para {patient_key}: {decision_escalamiento}")
         
-        # 4. EJECUTAR EL ESCALAMIENTO SEGÚN LA DECISIÓN
         if decision_escalamiento["accion"] == "generar":
             tipo = decision_escalamiento["tipo"]
+            
+            # ✅ NUEVO: Verificar datos para desacato antes de generar
+            if tipo == "desacato":
+                datos_tutela_existentes = _obtener_datos_tutela_para_desacato(patient_key)
+
+                faltantes = []
+                if not datos_tutela_existentes:
+                    faltantes = REQUIRED_TUTELA_FIELDS
+                else:
+                    faltantes = [campo for campo in REQUIRED_TUTELA_FIELDS 
+                               if not datos_tutela_existentes.get(campo)]
+                
+                if faltantes:
+                    # ✅ Faltan datos de tutela → Solicitar recolección
+                    return {
+                        "success": False,
+                        "requiere_recoleccion_tutela": True,
+                        "tipo": "desacato",
+                        "patient_key": patient_key,
+                        "session_id": session_id,
+                        "campos_necesarios": faltantes
+                    }
+            
+            # ✅ Si no es desacato O tiene todos los datos → Continuar normal
             resultado = _ejecutar_escalamiento_especifico(patient_key, tipo)
             
         elif decision_escalamiento["accion"] == "generar_multiple":
@@ -1447,7 +1729,10 @@ def _evaluar_escalamiento_vital(nivel_actual: int, tipo_actual: str) -> Dict[str
 
 
 def _ejecutar_escalamiento_especifico(patient_key: str, tipo: str) -> Dict[str, Any]:
-    """Ejecuta un solo tipo de escalamiento usando las funciones existentes."""
+    """
+    Ejecuta un solo tipo de escalamiento usando las funciones existentes.
+    ✅ MODIFICADO: Verifica datos de tutela antes de generar desacato.
+    """
     try:
         if tipo == "reclamacion_eps":
             return generar_reclamacion_eps(patient_key)
@@ -1456,7 +1741,18 @@ def _ejecutar_escalamiento_especifico(patient_key: str, tipo: str) -> Dict[str, 
         elif tipo == "tutela":
             return generar_tutela(patient_key)
         elif tipo == "desacato":
-            return generar_desacato(patient_key)
+            # ✅ MEJORAR: Verificar datos completos antes de generar desacato
+            validacion = validar_datos_tutela_completos(patient_key)
+            
+            if not validacion["completo"]:
+                return {
+                    "success": False,
+                    "error": "Datos de tutela incompletos para generar desacato",
+                    "requiere_recoleccion_tutela": True,
+                    "campos_faltantes": validacion["campos_faltantes"]
+                }
+            
+            return generar_desacato(patient_key, validacion["datos_existentes"])
         else:
             return {"success": False, "error": f"Tipo de escalamiento no reconocido: {tipo}"}
         
@@ -1496,10 +1792,44 @@ def _ejecutar_escalamiento_multiple(patient_key: str, tipos: List[str]) -> Dict[
             "error": "Ningún escalamiento fue exitoso",
             "resultados": resultados
         }
-
-
-# claim_generator.py - dentro de la función _guardar_escalamiento_en_bd
-
+    
+def _verificar_datos_completos_desacato(patient_key: str) -> Dict[str, Any]:
+    """
+    Verifica si el paciente tiene todos los datos necesarios para desacato.
+    ✅ MODIFICADO: Usa tabla tutelas simplificada.
+    """
+    try:
+        # ✅ VERIFICACIÓN SIMPLIFICADA usando nueva función
+        datos_tutela = _obtener_datos_tutela_para_desacato(patient_key)
+        
+        if not datos_tutela:
+            return {
+                "datos_completos": False,
+                "campos_faltantes": ["numero_sentencia", "fecha_sentencia", "juzgado", "ciudad"],
+                "error": "No se encontraron datos de tutela para desacato"
+            }
+        
+        # ✅ Verificar que tenga los campos esenciales
+        campos_requeridos = ["numero_sentencia", "juzgado", "fecha_sentencia"]
+        campos_faltantes = []
+        
+        for campo in campos_requeridos:
+            if not datos_tutela.get(campo):
+                campos_faltantes.append(campo)
+        
+        return {
+            "datos_completos": len(campos_faltantes) == 0,
+            "campos_faltantes": campos_faltantes,
+            "tutela_data": datos_tutela
+        }
+        
+    except Exception as e:
+        logger.error(f"Error verificando datos para desacato: {e}")
+        return {
+            "datos_completos": False,
+            "error": f"Error técnico: {str(e)}"
+        }
+    
 def _guardar_escalamiento_en_bd(patient_key: str, resultado: Dict, nivel_escalamiento: int, current_session_id: str) -> bool:
     """
     Guarda el resultado del escalamiento en BigQuery.
@@ -1512,22 +1842,32 @@ def _guardar_escalamiento_en_bd(patient_key: str, resultado: Dict, nivel_escalam
         if resultado.get("tipo", "").startswith("multiple_") and "resultados" in resultado:
             for item in resultado["resultados"]:
                 if item["resultado"].get("success"):
-                    _guardar_escalamiento_individual( # <--- Esta llamada estaba incompleta
+                    _guardar_escalamiento_individual( 
                         client, patient_key, item["resultado"], nivel_escalamiento, current_session_id
-                    ) # <--- ¡Aquí faltaba el paréntesis de cierre!
-            return True # <--- Esta línea debería estar correctamente indentada para el 'if' principal
+                    ) 
+            return True 
         else:
             # Escalamiento simple
             return _guardar_escalamiento_individual(client, patient_key, resultado, nivel_escalamiento,current_session_id)
 
     except Exception as e:
-        logger.error(f"Error guardando escalamiento para {patient_key}: {e}", exc_info=True) # <-- Ya corregimos el paréntesis aquí
+        logger.error(f"Error guardando escalamiento para {patient_key}: {e}", exc_info=True) 
         return False
 
 
 def _guardar_escalamiento_individual(client, patient_key: str, resultado: Dict, nivel: int, current_session_id) -> bool:
-    """Guarda un escalamiento individual en BigQuery."""
+    """
+    Guarda un escalamiento individual en BigQuery.
+    ✅ MODIFICADO: Incluye URL del PDF automáticamente.
+    """
     try:
+
+        pdf_url = resultado.get("pdf_url", "")
+        if pdf_url:
+            logger.info(f"📎 Guardando escalamiento con PDF: {pdf_url}")
+        else:
+            logger.warning(f"⚠️ Escalamiento sin PDF para tipo: {resultado.get('tipo', 'unknown')}")
+
         # Escapar texto para SQL
         texto_escaped = resultado["texto_reclamacion"].replace("'", "''")
         
@@ -1542,23 +1882,36 @@ def _guardar_escalamiento_individual(client, patient_key: str, resultado: Dict, 
         elif "desacato" in tipo:
             dias_revision = 10
         
+        estado_update_logic = f"""
+            CASE
+                -- Cuando se genera desacato (nivel 5), marcar tutela (nivel 4) como escalada
+                WHEN {nivel} = 5 AND r.tipo_accion = 'tutela' AND r.nivel_escalamiento = 4
+                     AND r.estado_reclamacion NOT IN ('resuelto', 'escalado')
+                THEN 'escalado'
+                
+                -- Cuando se genera tutela (nivel 4), marcar supersalud/eps previas como escaladas
+                WHEN {nivel} = 4 AND r.nivel_escalamiento < 4
+                     AND r.estado_reclamacion NOT IN ('resuelto', 'escalado')
+                THEN 'escalado'
+                
+                -- Lógica general: niveles menores no resueltos pasan a escalados
+                WHEN r.nivel_escalamiento < {nivel} 
+                     AND r.estado_reclamacion NOT IN ('resuelto', 'escalado')
+                THEN 'escalado'
+                
+                ELSE r.estado_reclamacion
+            END
+        """
+
         sql = f"""
         UPDATE `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}` AS t
         SET reclamaciones = ARRAY_CONCAT(
-            ARRAY( -- Reconstruye las reclamaciones existentes, actualizando la previa
+            ARRAY(
                 SELECT AS STRUCT
                     r.med_no_entregados,
                     r.tipo_accion,
                     r.texto_reclamacion,
-                    CASE
-                        -- Si es la reclamación EPS que se está escalando (usando el id_session de la conversación)
-                        -- y su estado no es 'resuelto' o 'escalado', la cambiamos a 'escalado'.
-                        WHEN r.tipo_accion = 'reclamacion_eps'
-                             AND r.id_session = '{current_session_id}' -- <--- Usa el id de la conversación actual
-                             AND r.estado_reclamacion NOT IN ('resuelto', 'escalado')
-                        THEN 'escalado'
-                        ELSE r.estado_reclamacion
-                    END AS estado_reclamacion,
+                    {estado_update_logic} AS estado_reclamacion,
                     r.nivel_escalamiento,
                     r.url_documento,
                     r.numero_radicado,
@@ -1567,33 +1920,126 @@ def _guardar_escalamiento_individual(client, patient_key: str, resultado: Dict, 
                     r.id_session
                 FROM UNNEST(t.reclamaciones) AS r
             ),
-            [STRUCT( -- Añade la nueva reclamación de escalamiento
+            [STRUCT(
                 '{resultado.get("medicamentos_afectados", "")}' AS med_no_entregados,
                 '{tipo}' AS tipo_accion,
                 '''{texto_escaped}''' AS texto_reclamacion,
-                'pendiente_radicacion' AS estado_reclamacion, -- La nueva reclamación inicia pendiente
+                'pendiente_radicacion' AS estado_reclamacion,
                 {nivel} AS nivel_escalamiento,
-                '' AS url_documento,
-                '' AS numero_radicado, -- El radicado de la nueva reclamación se asigna después si aplica
+                '{pdf_url}' AS url_documento,  -- ✅ INCLUIR PDF URL
+                '' AS numero_radicado,
                 CURRENT_DATE() AS fecha_radicacion,
                 DATE_ADD(CURRENT_DATE(), INTERVAL {dias_revision} DAY) AS fecha_revision,
-                '{current_session_id}' AS id_session -- <--- USA EL ID DE LA CONVERSACIÓN ACTUAL
+                '{current_session_id}' AS id_session
             )]
         )
         WHERE paciente_clave = '{patient_key}'
         """
         
         client.query(sql).result()
-        logger.info(f"Escalamiento {tipo} guardado para {patient_key} en nivel {nivel}. Reclamación previa actualizada. Session ID de la nueva reclamación: {current_session_id}")
+        logger.info(f"✅ Escalamiento {tipo} guardado para {patient_key} en nivel {nivel} con PDF: {pdf_url}")
         return True
 
     except Exception as e:
-        logger.error(f"Error guardando escalamiento individual: {e}", exc_info=True)
+        logger.error(f"❌ Error guardando escalamiento individual: {e}")
         return False
 
-
+    
 def _format_array_to_string(array_field) -> str:
     """Convierte arrays de BigQuery a string para uso en prompts."""
     if isinstance(array_field, list):
         return ", ".join(str(item) for item in array_field if item)
     return str(array_field) if array_field else ""
+
+def _obtener_datos_tutela_para_desacato(patient_key: str) -> Optional[Dict[str, Any]]:
+    """
+    Obtiene datos de tutela desde la tabla tutelas simplificada para generar desacato.
+    
+    Args:
+        patient_key: Clave del paciente
+        
+    Returns:
+        Dict con datos de tutela si existen, None si no hay datos
+    """
+    try:
+        client = get_bigquery_client()
+        
+        # Consultar tabla tutelas simplificada
+        query = f"""
+        SELECT 
+            numero_sentencia,
+            fecha_sentencia,
+            fecha_radicacion_tutela,
+            juzgado,
+            ciudad
+        FROM `{PROJECT_ID}.{DATASET_ID}.tutelas`
+        WHERE paciente_clave = @patient_key
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)
+            ]
+        )
+        
+        results = client.query(query, job_config=job_config).result()
+        
+        for row in results:
+            return {
+                "numero_sentencia": row.numero_sentencia or "", 
+                "fecha_sentencia": row.fecha_sentencia.strftime("%d/%m/%Y") if row.fecha_sentencia else "",
+                "fecha_radicacion_tutela": row.fecha_radicacion_tutela.strftime("%d/%m/%Y") if row.fecha_radicacion_tutela else "",
+                "juzgado": row.juzgado or "",
+                "ciudad": row.ciudad or ""
+            }
+        
+        logger.info(f"No se encontraron datos de tutela para desacato: {patient_key}")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error obteniendo datos de tutela para desacato {patient_key}: {e}")
+        return None
+
+def validar_datos_tutela_completos(patient_key: str) -> Dict[str, Any]:
+    """
+    Valida que todos los campos de tutela estén completos para desacato.
+    
+    Args:
+        patient_key: Clave del paciente
+        
+    Returns:
+        Dict con información sobre campos faltantes
+    """
+    try:
+        
+        datos_tutela = _obtener_datos_tutela_para_desacato(patient_key)
+        
+        if not datos_tutela:
+            return {
+                "completo": False,
+                "campos_faltantes": REQUIRED_TUTELA_FIELDS,
+                "mensaje": "No se encontraron datos de tutela. Es necesario recopilar todos los campos."
+            }
+        
+        campos_faltantes = []
+        for campo in REQUIRED_TUTELA_FIELDS:
+            valor = datos_tutela.get(campo)
+            if not valor or (isinstance(valor, str) and not valor.strip()):
+                campos_faltantes.append(campo)
+        
+        return {
+            "completo": len(campos_faltantes) == 0,
+            "campos_faltantes": campos_faltantes,
+            "datos_existentes": datos_tutela,
+            "mensaje": f"Faltan {len(campos_faltantes)} campos por completar" if campos_faltantes else "Todos los datos están completos"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error validando datos de tutela: {e}")
+        return {
+            "completo": False,
+            "error": str(e),
+            "campos_faltantes": REQUIRED_TUTELA_FIELDS
+        }

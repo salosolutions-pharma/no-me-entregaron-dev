@@ -42,6 +42,18 @@ class PDFGenerator:
         
         logger.info(f"PDFGenerator inicializado con bucket: {self.bucket_name}")
 
+        try:
+            from .cloud_storage_pip import get_cloud_storage_client
+            client = get_cloud_storage_client()
+            bucket_id = self.bucket_name.replace("gs://", "").split("/", maxsplit=1)[0]
+            bucket = client.bucket(bucket_id)
+            if bucket.exists():
+                logger.info(f"✅ Bucket {bucket_id} verificado exitosamente")
+            else:
+                logger.error(f"❌ Bucket {bucket_id} no existe o no es accesible")
+        except Exception as e:
+            logger.error(f"❌ Error verificando bucket: {e}")
+
     def _create_pdf_styles(self):
         """Crea los estilos para el documento PDF."""
         styles = getSampleStyleSheet()
@@ -225,10 +237,10 @@ class PDFGenerator:
                 styles = self._create_pdf_styles()
                 
                 # Título
-                numero_tutela = claim_data.get("numero_tutela_referencia", "")
+                numero_sentencia = claim_data.get("numero_sentencia_referencia", "")
                 title_text = f"INCIDENTE DE DESACATO"
-                if numero_tutela:
-                    title_text += f"\nACCIÓN DE TUTELA No. {numero_tutela}"
+                if numero_sentencia:
+                    title_text += f"\nACCIÓN DE TUTELA No. {numero_sentencia}"
                 
                 title = Paragraph(title_text, styles['title'])
                 story.append(title)
@@ -272,7 +284,7 @@ class PDFGenerator:
                         "pdf_filename": pdf_filename,
                         "document_type": "desacato",
                         "patient_key": patient_key,
-                        "numero_tutela_referencia": claim_data.get("numero_tutela_referencia", ""),
+                        "numero_sentencia_referencia": claim_data.get("numero_sentencia_referencia", ""),
                         "juzgado": claim_data.get("juzgado", ""),
                         "generated_at": datetime.now(COLOMBIA_TZ).isoformat(),
                         "file_size_bytes": temp_path.stat().st_size

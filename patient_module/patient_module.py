@@ -2,8 +2,9 @@ import os
 import logging
 import json
 from datetime import date
+from datetime import datetime
 from typing import Dict, List, Any, Optional
-
+import pytz
 import requests
 from google.cloud import bigquery
 
@@ -36,27 +37,31 @@ class PatientModule:
         Envía mensajes de seguimiento usando session_id.
         El escalamiento automático se delega completamente al ClaimManager.
         """
-        today = today or date.today()
+        tz_colombia = pytz.timezone('America/Bogota')
+        today = datetime.now(tz_colombia).date()
+        logger.info(f"🔍 Buscando reclamaciones pendientes para {today.isoformat()}")
+
         sql = f"""
         SELECT 
             t.paciente_clave,
             pres.user_id AS user_id,
-            pres.id_session AS session_id  -- ✅ USAR id_session (campo correcto)
+            pres.id_session AS session_id  --
         FROM `{self.project}.{self.dataset}.{self.table}` AS t,
              UNNEST(t.prescripciones) AS pres,
              UNNEST(t.reclamaciones) AS rec
         WHERE rec.fecha_revision = '{today.isoformat()}'
           AND rec.estado_reclamacion != 'resuelto'
         """
-        
+        logger.info(f"📝 SQL ejecutado: {sql}")
+
         for row in self.bq.query(sql).result():
             user_id = row.user_id
             patient_key = row.paciente_clave
-            session_id = row.session_id  # ✅ OBTENER SESSION_ID
+            session_id = row.session_id 
             
             try:
                 self.send_message(
-                    user_id, session_id,  # ✅ PASAR SESSION_ID EN LUGAR DE PATIENT_KEY
+                    user_id, session_id, 
                     "Hola, ¿ya le entregaron los medicamentos relacionados con su solicitud?",
                     buttons=[
                         {"text": "✅ Sí", "callback_data": f"followup_yes_{session_id}"},   # ✅ USAR SESSION_ID
@@ -83,44 +88,63 @@ class PatientModule:
 
     def update_reclamation_status(self, session_id: str, new_status: str) -> bool:
         """
-        Actualiza estado de reclamación a resuelto usando session_id.
-        NUEVA VERSIÓN: Busca el patient_key internamente usando session_id.
+        Actualiza estado de reclamación usando session_id.
+        Si es resuelto, TODAS las reclamaciones van a resuelto.
         """
         try:
-            # 1. BUSCAR PATIENT_KEY USANDO SESSION_ID
             patient_key = self._get_patient_key_by_session_id(session_id)
             if not patient_key:
                 logger.error(f"No se encontró patient_key para session_id: {session_id}")
                 return False
             
-            logger.info(f"✅ Session {session_id} corresponde a patient_key: {patient_key}")
+            logger.info(f"Session {session_id} corresponde a patient_key: {patient_key}")
             
-            # 2. ACTUALIZAR ESTADO USANDO PATIENT_KEY
-            sql = f"""
-            UPDATE `{self.project}.{self.dataset}.{self.table}` AS t
-            SET reclamaciones = ARRAY(
-                SELECT
-                    IF(r.estado_reclamacion != 'resuelto',
-                        STRUCT(
-                            r.med_no_entregados,
-                            r.tipo_accion,
-                            r.texto_reclamacion,
-                            '{new_status}' AS estado_reclamacion,
-                            r.nivel_escalamiento,
-                            r.url_documento,
-                            r.numero_radicado,
-                            r.fecha_radicacion,
-                            r.fecha_revision,
-                            r.id_session
-                        ),
-                        r
-                    )
-                FROM UNNEST(t.reclamaciones) AS r
-            )
-            WHERE paciente_clave = '{patient_key}'
-            """
+            if new_status == "resuelto":
+                # TODAS las reclamaciones a resuelto
+                sql = f"""
+                UPDATE `{self.project}.{self.dataset}.{self.table}` AS t
+                SET reclamaciones = ARRAY(
+                    SELECT AS STRUCT
+                        r.med_no_entregados,
+                        r.tipo_accion,
+                        r.texto_reclamacion,
+                        'resuelto' AS estado_reclamacion,
+                        r.nivel_escalamiento,
+                        r.url_documento,
+                        r.numero_radicado,
+                        r.fecha_radicacion,
+                        r.fecha_revision,
+                        r.id_session
+                    FROM UNNEST(t.reclamaciones) AS r
+                )
+                WHERE paciente_clave = '{patient_key}'
+                """
+            else:
+                # Solo las de la sesión específica
+                sql = f"""
+                UPDATE `{self.project}.{self.dataset}.{self.table}` AS t
+                SET reclamaciones = ARRAY(
+                    SELECT AS STRUCT
+                        r.med_no_entregados,
+                        r.tipo_accion,
+                        r.texto_reclamacion,
+                        CASE 
+                            WHEN r.id_session = '{session_id}' THEN '{new_status}'
+                            ELSE r.estado_reclamacion
+                        END AS estado_reclamacion,
+                        r.nivel_escalamiento,
+                        r.url_documento,
+                        r.numero_radicado,
+                        r.fecha_radicacion,
+                        r.fecha_revision,
+                        r.id_session
+                    FROM UNNEST(t.reclamaciones) AS r
+                )
+                WHERE paciente_clave = '{patient_key}'
+                """
+            
             self.bq.query(sql).result()
-            logger.info(f"✅ Estado actualizado a '{new_status}' para paciente {patient_key}")
+            logger.info(f"Estado actualizado a '{new_status}' para paciente {patient_key}")
             return True
             
         except Exception as e:

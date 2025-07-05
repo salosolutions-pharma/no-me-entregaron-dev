@@ -234,7 +234,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             handled = await handle_field_response(update, context)
             if handled:
                 return
-            
+
+        if context.user_data.get("waiting_for_tutela_field"):
+            handled = await handle_tutela_field_response(update, context)
+            if handled:
+                return
+                
         if consent_manager:
             response = consent_manager.get_bot_response(user_message, session_context)
             keyboard = None
@@ -297,6 +302,7 @@ async def process_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data["session_id"] = new_session_id
         context.user_data["phone"] = phone
         context.user_data["phone_shared"] = True
+        context.user_data["canal"] = "TELEGRAM"
         context.user_data["detected_channel"] = "TL"
         context.user_data["telegram_user_id"] = telegram_user_id  # 🟢 GUARDAR para uso posterior
 
@@ -357,29 +363,86 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 
                 if success:
                     await query.edit_message_text(
-                        "✅ **¡Excelente!**\n\n"
-                        "Tu caso ha sido marcado como resuelto.\n"
-                        "¡Gracias por confiar en nosotros! 🎉"
+                        text=format_telegram_text(
+                            "✅ *¡Excelente!*\n\n"
+                            "Tu caso ha sido marcado como resuelto.\n"
+                            "¡Gracias por confiar en nosotros! 🎉"
+                        ),
+                        parse_mode=ParseMode.MARKDOWN
                     )
                 else:
                     await query.edit_message_text(
-                        "⚠️ Hubo un error actualizando tu caso.\n"
-                        "Nuestro equipo lo revisará manualmente."
+                        text=format_telegram_text(
+                            "⚠️ Hubo un error actualizando tu caso.\n"
+                            "Nuestro equipo lo revisará manualmente."
+                        ),
+                        parse_mode=ParseMode.MARKDOWN
                     )
             except Exception as e:
                 logger.error(f"Error actualizando reclamación para session {session_id}: {e}")
-                await query.edit_message_text("❌ Error técnico. Por favor inténtalo más tarde.")
+                await query.edit_message_text(
+                    text=format_telegram_text("❌ Error técnico. Por favor inténtalo más tarde."),
+                    parse_mode=ParseMode.MARKDOWN
+                )
         
         else:  # followup_no_
             session_id = data[len("followup_no_"):]
             logger.info(f"❌ Paciente NO recibió medicamentos para session: {session_id}")
             
-            await query.edit_message_text("🔄 **Procesando escalamiento automático...**\n\nEvaluando el mejor siguiente paso para tu caso.")
+            await query.edit_message_text(
+                text=format_telegram_text("🔄 *Procesando escalamiento automático...*\n\nEvaluando el mejor siguiente paso para tu caso."),
+                parse_mode=ParseMode.MARKDOWN
+            )
             
             try:
                 # ✅ DELEGAR TODO AL CLAIM MANAGER con session_id
                 from claim_manager.claim_generator import auto_escalate_patient
-                resultado = auto_escalate_patient(session_id)  # ✅ PASAR SESSION_ID
+                resultado = auto_escalate_patient(session_id)
+                
+                # ✅ NUEVO: Verificar si requiere recolección de datos de tutela
+                if resultado.get("requiere_recoleccion_tutela") and resultado.get("tipo") == "desacato":
+                    patient_key = resultado["patient_key"]
+                    
+                    # Verificar si ya tiene datos de tutela
+                    datos_existentes = claim_manager.get_existing_tutela_data(patient_key)
+                    
+                    if datos_existentes:
+                        # Ya tiene datos, usar para generar desacato
+                        from claim_manager.claim_generator import generar_desacato
+                        resultado_desacato = generar_desacato(patient_key, datos_existentes)
+                        
+                        if resultado_desacato.get("success"):
+                            await query.edit_message_text(
+                                text=format_telegram_text(
+                                    "✅ *Desacato generado exitosamente*\n\n"
+                                    f"Nivel de escalamiento: *5*\n\n"
+                                    "Tu incidente de desacato ha sido preparado automáticamente usando los datos de tu tutela previa."
+                                ),
+                                parse_mode=ParseMode.MARKDOWN
+                            )
+                        else:
+                            await query.edit_message_text(
+                                text=format_telegram_text("❌ Error generando desacato automáticamente."),
+                                parse_mode=ParseMode.MARKDOWN
+                            )
+                    else:
+                        # No tiene datos, iniciar recolección
+                        field_prompt = claim_manager.get_next_missing_tutela_field_prompt(patient_key, {})
+                        
+                        await query.edit_message_text(
+                            text=format_telegram_text(
+                                "🔄 *Para proceder con el desacato necesito datos de tu tutela:*\n\n"
+                                f"{field_prompt['prompt_text']}"
+                            ),
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                        
+                        # Guardar estado en context
+                        context.user_data["waiting_for_tutela_field"] = field_prompt["field_name"]
+                        context.user_data["patient_key"] = patient_key
+                        context.user_data["tutela_data_temp"] = {}
+                    
+                    return
                 
                 if resultado.get("success"):
                     tipo = resultado.get("tipo", "escalamiento")
@@ -391,46 +454,60 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     
                     if tipo == "sin_escalamiento":
                         await query.edit_message_text(
-                            "📋 **Caso en revisión**\n\n"
-                            "Tu caso está siendo revisado por nuestro equipo especializado.\n"
-                            "Te contactaremos pronto con actualizaciones."
+                            text=format_telegram_text(
+                                "📋 *Caso en revisión*\n\n"
+                                "Tu caso está siendo revisado por nuestro equipo especializado.\n"
+                                "Te contactaremos pronto con actualizaciones."
+                            ),
+                            parse_mode=ParseMode.MARKDOWN
                         )
                     elif tipo.startswith("multiple_"):
                         # Escalamiento múltiple (EPS + Supersalud)
                         tipos_generados = tipo.replace("multiple_", "").replace("_", " y ").replace("reclamacion", "reclamación")
                         await query.edit_message_text(
-                            f"✅ **Escalamiento múltiple exitoso**\n\n"
-                            f"Se han generado: **{tipos_generados}**\n"
-                            f"Nivel de escalamiento: **{nivel}**\n\n"
-                            f"📋 *Motivo:* {razon}\n\n"
-                            f"Nuestro equipo procesará ambas reclamaciones y te mantendremos informado."
+                            text=format_telegram_text(
+                                f"✅ *Escalamiento múltiple exitoso*\n\n"
+                                f"Se han generado: *{tipos_generados}*\n"
+                                f"Nivel de escalamiento: *{nivel}*\n\n"
+                                f"📋 *Motivo:* {razon}\n\n"
+                                f"Nuestro equipo procesará ambas reclamaciones y te mantendremos informado."
+                            ),
+                            parse_mode=ParseMode.MARKDOWN
                         )
                     else:
                         # Escalamiento simple
                         tipo_legible = tipo.replace("_", " ").replace("reclamacion", "reclamación").title()
                         await query.edit_message_text(
-                            f"✅ **{tipo_legible} generada exitosamente**\n\n"
-                            f"Nivel de escalamiento: **{nivel}**\n\n"
-                            f"📋 *Motivo:* {razon}\n\n"
-                            f"Tu caso ha sido escalado automáticamente. Nuestro equipo procesará tu solicitud y te mantendremos informado del progreso."
+                            text=format_telegram_text(
+                                f"✅ *{tipo_legible} generada exitosamente*\n\n"
+                                f"Nivel de escalamiento: *{nivel}*\n\n"
+                                f"📋 *Motivo:* {razon}\n\n"
+                                f"Tu caso ha sido escalado automáticamente. Nuestro equipo procesará tu solicitud y te mantendremos informado del progreso."
+                            ),
+                            parse_mode=ParseMode.MARKDOWN
                         )
                 else:
                     error = resultado.get("error", "Error desconocido")
                     logger.error(f"Error en escalamiento automático para session {session_id}: {error}")
                     await query.edit_message_text(
-                        "⚠️ **Error en escalamiento automático**\n\n"
-                        "Hubo un problema procesando tu caso automáticamente.\n"
-                        "Nuestro equipo revisará tu solicitud manualmente y te contactará pronto."
+                        text=format_telegram_text(
+                            "⚠️ *Error en escalamiento automático*\n\n"
+                            "Hubo un problema procesando tu caso automáticamente.\n"
+                            "Nuestro equipo revisará tu solicitud manualmente y te contactará pronto."
+                        ),
+                        parse_mode=ParseMode.MARKDOWN
                     )
                     
             except Exception as e:
                 logger.error(f"Error ejecutando escalamiento automático para session {session_id}: {e}")
                 await query.edit_message_text(
-                    "❌ **Error técnico**\n\n"
-                    "Ocurrió un problema técnico procesando tu escalamiento.\n"
-                    "Por favor contacta a nuestro equipo de soporte."
+                    text=format_telegram_text(
+                        "❌ *Error técnico*\n\n"
+                        "Ocurrió un problema técnico procesando tu escalamiento.\n"
+                        "Por favor contacta a nuestro equipo de soporte."
+                    ),
+                    parse_mode=ParseMode.MARKDOWN
                 )
-        
         return
 
     # Extraer session_id según el tipo de callback para otros callbacks
@@ -440,7 +517,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         logger.info(f"Callback de consentimiento - session_id del contexto: {session_id}")
         
         if not session_id:
-            await query.edit_message_text("Error: No se encontró una sesión activa. Por favor, reinicia la conversación.")
+            await query.edit_message_text(
+                text=format_telegram_text("Error: No se encontró una sesión activa. Por favor, reinicia la conversación."),
+                parse_mode=ParseMode.MARKDOWN
+            )
             return
             
         await handle_consent_response(query, context, session_id, data == "consent_yes")
@@ -462,7 +542,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     
     else:
         # Para otros tipos de callback que no reconocemos
-        await query.edit_message_text("Acción no reconocida. Por favor, intenta de nuevo.")
+        await query.edit_message_text(
+            text=format_telegram_text("Acción no reconocida. Por favor, intenta de nuevo."),
+            parse_mode=ParseMode.MARKDOWN
+        )
         logger.warning(f"Callback no reconocido: {data}")
         return
 
@@ -474,7 +557,10 @@ async def handle_consent_response(query, context: ContextTypes.DEFAULT_TYPE,
     phone = context.user_data.get("phone")
 
     if not consent_manager or not phone:
-        await query.edit_message_text("Error de sistema al procesar consentimiento. Inténtalo de nuevo.")
+        await query.edit_message_text(
+            text=format_telegram_text("Error de sistema al procesar consentimiento. Inténtalo de nuevo."),
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
     consent_status = "autorizado" if granted else "no autorizado"
@@ -498,7 +584,10 @@ async def handle_consent_response(query, context: ContextTypes.DEFAULT_TYPE,
             parse_mode=ParseMode.MARKDOWN
         )
     else:
-        await query.edit_message_text("Hubo un problema al guardar tu consentimiento.")
+        await query.edit_message_text(
+            text=format_telegram_text("Hubo un problema al guardar tu consentimiento."),
+            parse_mode=ParseMode.MARKDOWN
+        )
 
 
 async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -582,7 +671,11 @@ async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def safe_edit_message(query, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
     """Edita un mensaje de forma segura, evitando errores de Telegram si el mensaje ya fue modificado."""
     try:
-        await query.edit_message_text(text, reply_markup=reply_markup)
+        await query.edit_message_text(
+            text=format_telegram_text(text), 
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
     except Exception as e:
         logger.warning(f"No se pudo editar mensaje de callback: {e}. Intentando enviar uno nuevo.")
         try:
@@ -966,7 +1059,9 @@ async def handle_field_response(update: Update, context: ContextTypes.DEFAULT_TY
     current_field = context.user_data.get("waiting_for_field")
     patient_key = context.user_data.get("patient_key")
     user_response = update.message.text.strip() if update.message.text else ""
-
+    
+    if context.user_data.get("waiting_for_tutela_field"):
+        return False
     if not current_field or not patient_key or not claim_manager:
         return False
 
@@ -1026,7 +1121,137 @@ async def handle_field_response(update: Update, context: ContextTypes.DEFAULT_TY
         await send_and_log_message(chat_id, "Ocurrió un error procesando tu respuesta. Por favor, inténtalo de nuevo.", context)
         return True
 
+async def handle_tutela_field_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Maneja las respuestas de campos de tutela para generar desacato.
+    
+    Args:
+        update: Update de Telegram
+        context: Context de Telegram
+        
+    Returns:
+        bool: True si manejó la respuesta, False si no
+    """
+    chat_id = update.effective_chat.id
+    field_name = context.user_data.get("waiting_for_tutela_field")
+    patient_key = context.user_data.get("patient_key")
+    tutela_data = context.user_data.get("tutela_data_temp", {})
+    user_response = update.message.text.strip()
+    
+    logger.info(f"Procesando respuesta de campo tutela '{field_name}': {user_response[:50]}...")
+    
+    try:
+        # Normalizar según el tipo de campo
+        if field_name in ["fecha_sentencia", "fecha_radicacion_tutela"]:
+            # Usar el normalizador de fechas existente
+            normalized_value = claim_manager._normalize_date(user_response)
+            if not normalized_value:
+                await send_and_log_message(
+                    chat_id,
+                    "❌ Formato de fecha inválido. Por favor usa el formato DD/MM/AAAA\n\n"
+                    "Ejemplo: 28/05/2025",
+                    context
+                )
+                return True
+            tutela_data[field_name] = normalized_value
+        else:
 
+            # Campos de texto normales
+            tutela_data[field_name] = user_response
+        
+        # Verificar si faltan más campos
+        field_prompt = claim_manager.get_next_missing_tutela_field_prompt(patient_key, tutela_data)
+        
+        if field_prompt.get("field_name"):
+            # Aún faltan campos
+            await send_and_log_message(chat_id, field_prompt["prompt_text"], context)
+            context.user_data["waiting_for_tutela_field"] = field_prompt["field_name"]
+            context.user_data["tutela_data_temp"] = tutela_data
+            
+        else:
+            # ✅ Todos los campos completos
+            context.user_data.pop("waiting_for_tutela_field", None)
+            context.user_data.pop("tutela_data_temp", None)
+            
+            await send_and_log_message(
+                chat_id,
+                "✅ Datos de tutela recopilados correctamente.\n\n🔄 Generando incidente de desacato...",
+                context
+            )
+            
+            # 1. Guardar datos de tutela
+            success = claim_manager.save_tutela_data_simple(patient_key, tutela_data)
+            
+            if success:
+                # 2. Generar desacato
+                try:
+                    from claim_manager.claim_generator import generar_desacato
+                    resultado_desacato = generar_desacato(patient_key, tutela_data)
+                    
+                    if resultado_desacato.get("success"):
+                        # 3. Guardar reclamación de desacato
+                        guardado = await save_reclamacion_to_database(
+                            patient_key=patient_key,
+                            tipo_accion="desacato",
+                            texto_reclamacion=resultado_desacato["texto_reclamacion"],
+                            estado_reclamacion="pendiente_radicacion",
+                            nivel_escalamiento=5,
+                            session_id=context.user_data.get("session_id", ""),
+                            resultado_claim_generator=resultado_desacato
+                        )
+                        
+                        if guardado:
+                            await send_and_log_message(
+                                chat_id,
+                                "✅ *Desacato generado exitosamente*\n\n"
+                                "Nivel de escalamiento: *5*\n\n"
+                                "📋 Tu incidente de desacato ha sido preparado con los datos de tu tutela.\n\n"
+                                "Nuestro equipo procesará tu solicitud y te mantendremos informado del progreso.",
+                                context
+                            )
+                        else:
+                            await send_and_log_message(
+                                chat_id,
+                                "⚠️ Desacato generado pero hubo un problema guardándolo en el sistema.\n\n"
+                                "📞 Nuestro equipo revisará tu caso manualmente.",
+                                context
+                            )
+                    else:
+                        error_msg = resultado_desacato.get("error", "Error desconocido")
+                        await send_and_log_message(
+                            chat_id,
+                            f"❌ Error generando desacato: {error_msg}\n\n"
+                            "📞 Nuestro equipo revisará tu caso.",
+                            context
+                        )
+                        
+                except Exception as e:
+                    logger.error(f"Error generando desacato para {patient_key}: {e}")
+                    await send_and_log_message(
+                        chat_id,
+                        "❌ Error técnico generando desacato.\n\n"
+                        "📞 Nuestro equipo revisará tu caso manualmente.",
+                        context
+                    )
+            else:
+                await send_and_log_message(
+                    chat_id,
+                    "❌ Error guardando datos de tutela.\n\n"
+                    "Por favor intenta más tarde o contacta a nuestro equipo.",
+                    context
+                )
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error procesando respuesta de campo tutela '{field_name}': {e}")
+        await send_and_log_message(
+            chat_id,
+            "❌ Error procesando tu respuesta. Por favor intenta de nuevo.",
+            context
+        )
+        return True
+    
 def setup_handlers(application: Application) -> None:
     """Configura los manejadores de mensajes y callbacks."""
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -1047,11 +1272,20 @@ def setup_job_queue(application: Application) -> None:
 def format_telegram_text(text: str) -> str:
     """Convierte formato markdown a formato Telegram correcto"""
     import re
+    
+    # ✅ CORREGIR: Telegram usa *texto* para negritas, no **texto**
     text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
+    
+    # ✅ AGREGAR: También manejar negritas simples mal formateadas
+    text = re.sub(r'(?<!\*)\*([^*]+)\*(?!\*)', r'*\1*', text)
+    
+    # ✅ Escapar caracteres especiales de Telegram
     text = text.replace('_', r'\_')
     text = text.replace('[', r'\[')
     text = text.replace(']', r'\]')
-
+    text = text.replace('(', r'\(')
+    text = text.replace(')', r'\)')
+    
     return text
 
 

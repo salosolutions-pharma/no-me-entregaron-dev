@@ -45,15 +45,6 @@ class ClaimManager:
         "informante",
     ]
 
-    # ✨ NUEVO: Campos específicos para desacato
-    REQUIRED_FIELDS_DESACATO = [
-        "numero_tutela",
-        "juzgado", 
-        "fecha_sentencia",
-        "contenido_fallo",
-        "representante_legal_eps"
-    ]
-
     FIELD_DISPLAY_NAMES = {
         "tipo_documento": "tipo de documento",
         "numero_documento": "número de documento",
@@ -69,16 +60,7 @@ class ClaimManager:
         "farmacia": "farmacia donde recoges medicamentos",
         "sede_farmacia": "sede o punto de entrega específico",
         "informante": "información sobre quién está haciendo esta solicitud",
-    }
-
-    # ✨ NUEVO: Nombres de campos para desacato
-    FIELD_DISPLAY_NAMES_DESACATO = {
-        "numero_tutela": "número de la acción de tutela",
-        "juzgado": "nombre completo del juzgado que concedió la tutela", 
-        "fecha_sentencia": "fecha de la sentencia de tutela",
-        "contenido_fallo": "contenido específico de lo que ordenó el juez",
-        "representante_legal_eps": "nombre del representante legal de la EPS"
-    }
+    } 
 
     PHARMACY_STANDARDIZATION_MAP = {
         "no sé": "Según indicación de EPS",
@@ -240,10 +222,12 @@ class ClaimManager:
                 "prompt_text": "😓 Ocurrió un error. Por favor, inténtalo nuevamente.",
             }
 
-    # ✨ NUEVA FUNCIÓN: Para recolectar datos específicos de desacato
-    def get_next_missing_field_prompt_desacato(self, patient_key: str, datos_tutela_actuales: Dict[str, Any] = None) -> Dict[str, Optional[str]]:
+
+    def get_next_missing_tutela_field_prompt(self, patient_key: str, 
+                                        datos_tutela_actuales: Dict[str, Any] = None) -> Dict[str, Optional[str]]:
         """
-        Genera dinámicamente un prompt para el siguiente campo faltante de desacato usando el LLM Core.
+        Genera prompts para recolectar datos específicos de tutela para desacato.
+        Solo pide los 5 campos esenciales que necesita el usuario proporcionar.
         
         Args:
             patient_key: Clave del paciente
@@ -253,74 +237,165 @@ class ClaimManager:
             Dict con field_name y prompt_text para el siguiente campo faltante
         """
         try:
-            # Obtener datos del paciente
-            patient_record = self._get_patient_data(patient_key)
-            if not patient_record:
-                return {
-                    "field_name": None,
-                    "prompt_text": f"⚠️ No se encontró ningún paciente con la clave '{patient_key}'. ¿Podrías verificar y enviarla nuevamente?",
-                }
-
-            # Combinar datos actuales con los proporcionados
+            # Campos mínimos necesarios para desacato
+            REQUIRED_TUTELA_FIELDS = [
+                "numero_sentencia",
+                "fecha_sentencia", 
+                "fecha_radicacion_tutela", 
+                "juzgado",
+                "ciudad"
+            ]
+            
+            # Prompts específicos para cada campo
+            TUTELA_FIELD_PROMPTS = {
+                "numero_sentencia": (
+                    "📋 Para generar el desacato necesito el *número exacto de tu acción de tutela*.\n\n"
+                    "Este número aparece en la sentencia de tutela (ejemplos: '078', 'T-05001-31-05-001-2025-10098-00').\n\n"
+                    "¿Puedes proporcionarme el número completo tal como aparece en tu sentencia?"
+                ),
+                
+                "fecha_sentencia": (
+                    "📅 ¿En qué fecha te *concedieron la tutela*?\n\n"
+                    "Necesito la fecha exacta de la sentencia en formato DD/MM/AAAA (ejemplo: 28/05/2025).\n\n"
+                    "Esta fecha aparece en el encabezado de tu sentencia de tutela."
+                ),
+                
+                "fecha_radicacion_tutela": (
+                    "📋 ¿En qué fecha *radicaste tu acción de tutela*?\n\n"
+                    "Formato DD/MM/AAAA (ejemplo: 15/05/2025).\n\n"
+                    "Esta es la fecha en que presentaste inicialmente la tutela ante el juzgado."
+                ),
+                
+                "juzgado": (
+                    "⚖️ Necesito el *nombre completo del juzgado* que te concedió la tutela.\n\n"
+                    "Ejemplos:\n"
+                    "• 'Juzgado Primero Laboral del Circuito de Medellín'\n"
+                    "• 'Juzgado Tercero Civil Municipal de Bogotá'\n\n"
+                    "¿Puedes indicarme el nombre exacto como aparece en tu sentencia?"
+                ),
+                
+                "ciudad": (
+                    "🏙️ ¿En qué *ciudad* se encuentra el juzgado que concedió tu tutela?\n\n"
+                    "Ejemplos: Medellín, Bogotá, Cali, Barranquilla, etc.\n\n"
+                    "Necesito la ciudad donde está ubicado físicamente el juzgado."
+                )
+            }
+            
             if not datos_tutela_actuales:
                 datos_tutela_actuales = {}
-
-            datos_confirmados = []
-            campo_faltante = None
-
-            # Verificar campos específicos de desacato
-            for field in self.REQUIRED_FIELDS_DESACATO:
-                value = datos_tutela_actuales.get(field)
-
-                if value and str(value).strip():
-                    display_name = self.FIELD_DISPLAY_NAMES_DESACATO.get(field, field)
-                    datos_confirmados.append(f"- {display_name}: {value}")
-                else:
-                    campo_faltante = field
-                    break
-            else:
-                # Todos los campos están completos
-                return {
-                    "field_name": None,
-                    "prompt_text": "✅ Ya tenemos toda la información necesaria sobre tu tutela para generar el incidente de desacato. ¡Gracias por tu colaboración!",
-                }
-
-            # Obtener prompt para recolección de desacato
-            desacato_prompt_template = prompt_manager.get_prompt_by_module_and_function("DATA", "recoleccion_desacato")
-            if not desacato_prompt_template:
-                logger.error("Prompt 'DATA.recoleccion_desacato' no encontrado en manual_instrucciones.")
-                field_display_name = self.FIELD_DISPLAY_NAMES_DESACATO.get(campo_faltante, campo_faltante)
-                return {
-                    "field_name": campo_faltante,
-                    "prompt_text": f"Para continuar con el incidente de desacato, necesito que me indiques {field_display_name}. ¿Me lo puedes compartir, por favor?",
-                }
-
-            datos_confirmados_str = "\n".join(datos_confirmados) if datos_confirmados else "Ningún dato de tutela confirmado aún."
             
-            full_prompt = desacato_prompt_template.format(
-                datos_confirmados_str=datos_confirmados_str,
-                campo_faltante=campo_faltante,
-            )
-
-            try:
-                generated_question = self.llm_core.ask_text(full_prompt)
-                logger.info(f"Pregunta generada por LLM para campo de desacato '{campo_faltante}'.")
-                return {"field_name": campo_faltante, "prompt_text": generated_question}
-            except Exception as llm_error:
-                logger.error(f"Error al generar pregunta con LLM para '{campo_faltante}': {llm_error}")
-                field_display_name = self.FIELD_DISPLAY_NAMES_DESACATO.get(campo_faltante, campo_faltante)
-                return {
-                    "field_name": campo_faltante,
-                    "prompt_text": f"Para continuar con el incidente de desacato, necesito que me indiques {field_display_name}. ¿Me lo puedes compartir, por favor? 😊",
-                }
-
-        except Exception as e:
-            logger.exception(f"Error inesperado en get_next_missing_field_prompt_desacato para '{patient_key}'.")
+            # Buscar primer campo faltante
+            for field in REQUIRED_TUTELA_FIELDS:
+                value = datos_tutela_actuales.get(field)
+                if not value or not str(value).strip():
+                    return {
+                        "field_name": field,
+                        "prompt_text": TUTELA_FIELD_PROMPTS[field]
+                    }
+            
+            # Todos los campos están completos
             return {
                 "field_name": None,
-                "prompt_text": "😓 Ocurrió un error inesperado al generar tu pregunta sobre el desacato. Por favor, inténtalo nuevamente.",
+                "prompt_text": "✅ Tengo todos los datos de tu tutela. Generando el incidente de desacato..."
             }
+            
+        except Exception as e:
+            logger.error(f"Error en get_next_missing_tutela_field_prompt para '{patient_key}': {e}")
+            return {
+                "field_name": None,
+                "prompt_text": "😓 Ocurrió un error. Por favor, inténtalo nuevamente."
+            }
+        
+    def get_existing_tutela_data(self, patient_key: str) -> Optional[Dict[str, Any]]:
+        """
+        Obtiene datos existentes de tutela para un paciente desde la tabla tutelas.
+        
+        Args:
+            patient_key: Clave del paciente
+            
+        Returns:
+            Dict con datos de tutela si existen, None si no hay datos
+        """
+        try:
+            from google.cloud import bigquery
+            
+            query = f"""
+            SELECT 
+                numero_sentencia,
+                fecha_sentencia,
+                fecha_radicacion_tutela,
+                juzgado,
+                ciudad,
+                created_at
+            FROM `{PROJECT_ID}.{DATASET_ID}.tutelas`
+            WHERE paciente_clave = @patient_key
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+            
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)
+                ]
+            )
+            
+            results = self.bq_client.query(query, job_config=job_config).result()
+            
+            for row in results:
+                return {
+                    "numero_sentencia": row.numero_sentencia,
+                    "fecha_sentencia": row.fecha_sentencia.strftime("%d/%m/%Y") if row.fecha_sentencia else "",
+                    "fecha_radicacion_tutela": row.fecha_radicacion_tutela.strftime("%d/%m/%Y") if row.fecha_radicacion_tutela else "",
+                    "juzgado": row.juzgado,
+                    "ciudad": row.ciudad
+                }
+            
+            logger.info(f"No se encontraron datos de tutela para paciente: {patient_key}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error obteniendo datos de tutela existentes para {patient_key}: {e}")
+            return None
 
+    def save_tutela_data_simple(self, patient_key: str, tutela_data: Dict[str, Any]) -> bool:
+        """
+        Guarda datos mínimos de tutela en la tabla tutelas simplificada.
+        
+        Args:
+            patient_key: Clave del paciente
+            tutela_data: Datos de tutela recolectados del usuario
+            
+        Returns:
+            bool: True si se guardó correctamente
+        """
+        try:
+            # Preparar registro simplificado
+            tutela_record = {
+                "paciente_clave": patient_key,
+                "numero_sentencia": str(tutela_data.get("numero_sentencia", "")).strip(),
+                "fecha_sentencia": tutela_data.get("fecha_sentencia"),  # Ya en formato YYYY-MM-DD
+                "fecha_radicacion_tutela": tutela_data.get("fecha_radicacion_tutela"),  # Ya en formato YYYY-MM-DD
+                "juzgado": str(tutela_data.get("juzgado", "")).strip(),
+                "ciudad": str(tutela_data.get("ciudad", "")).strip(),
+                "created_at": datetime.now().isoformat()
+            }
+            
+            # Validar datos mínimos
+            if not tutela_record["numero_sentencia"] or not tutela_record["juzgado"]:
+                logger.error(f"Datos de tutela incompletos para {patient_key}: faltan número o juzgado")
+                return False
+            
+            # Guardar en tabla tutelas
+            table_reference = f"{PROJECT_ID}.{DATASET_ID}.tutelas"
+            load_table_from_json_direct([tutela_record], table_reference)
+            
+            logger.info(f"✅ Datos de tutela guardados exitosamente para paciente {patient_key}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error guardando datos de tutela simples para {patient_key}: {e}")
+            return False
+        
     def _get_field_display_name(self, field_name: str) -> str:
         """Convierte nombres de campos técnicos a nombres amigables para mostrar al usuario."""
         return self.FIELD_DISPLAY_NAMES.get(field_name, field_name.replace("_", " "))
@@ -482,24 +557,6 @@ Respuesta:"""
 
         return str(value).strip()
 
-    # ✨ NUEVA FUNCIÓN: Normalizar valores específicos para campos de tutela
-    def _normalize_tutela_field_value(self, field_name: str, value: Any) -> Any:
-        """Normaliza valores específicos para campos de tutela."""
-        if value is None:
-            return None
-
-        if field_name == "fecha_sentencia":
-            return self._normalize_date(value)
-
-        # Campos de texto para tutela
-        tutela_text_fields = [
-            "numero_tutela", "juzgado", "contenido_fallo", "representante_legal_eps"
-        ]
-        
-        if field_name in tutela_text_fields:
-            return str(value).strip()
-
-        return str(value).strip()
 
     def _standardize_response(self, user_response: str, mapping: Dict[str, str]) -> str:
         """Aplica un mapeo de estandarización a la respuesta del usuario."""
@@ -534,157 +591,46 @@ Respuesta:"""
             logger.error(f"❌ Error en update_informante_with_merge: {e}")
             return False
 
-
-    # ✨ NUEVA FUNCIÓN: Guardar datos de tutela en tabla tutelas
     def save_tutela_data_to_bigquery(self, patient_key: str, tutela_data: Dict[str, Any]) -> bool:
         """
-        Guarda los datos de la tutela en la tabla tutelas de BigQuery.
+        Guarda los datos básicos de tutela en la tabla tutelas simplificada.
+        MODIFICADO: Ahora usa estructura simplificada con solo campos esenciales.
         
         Args:
             patient_key: Clave del paciente
-            tutela_data: Datos de la tutela a guardar
+            tutela_data: Datos de la tutela recolectados del usuario
             
         Returns:
             bool: True si se guardó correctamente
         """
         try:
-            # Preparar registro para BigQuery
+            # ✅ NUEVA ESTRUCTURA SIMPLIFICADA - Solo campos esenciales
             tutela_record = {
                 "paciente_clave": patient_key,
-                "numero_tutela": tutela_data.get("numero_tutela", ""),
-                "juzgado": tutela_data.get("juzgado", ""),
-                "fecha_sentencia": tutela_data.get("fecha_sentencia"),  # Ya debe estar en formato YYYY-MM-DD
-                "contenido_fallo": tutela_data.get("contenido_fallo", ""),
-                "estado_tutela": "favorable",  # Por defecto, ya que se va a hacer desacato
-                "representante_legal_eps": tutela_data.get("representante_legal_eps", ""),
+                "numero_sentencia": str(tutela_data.get("numero_sentencia", "")).strip(),
+                "fecha_sentencia": tutela_data.get("fecha_sentencia"),  # Formato YYYY-MM-DD
+                "fecha_radicacion_tutela": tutela_data.get("fecha_radicacion_tutela"),  # Formato YYYY-MM-DD  
+                "juzgado": str(tutela_data.get("juzgado", "")).strip(),
+                "ciudad": str(tutela_data.get("ciudad", "")).strip(),
                 "created_at": datetime.now().isoformat()
             }
             
-            # Tabla de tutelas
-            table_reference = f"{PROJECT_ID}.{DATASET_ID}.tutelas"
+            # ✅ VALIDACIÓN MÍNIMA - Solo campos críticos
+            if not tutela_record["numero_sentencia"] or not tutela_record["juzgado"]:
+                logger.error(f"Datos de tutela incompletos para {patient_key}: faltan número o juzgado")
+                return False
             
-            # Insertar usando load_table_from_json_direct
+            # ✅ GUARDAR en tabla simplificada
+            table_reference = f"{PROJECT_ID}.{DATASET_ID}.tutelas"
             load_table_from_json_direct([tutela_record], table_reference)
             
-            logger.info(f"Datos de tutela guardados para paciente {patient_key}")
+            logger.info(f"✅ Datos de tutela guardados en estructura simplificada para paciente {patient_key}")
             return True
             
         except Exception as e:
-            logger.error(f"Error guardando datos de tutela para paciente {patient_key}: {e}")
+            logger.error(f"❌ Error guardando datos de tutela simplificados para paciente {patient_key}: {e}")
             return False
         
-    def update_tutela_pdf_info(self, patient_key: str, numero_tutela: str, 
-                          pdf_info: Dict[str, Any]) -> bool:
-        """
-        NUEVA FUNCIÓN: Actualiza la información del PDF generado en la tabla tutelas.
-        """
-        try:
-            from processor_image_prescription.bigquery_pip import get_bigquery_client
-            from google.cloud import bigquery
-            
-            client = get_bigquery_client()
-            table_reference = f"{PROJECT_ID}.{DATASET_ID}.tutelas"
-
-            # UPDATE seguro que actualiza solo los campos del PDF
-            update_query = f"""
-            UPDATE `{table_reference}`
-            SET 
-                pdf_generado = TRUE,
-                fecha_generacion_pdf = CURRENT_TIMESTAMP(),
-                url_documento_pdf = @url_documento,
-                filename_pdf = @filename,
-                size_pdf_bytes = @size_bytes
-            WHERE paciente_clave = @patient_key 
-            AND numero_tutela = @numero_tutela
-            """
-
-            job_config = bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key),
-                    bigquery.ScalarQueryParameter("numero_tutela", "STRING", numero_tutela),
-                    bigquery.ScalarQueryParameter("url_documento", "STRING", pdf_info.get("pdf_url", "")),
-                    bigquery.ScalarQueryParameter("filename", "STRING", pdf_info.get("pdf_filename", "")),
-                    bigquery.ScalarQueryParameter("size_bytes", "INTEGER", pdf_info.get("file_size_bytes", 0))
-                ]
-            )
-
-            logger.info(f"🔄 Actualizando info PDF para tutela {numero_tutela} del paciente {patient_key}")
-            
-            query_job = client.query(update_query, job_config=job_config)
-            query_job.result()
-
-            rows_affected = getattr(query_job, 'num_dml_affected_rows', 0)
-            if rows_affected == 0:
-                logger.warning(f"No se encontró tutela {numero_tutela} para paciente {patient_key}")
-                return False
-
-            logger.info(f"✅ Información de PDF actualizada exitosamente")
-            return True
-
-        except Exception as e:
-            logger.error(f"❌ Error actualizando info PDF de tutela: {e}")
-            return False
-
-    def get_tutelas_con_pdf_para_desacato(self, patient_key: str) -> List[Dict[str, Any]]:
-        """
-        NUEVA FUNCIÓN: Obtiene tutelas favorables con PDF generado para desacato.
-        """
-        try:
-            from processor_image_prescription.bigquery_pip import get_bigquery_client
-            from google.cloud import bigquery
-            
-            client = get_bigquery_client()
-            table_reference = f"{PROJECT_ID}.{DATASET_ID}.tutelas"
-
-            query = f"""
-            SELECT 
-                numero_tutela,
-                juzgado, 
-                fecha_sentencia,
-                contenido_fallo,
-                representante_legal_eps,
-                pdf_generado,
-                url_documento_pdf,
-                filename_pdf,
-                fecha_generacion_pdf
-            FROM `{table_reference}`
-            WHERE paciente_clave = @patient_key 
-            AND estado_tutela = 'favorable'
-            AND pdf_generado = TRUE
-            AND url_documento_pdf IS NOT NULL
-            AND url_documento_pdf != ''
-            ORDER BY fecha_generacion_pdf DESC
-            """
-            
-            job_config = bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)
-                ]
-            )
-            
-            results = client.query(query, job_config=job_config).result()
-            tutelas_disponibles = []
-            
-            for row in results:
-                tutela_info = {
-                    "numero_tutela": row.numero_tutela,
-                    "juzgado": row.juzgado,
-                    "fecha_sentencia": row.fecha_sentencia.strftime("%d/%m/%Y") if row.fecha_sentencia else "",
-                    "contenido_fallo": row.contenido_fallo or "",
-                    "representante_legal_eps": row.representante_legal_eps or "",
-                    "pdf_url": row.url_documento_pdf,
-                    "pdf_filename": row.filename_pdf,
-                    "fecha_pdf": row.fecha_generacion_pdf.isoformat() if row.fecha_generacion_pdf else ""
-                }
-                tutelas_disponibles.append(tutela_info)
-            
-            logger.info(f"✅ Encontradas {len(tutelas_disponibles)} tutelas con PDF para desacato")
-            return tutelas_disponibles
-            
-        except Exception as e:
-            logger.error(f"❌ Error obteniendo tutelas con PDF: {e}")
-            return []
-
 
 try:
     claim_manager = ClaimManager()

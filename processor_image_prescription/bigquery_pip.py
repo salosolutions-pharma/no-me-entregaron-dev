@@ -539,6 +539,55 @@ def load_table_from_json_direct(data: List[Dict[str, Any]], table_reference: str
         logger.exception("Error inesperado durante la carga directa en BigQuery.")
         raise BigQueryServiceError(f"Error inesperado en la carga directa: {exc}") from exc
 
+def update_prescriptions_with_load_table(patient_key: str, new_prescriptions: List[Dict[str, Any]]) -> bool:
+    """Actualiza prescripciones usando DELETE + load_table_from_json SIN BÚFER."""
+    if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
+        raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
+
+    client = get_bigquery_client()
+    table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+
+    try:
+        get_query = f"""
+            SELECT * FROM `{table_reference}`
+            WHERE paciente_clave = @patient_key
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)]
+        )
+
+        results = client.query(get_query, job_config=job_config).result()
+        current_data = None
+
+        for row in results:
+            current_data = _convert_bq_row_to_dict_recursive(row)
+            break
+
+        if not current_data:
+            logger.error(f"Paciente {patient_key} no encontrado para actualizar prescripciones.")
+            return False
+
+        current_prescriptions = current_data.get("prescripciones", [])
+        current_prescriptions.extend(new_prescriptions)
+        current_data["prescripciones"] = current_prescriptions
+
+        delete_query = f"""
+            DELETE FROM `{table_reference}`
+            WHERE paciente_clave = @patient_key
+        """
+
+        delete_job = client.query(delete_query, job_config=job_config)
+        delete_job.result()
+        logger.info(f"Registro {patient_key} eliminado para actualizar prescripciones.")
+
+        load_table_from_json_direct([current_data], table_reference)
+        logger.info(f"Prescripciones actualizadas SIN BÚFER para paciente {patient_key}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error actualizando prescripciones SIN BÚFER: {e}")
+
 
 # ✅ FUNCIÓN PRINCIPAL para insertar/actualizar pacientes
 def insert_or_update_patient_data(patient_data: Dict[str, Any],
@@ -592,7 +641,9 @@ def insert_or_update_patient_data(patient_data: Dict[str, Any],
         # Para nuevas prescripciones, usar operación específica
         if patient_data.get("prescripciones"):
             logger.info("➕ Agregando nueva prescripción...")
-            # Implementar lógica específica para prescripciones si es necesario
+            success = update_prescriptions_with_load_table(patient_key, patient_data["prescripciones"])
+            if not success:
+                raise BigQueryServiceError(f"❌ No se pudo actualizar las prescripciones para '{patient_key}'")
 
     else:
         # Solo para pacientes completamente nuevos

@@ -2,5 +2,14 @@ google-cloud-bigquery
 requests
 openai
 python-dotenv
-
+fastapi
+functions-framework
+pytz
+python-telegram-bot
+requests
+uvicorn[standard]
+google-cloud-firestore
+google-cloud-storage
+Pillow
+reportlab
 

@@ -2,3 +2,13 @@ functions-framework==3.*
 google-cloud-bigquery==3.*
 google-cloud-firestore==2.*
 pytz==2023.*
+fastapi
+functions-framework
+openai
+python-dotenv
+python-telegram-bot
+requests
+uvicorn[standard]
+google-cloud-storage
+Pillow
+reportlab

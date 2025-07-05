@@ -9,3 +9,5 @@ uvicorn[standard]
 google-cloud-bigquery
 google-cloud-firestore
 google-cloud-storage
+Pillow
+reportlab
