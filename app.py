@@ -5,15 +5,14 @@ import logging
 from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
 from channels.telegram_c import create_application
+from channels.whatsapp import create_whatsapp_service
 import traceback
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-# Si tienes un módulo de WhatsApp, impórtalo también:
-# from channels.whatsapp_c import WhatsAppClient
 
 logger = logging.getLogger(__name__)
 app = FastAPI()
 app.state.telegram_app = None
-# app.state.whatsapp_client = None
+app.state.whatsapp_service = None
 
 @app.on_event("startup")
 async def startup_event():
@@ -23,10 +22,14 @@ async def startup_event():
     await telegram_app.start()
     app.state.telegram_app = telegram_app
 
-    # 2) (Opcional) Inicializar WhatsApp client
-    # wa_client = WhatsAppClient(...)
-    # await wa_client.initialize()
-    # app.state.whatsapp_client = wa_client
+    # 2) Inicializar WhatsApp service
+    try:
+        whatsapp_service = create_whatsapp_service()
+        app.state.whatsapp_service = whatsapp_service
+        logger.info("WhatsApp service inicializado correctamente")
+    except Exception as e:
+        logger.warning(f"WhatsApp service no disponible: {e}")
+        app.state.whatsapp_service = None
 
     # 3) Registrar jobs periódicos
     """interval = int(os.getenv("CHECK_INTERVAL_SECONDS", 60))
@@ -50,8 +53,8 @@ async def shutdown_event():
     if app.state.telegram_app:
         await app.state.telegram_app.shutdown()
         await app.state.telegram_app.stop()
-    # if app.state.whatsapp_client:
-    #     await app.state.whatsapp_client.shutdown()
+    if app.state.whatsapp_service:
+        logger.info("WhatsApp service finalizado")
 
 @app.post("/webhook")
 async def telegram_webhook(req: Request):
@@ -100,21 +103,88 @@ async def send_message(req: Request):
             logger.error(f"❌ Error enviando Telegram a chat_id {chat_id} (user_id: {sid}): {e}\n{tb}")
             raise HTTPException(500, f"Falló envío Telegram: {str(e)}")
     elif prefix == "WA":
-        # WhatsApp: usa tu cliente o API de WhatsApp
-        wa_client = app.state.whatsapp_client
-        if not wa_client:
+        # WhatsApp: usa el servicio de WhatsApp Business API
+        whatsapp_service = app.state.whatsapp_service
+        if not whatsapp_service:
             raise HTTPException(503, "Canal WhatsApp no está habilitado")
         phone = rest.split("_")[0]
+        logger.info(f"Intentando enviar mensaje WhatsApp a teléfono: {phone} y sesión {session_id}")
         try:
-            await wa_client.send_message(phone_number=phone, text=text)
+            success = await whatsapp_service.send_message(phone, text, buttons)
+            if not success:
+                raise HTTPException(500, "Falló envío WhatsApp")
         except Exception as e:
-            logger.error(f"Error enviando WhatsApp a {phone}: {e}")
-            raise HTTPException(500, "Falló envío WhatsApp")
+            tb = traceback.format_exc()
+            logger.error(f"❌ Error enviando WhatsApp a {phone} (user_id: {sid}): {e}\n{tb}")
+            raise HTTPException(500, f"Falló envío WhatsApp: {str(e)}")
     else:
         raise HTTPException(400, f"Canal desconocido en user_id: {prefix}")
 
     return {"ok": True}
 
+# Nuevos endpoints para WhatsApp
+
+@app.get("/whatsapp/webhook")
+async def whatsapp_webhook_verify(req: Request):
+    """Verifica el webhook de WhatsApp durante la configuración."""
+    mode = req.query_params.get("hub.mode")
+    token = req.query_params.get("hub.verify_token")
+    challenge = req.query_params.get("hub.challenge")
+    
+    whatsapp_service = app.state.whatsapp_service
+    if not whatsapp_service:
+        raise HTTPException(503, "WhatsApp service no disponible")
+    
+    result = whatsapp_service.verify_webhook(mode, token, challenge)
+    if result:
+        return int(result)  # WhatsApp espera el challenge como número
+    else:
+        raise HTTPException(403, "Verificación de webhook fallida")
+
+@app.post("/whatsapp/webhook")
+async def whatsapp_webhook_handler(req: Request):
+    """Maneja webhooks entrantes de WhatsApp."""
+    whatsapp_service = app.state.whatsapp_service
+    if not whatsapp_service:
+        raise HTTPException(503, "WhatsApp service no disponible")
+    
+    body = await req.json()
+    logger.info("🔔 WhatsApp webhook received: %s", body)
+    
+    result = await whatsapp_service.handle_webhook(body)
+    
+    if result["status"] == "success":
+        return {"ok": True}
+    elif result["status"] == "ignored":
+        return {"ok": True, "ignored": True, "reason": result.get("reason")}
+    else:
+        logger.error(f"Error procesando webhook WhatsApp: {result.get('error')}")
+        raise HTTPException(500, f"Error procesando webhook: {result.get('error', 'Desconocido')}")
+
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    """Health check que incluye estado de ambos canales."""
+    telegram_healthy = app.state.telegram_app is not None
+    whatsapp_healthy = False
+    whatsapp_details = {}
+    
+    if app.state.whatsapp_service:
+        whatsapp_health = app.state.whatsapp_service.health_check()
+        whatsapp_healthy = whatsapp_health.get("healthy", False)
+        whatsapp_details = whatsapp_health.get("components", {})
+    
+    return {
+        "status": "healthy" if telegram_healthy else "degraded",
+        "channels": {
+            "telegram": {
+                "status": "healthy" if telegram_healthy else "unhealthy",
+                "available": telegram_healthy
+            },
+            "whatsapp": {
+                "status": "healthy" if whatsapp_healthy else "unhealthy",
+                "available": whatsapp_healthy,
+                "components": whatsapp_details
+            }
+        },
+        "overall_healthy": telegram_healthy  # Al menos Telegram debe estar funcionando
+    }
