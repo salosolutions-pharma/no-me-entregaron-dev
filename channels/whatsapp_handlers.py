@@ -904,6 +904,7 @@ class WhatsAppMessageHandler:
                                 "Tu caso está siendo revisado por nuestro equipo especializado.\n"
                                 "Te contactaremos pronto con actualizaciones."
                             )
+                            
                         elif tipo.startswith("multiple_"):
                             # Escalamiento múltiple (EPS + Supersalud)
                             tipos_generados = tipo.replace("multiple_", "").replace("_", " y ").replace("reclamacion", "reclamación")

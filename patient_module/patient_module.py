@@ -68,23 +68,152 @@ class PatientModule:
                         {"text": "❌ No", "callback_data": f"followup_no_{session_id}"},    # ✅ USAR SESSION_ID
                     ]
                 )
-                logger.info(f"Mensaje enviado a {user_id} para session {session_id} (paciente {patient_key})")
+                
+                # Determinar el identificador de usuario para logging
+                if session_id.startswith("WA_"):
+                    phone_number = self._extract_phone_from_whatsapp_session(session_id)
+                    user_identifier = f"WhatsApp:{phone_number}" if phone_number else f"WhatsApp:unknown"
+                else:
+                    user_identifier = f"Telegram:{user_id}"
+                
+                logger.info(f"Mensaje enviado a {user_identifier} para session {session_id} (paciente {patient_key})")
             except Exception as e:
                 logger.error(f"Error enviando mensaje: {e}")
 
     def send_message(self, user_id: str, session_id: str, text: str, buttons: list = None) -> None:
         """Envía mensaje via API recepcionista."""
+        # Determinar el canal basado en el session_id
+        channel_prefix = self._get_channel_from_session(session_id)
+        
+        if channel_prefix == "WA":
+            # Para WhatsApp, extraer el número de teléfono desde el session_id
+            # Formato session_id: WA_573146748777_20250704_184334
+            phone_number = self._extract_phone_from_whatsapp_session(session_id)
+            if phone_number:
+                formatted_user_id = f"WA_{phone_number}"
+            else:
+                logger.error(f"No se pudo extraer número de teléfono de session_id: {session_id}")
+                return
+        else:
+            # Para Telegram, usar el formato tradicional
+            formatted_user_id = f"TL_{user_id}"
+        
         payload = {
-            "user_id": f"TL_{user_id}",
+            "user_id": formatted_user_id,
             "session_id": session_id,  # ✅ USAR SESSION_ID REAL
             "message": text
         }
         if buttons:
             payload["buttons"] = buttons
 
-        resp = requests.post(f"{self.api_url}/send_message", json=payload)
-        if resp.status_code != 200:
-            logger.error(f"Error enviando mensaje: {resp.text}")
+        logger.info(f"📤 Enviando payload a recepcionista: {json.dumps(payload)}")
+        logger.info(f"📤 URL destino: {self.api_url}/send_message")
+
+        try:
+            resp = requests.post(f"{self.api_url}/send_message", json=payload)
+
+            # 🔍 LOG DE RESPUESTA
+            logger.info(f"📥 Respuesta de recepcionista: {resp.status_code} - {resp.text}")
+
+            if resp.status_code != 200:
+                logger.error(f"❌ Error enviando mensaje: {resp.status_code} - {resp.text}")
+        except Exception as e:
+            logger.exception(f"❌ Excepción durante envío de mensaje: {e}")    
+
+
+    def _get_channel_from_session(self, session_id: str) -> str:
+        """
+        Determina el canal (TL/WA) basándose en el session_id.
+        Busca en Firestore la información de la sesión para obtener el canal.
+        """
+        try:
+            # Consultar BigQuery para obtener información del canal desde prescripciones
+            sql = f"""
+            SELECT 
+                canal_contacto,
+                user_id
+            FROM `{self.project}.{self.dataset}.{self.table}` AS t,
+                 UNNEST(t.prescripciones) AS pres
+            WHERE pres.id_session = '{session_id}'
+            LIMIT 1
+            """
+            
+            results = self.bq.query(sql).result()
+            for row in results:
+                canal_contacto = row.canal_contacto
+                user_id = row.user_id
+                
+                # Determinar canal basado en canal_contacto o user_id
+                if canal_contacto == "WA" or (user_id and user_id.startswith("WA_")):
+                    return "WA"
+                else:
+                    return "TL"
+            
+            # Si no se encuentra en prescripciones, buscar en reclamaciones
+            sql_rec = f"""
+            SELECT 
+                t.prescripciones[SAFE_OFFSET(0)].canal_contacto as canal_contacto,
+                t.prescripciones[SAFE_OFFSET(0)].user_id as user_id
+            FROM `{self.project}.{self.dataset}.{self.table}` AS t,
+                 UNNEST(t.reclamaciones) AS rec
+            WHERE rec.id_session = '{session_id}'
+            LIMIT 1
+            """
+            
+            results_rec = self.bq.query(sql_rec).result()
+            for row in results_rec:
+                canal_contacto = row.canal_contacto
+                user_id = row.user_id
+                
+                if canal_contacto == "WA" or (user_id and user_id.startswith("WA_")):
+                    return "WA"
+                else:
+                    return "TL"
+            
+            # Por defecto, asumir Telegram
+            logger.warning(f"No se pudo determinar canal para session_id {session_id}, asumiendo Telegram")
+            return "TL"
+            
+        except Exception as e:
+            logger.error(f"Error determinando canal para session_id {session_id}: {e}")
+            return "TL"  # Fallback a Telegram
+
+    def _extract_phone_from_whatsapp_session(self, session_id: str) -> Optional[str]:
+        """
+        Extrae el número de teléfono de un session_id de WhatsApp.
+        Formato esperado: WA_573146748777_20250704_184334
+        
+        Args:
+            session_id: ID de sesión de WhatsApp
+            
+        Returns:
+            Número de teléfono o None si no se puede extraer
+        """
+        try:
+            if not session_id.startswith("WA_"):
+                return None
+            
+            # Remover prefijo WA_ y dividir por _
+            parts = session_id[3:].split("_")
+            
+            if len(parts) >= 3:
+                # El primer elemento después de WA_ debería ser el número de teléfono
+                phone_number = parts[0]
+                
+                # Validar que sea un número válido
+                if phone_number.isdigit() and len(phone_number) >= 10:
+                    logger.info(f"Número de teléfono extraído de {session_id}: {phone_number}")
+                    return phone_number
+                else:
+                    logger.error(f"Número de teléfono inválido extraído: {phone_number}")
+                    return None
+            else:
+                logger.error(f"Formato de session_id inesperado: {session_id}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error extrayendo número de teléfono de session_id {session_id}: {e}")
+            return None
 
     def update_reclamation_status(self, session_id: str, new_status: str) -> bool:
         """

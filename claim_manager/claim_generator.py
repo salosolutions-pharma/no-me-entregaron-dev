@@ -1281,12 +1281,10 @@ def validar_disponibilidad_desacato() -> Dict[str, Any]:
 def auto_escalate_patient(session_id: str) -> Dict[str, Any]:
     """
     FUNCIÓN PRINCIPAL DE ESCALAMIENTO AUTOMÁTICO
-    
-    NUEVA VERSIÓN: Acepta session_id y busca el patient_key internamente
-    
+
     Args:
         session_id: ID de la sesión (ej: "TL_573226743144_20250702_091518")
-    
+
     Returns:
         Dict con resultado del escalamiento automático
     """
@@ -1313,17 +1311,15 @@ def auto_escalate_patient(session_id: str) -> Dict[str, Any]:
         if decision_escalamiento["accion"] == "generar":
             tipo = decision_escalamiento["tipo"]
             
-            # ✅ NUEVO: Verificar datos para desacato antes de generar
+            # ✅ Verificar datos para desacato antes de generar
             if tipo == "desacato":
                 datos_tutela_existentes = _obtener_datos_tutela_para_desacato(patient_key)
-
                 faltantes = []
                 if not datos_tutela_existentes:
                     faltantes = REQUIRED_TUTELA_FIELDS
                 else:
                     faltantes = [campo for campo in REQUIRED_TUTELA_FIELDS 
                                if not datos_tutela_existentes.get(campo)]
-                
                 if faltantes:
                     # ✅ Faltan datos de tutela → Solicitar recolección
                     return {
@@ -1334,14 +1330,42 @@ def auto_escalate_patient(session_id: str) -> Dict[str, Any]:
                         "session_id": session_id,
                         "campos_necesarios": faltantes
                     }
-            
             # ✅ Si no es desacato O tiene todos los datos → Continuar normal
             resultado = _ejecutar_escalamiento_especifico(patient_key, tipo)
-            
+        
         elif decision_escalamiento["accion"] == "generar_multiple":
             tipos = decision_escalamiento["tipos"]
-            resultado = _ejecutar_escalamiento_multiple(patient_key, tipos)
-            
+            # Solo permitir escalamiento múltiple EPS+Supersalud, en ese orden exacto
+            if set(tipos) == set(["reclamacion_eps", "reclamacion_supersalud"]):
+                resultado = _ejecutar_escalamiento_multiple(patient_key, tipos)
+                # Guardar resultado y hacer return inmediato
+                if resultado.get("success"):
+                    guardado = _guardar_escalamiento_en_bd(
+                        patient_key, 
+                        resultado, 
+                        decision_escalamiento["nivel_escalamiento"],
+                        session_id
+                    )
+                    if guardado:
+                        logger.info(f"✅ Escalamiento múltiple EPS+Supersalud completo para {patient_key}")
+                        return {
+                            "success": True,
+                            "tipo": "multiple_reclamacion_eps_reclamacion_supersalud",
+                            "nivel_escalamiento": decision_escalamiento["nivel_escalamiento"],
+                            "razon": decision_escalamiento["razon"],
+                            "patient_key": patient_key
+                        }
+                    else:
+                        return {"success": False, "error": "Error guardando escalamiento múltiple en BigQuery"}
+                else:
+                    return resultado
+            else:
+                # Si intenta cualquier otro múltiple, rechaza
+                return {
+                    "success": False,
+                    "error": "Escalamiento múltiple solo permitido para EPS+Supersalud"
+                }
+        
         elif decision_escalamiento["accion"] == "mantener":
             return {
                 "success": True, 
@@ -1369,7 +1393,6 @@ def auto_escalate_patient(session_id: str) -> Dict[str, Any]:
                 decision_escalamiento["nivel_escalamiento"],
                 session_id
             )
-            
             if guardado:
                 logger.info(f"✅ Escalamiento completo para {patient_key}: {resultado.get('tipo_reclamacion', resultado.get('tipo', 'desconocido'))}")
                 return {
@@ -1377,7 +1400,7 @@ def auto_escalate_patient(session_id: str) -> Dict[str, Any]:
                     "tipo": resultado.get('tipo_reclamacion', resultado.get('tipo', 'desconocido')),
                     "nivel_escalamiento": decision_escalamiento["nivel_escalamiento"],
                     "razon": decision_escalamiento["razon"],
-                    "patient_key": patient_key  # ✅ Incluir para logging
+                    "patient_key": patient_key
                 }
             else:
                 return {"success": False, "error": "Error guardando escalamiento en BigQuery"}
@@ -1599,7 +1622,7 @@ def _generar_accion_inicial(categoria_riesgo: str) -> Dict[str, Any]:
 def _evaluar_escalamiento_simple(nivel_actual: int, tipo_actual: str) -> Dict[str, Any]:
     """
     Escalamiento para riesgo SIMPLE:
-    Nivel 1: EPS (5 días) → Nivel 2: Supersalud (20 días) → Nivel 3+: EPS + Supersalud (cada 20 días)
+    Nivel 1: EPS → Nivel 2: Supersalud → Nivel 3: EPS + Supersalud → Nivel 4: Tutela → Nivel 5: Desacato (repite)
     """
     if nivel_actual == 1 and tipo_actual == "reclamacion_eps":
         return {
@@ -1609,7 +1632,6 @@ def _evaluar_escalamiento_simple(nivel_actual: int, tipo_actual: str) -> Dict[st
             "plazo_dias": 20,
             "razon": "Simple: EPS sin respuesta → Supersalud nivel 2"
         }
-    
     elif nivel_actual == 2 and tipo_actual == "reclamacion_supersalud":
         return {
             "accion": "generar_multiple",
@@ -1618,23 +1640,37 @@ def _evaluar_escalamiento_simple(nivel_actual: int, tipo_actual: str) -> Dict[st
             "plazo_dias": 20,
             "razon": "Simple: Supersalud sin respuesta → EPS+Supersalud nivel 3"
         }
-    
-    elif nivel_actual >= 3:
+    elif nivel_actual == 3 and tipo_actual in ["multiple_reclamacion_eps_reclamacion_supersalud"]:
         return {
-            "accion": "generar_multiple",
-            "tipos": ["reclamacion_eps", "reclamacion_supersalud"],
-            "nivel_escalamiento": nivel_actual + 1,
-            "plazo_dias": 20,
-            "razon": f"Simple: Insistencia EPS+Supersalud nivel {nivel_actual + 1}"
+            "accion": "generar",
+            "tipo": "tutela",
+            "nivel_escalamiento": 4,
+            "plazo_dias": 15,
+            "razon": "Simple: EPS+Supersalud sin respuesta → Tutela nivel 4"
         }
-    
+    elif nivel_actual == 4 and tipo_actual == "tutela":
+        return {
+            "accion": "generar",
+            "tipo": "desacato",
+            "nivel_escalamiento": 5,
+            "plazo_dias": 10,
+            "razon": "Simple: Tutela incumplida → Desacato nivel 5"
+        }
+    elif nivel_actual >= 5 and tipo_actual == "desacato":
+        return {
+            "accion": "generar",
+            "tipo": "desacato",
+            "nivel_escalamiento": nivel_actual + 1,
+            "plazo_dias": 10,
+            "razon": f"Simple: Desacato previo incumplido → Desacato nivel {nivel_actual + 1}"
+        }
     return {"accion": "mantener", "razon": "Simple: Situación no contemplada"}
 
 
 def _evaluar_escalamiento_priorizado(nivel_actual: int, tipo_actual: str) -> Dict[str, Any]:
     """
     Escalamiento para riesgo PRIORIZADO:
-    Nivel 1: EPS → Nivel 2: Supersalud → Nivel 3: EPS+Supersalud → Nivel 4: Tutela → Nivel 5+: Desacato
+    Nivel 1: EPS → Nivel 2: Supersalud → Nivel 3: EPS+Supersalud → Nivel 4: Tutela → Nivel 5: Desacato (repite)
     """
     if nivel_actual == 1 and tipo_actual == "reclamacion_eps":
         return {
@@ -1644,7 +1680,6 @@ def _evaluar_escalamiento_priorizado(nivel_actual: int, tipo_actual: str) -> Dic
             "plazo_dias": 20,
             "razon": "Priorizado: EPS sin respuesta → Supersalud nivel 2"
         }
-    
     elif nivel_actual == 2 and tipo_actual == "reclamacion_supersalud":
         return {
             "accion": "generar_multiple",
@@ -1653,8 +1688,7 @@ def _evaluar_escalamiento_priorizado(nivel_actual: int, tipo_actual: str) -> Dic
             "plazo_dias": 20,
             "razon": "Priorizado: Supersalud sin respuesta → EPS+Supersalud nivel 3"
         }
-    
-    elif nivel_actual == 3:
+    elif nivel_actual == 3 and tipo_actual in ["multiple_reclamacion_eps_reclamacion_supersalud"]:
         return {
             "accion": "generar",
             "tipo": "tutela",
@@ -1662,7 +1696,6 @@ def _evaluar_escalamiento_priorizado(nivel_actual: int, tipo_actual: str) -> Dic
             "plazo_dias": 15,
             "razon": "Priorizado: EPS+Supersalud sin respuesta → Tutela nivel 4"
         }
-    
     elif nivel_actual == 4 and tipo_actual == "tutela":
         return {
             "accion": "generar",
@@ -1671,7 +1704,6 @@ def _evaluar_escalamiento_priorizado(nivel_actual: int, tipo_actual: str) -> Dic
             "plazo_dias": 10,
             "razon": "Priorizado: Tutela incumplida → Desacato nivel 5"
         }
-    
     elif nivel_actual >= 5 and tipo_actual == "desacato":
         return {
             "accion": "generar",
@@ -1680,14 +1712,14 @@ def _evaluar_escalamiento_priorizado(nivel_actual: int, tipo_actual: str) -> Dic
             "plazo_dias": 10,
             "razon": f"Priorizado: Desacato previo incumplido → Desacato nivel {nivel_actual + 1}"
         }
-    
     return {"accion": "mantener", "razon": "Priorizado: Situación no contemplada"}
+
 
 
 def _evaluar_escalamiento_vital(nivel_actual: int, tipo_actual: str) -> Dict[str, Any]:
     """
     Escalamiento para riesgo VITAL:
-    Nivel 1: EPS (24h) → Nivel 2: Supersalud (24h) → Nivel 3: Tutela → Nivel 4+: Desacato
+    Nivel 1: EPS → Nivel 2: Supersalud → Nivel 3: Tutela → Nivel 4: Desacato (repite)
     """
     if nivel_actual == 1 and tipo_actual == "reclamacion_eps":
         return {
@@ -1697,7 +1729,6 @@ def _evaluar_escalamiento_vital(nivel_actual: int, tipo_actual: str) -> Dict[str
             "plazo_dias": 1,
             "razon": "Vital: EPS sin respuesta (24h) → Supersalud nivel 2"
         }
-    
     elif nivel_actual == 2 and tipo_actual == "reclamacion_supersalud":
         return {
             "accion": "generar",
@@ -1706,7 +1737,6 @@ def _evaluar_escalamiento_vital(nivel_actual: int, tipo_actual: str) -> Dict[str
             "plazo_dias": 15,
             "razon": "Vital: Supersalud sin respuesta (24h) → Tutela nivel 3"
         }
-    
     elif nivel_actual == 3 and tipo_actual == "tutela":
         return {
             "accion": "generar",
@@ -1715,7 +1745,6 @@ def _evaluar_escalamiento_vital(nivel_actual: int, tipo_actual: str) -> Dict[str
             "plazo_dias": 5,
             "razon": "Vital: Tutela incumplida → Desacato nivel 4"
         }
-    
     elif nivel_actual >= 4 and tipo_actual == "desacato":
         return {
             "accion": "generar",
@@ -1724,8 +1753,8 @@ def _evaluar_escalamiento_vital(nivel_actual: int, tipo_actual: str) -> Dict[str
             "plazo_dias": 5,
             "razon": f"Vital: Desacato previo incumplido → Desacato nivel {nivel_actual + 1}"
         }
-    
     return {"accion": "mantener", "razon": "Vital: Situación no contemplada"}
+
 
 
 def _ejecutar_escalamiento_especifico(patient_key: str, tipo: str) -> Dict[str, Any]:
