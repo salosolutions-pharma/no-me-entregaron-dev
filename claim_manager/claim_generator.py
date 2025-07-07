@@ -1640,7 +1640,7 @@ def _evaluar_escalamiento_simple(nivel_actual: int, tipo_actual: str) -> Dict[st
             "plazo_dias": 20,
             "razon": "Simple: Supersalud sin respuesta → EPS+Supersalud nivel 3"
         }
-    elif nivel_actual == 3 and tipo_actual in ["multiple_reclamacion_eps_reclamacion_supersalud"]:
+    elif nivel_actual == 3 and tipo_actual in ["reclamacion_eps", "reclamacion_supersalud"]:
         return {
             "accion": "generar",
             "tipo": "tutela",
@@ -1688,7 +1688,7 @@ def _evaluar_escalamiento_priorizado(nivel_actual: int, tipo_actual: str) -> Dic
             "plazo_dias": 20,
             "razon": "Priorizado: Supersalud sin respuesta → EPS+Supersalud nivel 3"
         }
-    elif nivel_actual == 3 and tipo_actual in ["multiple_reclamacion_eps_reclamacion_supersalud"]:
+    elif nivel_actual == 3 and tipo_actual in ["reclamacion_eps", "reclamacion_supersalud"]:
         return {
             "accion": "generar",
             "tipo": "tutela",

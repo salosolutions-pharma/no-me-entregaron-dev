@@ -401,6 +401,11 @@ class WhatsAppMessageHandler:
                     context["waiting_for_field"] = session_data["waiting_for_field"]
                 if "patient_key" in session_data:
                     context["patient_key"] = session_data["patient_key"]
+                if "waiting_for_tutela_field" in session_data:
+                    context["waiting_for_tutela_field"] = session_data["waiting_for_tutela_field"]
+                if "tutela_data_temp" in session_data:
+                    context["tutela_data_temp"] = session_data["tutela_data_temp"]
+
                 
                 return context
             except Exception as e:
@@ -440,6 +445,11 @@ class WhatsAppMessageHandler:
                 update_fields["prescription_uploaded"] = context["prescription_uploaded"]
             if "cuidador_nombre" in context:
                 update_fields["cuidador_nombre"] = context["cuidador_nombre"]
+            if "waiting_for_tutela_field" in context:
+                update_fields["waiting_for_tutela_field"] = context["waiting_for_tutela_field"]
+            if "tutela_data_temp" in context:
+                update_fields["tutela_data_temp"] = context["tutela_data_temp"]
+
     
             
             if update_fields:
@@ -846,6 +856,8 @@ class WhatsAppMessageHandler:
                     # ✅ DELEGAR TODO AL CLAIM MANAGER con session_id
                     from claim_manager.claim_generator import auto_escalate_patient
                     resultado = auto_escalate_patient(session_id)
+                    self.logger.info(f"[WA] Resultado auto_escalate_patient: {resultado}")
+
                     
                     # ✅ NUEVO: Verificar si requiere recolección de datos de tutela
                     if resultado.get("requiere_recoleccion_tutela") and resultado.get("tipo") == "desacato":
@@ -1383,7 +1395,7 @@ class WhatsAppMessageHandler:
 
         if next_prompt["field_name"]:
             # Aún falta al menos un campo
-            session_context["waiting_for_field"] = next_prompt["field_name"]
+            session_context["waiting_for_tutela_field"]
             self._update_session_context(phone_number, session_context)
 
             await self._send_text_message(phone_number, next_prompt["prompt_text"])
