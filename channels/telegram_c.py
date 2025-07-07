@@ -389,13 +389,48 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             session_id = data[len("followup_no_"):]
             logger.info(f"❌ Paciente NO recibió medicamentos para session: {session_id}")
             
+            try:
+                from claim_manager.claim_generator import determinar_tipo_reclamacion_siguiente
+                tipo_reclamacion = determinar_tipo_reclamacion_siguiente(session_id)
+                
+                keyboard = [
+                    [
+                        InlineKeyboardButton("✅ Sí, quiero escalar", callback_data=f"escalate_yes_{session_id}"),
+                        InlineKeyboardButton("❌ No, por ahora no", callback_data=f"escalate_no_{session_id}")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await query.edit_message_text(
+                    text=format_telegram_text(
+                        f"💔 Lamento que no hayas recibido tus medicamentos.\n\n"
+                        f"¿Deseas escalar tu caso y entablar *{tipo_reclamacion}*?"
+                    ),
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+            except Exception as e:
+                logger.error(f"Error mostrando pregunta de escalamiento para session {session_id}: {e}")
+                await query.edit_message_text(
+                    text=format_telegram_text("❌ Error mostrando opciones de escalamiento."),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        return
+
+    # 🆕 NUEVO: Manejar respuestas de escalamiento
+    elif data.startswith("escalate_yes_") or data.startswith("escalate_no_"):
+        if data.startswith("escalate_yes_"):
+            session_id = data[len("escalate_yes_"):]
+            logger.info(f"✅ Paciente ACEPTA escalar para session: {session_id}")
+            
             await query.edit_message_text(
-                text=format_telegram_text("🔄 *Procesando escalamiento automático...*\n\nEvaluando el mejor siguiente paso para tu caso."),
+                text=format_telegram_text("🔄 *Procesando escalamiento...*\n\nEvaluando el mejor siguiente paso para tu caso."),
                 parse_mode=ParseMode.MARKDOWN
             )
             
             try:
-                # ✅ DELEGAR TODO AL CLAIM MANAGER con session_id
+                # 🔄 AQUÍ VA TODO EL CÓDIGO ORIGINAL DE auto_escalate_patient
                 from claim_manager.claim_generator import auto_escalate_patient
                 resultado = auto_escalate_patient(session_id)
                 
@@ -448,7 +483,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     tipo = resultado.get("tipo", "escalamiento")
                     razon = resultado.get("razon", "")
                     nivel = resultado.get("nivel_escalamiento", "")
-                    patient_key = resultado.get("patient_key", "")  # ✅ OBTENER PATIENT_KEY DEL RESULTADO
+                    patient_key = resultado.get("patient_key", "")
                     
                     logger.info(f"✅ Escalamiento exitoso para session {session_id} → patient {patient_key}: {tipo}")
                     
@@ -499,7 +534,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     )
                     
             except Exception as e:
-                logger.error(f"Error ejecutando escalamiento automático para session {session_id}: {e}")
+                logger.error(f"Error ejecutando escalamiento para session {session_id}: {e}")
                 await query.edit_message_text(
                     text=format_telegram_text(
                         "❌ *Error técnico*\n\n"
@@ -508,6 +543,28 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                     ),
                     parse_mode=ParseMode.MARKDOWN
                 )
+        
+        else:  # escalate_no_
+            session_id = data[len("escalate_no_"):]
+            logger.info(f"❌ Paciente RECHAZA escalar para session: {session_id}")
+            
+            await query.edit_message_text(
+                text=format_telegram_text(
+                    "📝 *Entendido*\n\n"
+                    "Respetamos tu decisión. Si más adelante deseas continuar con el escalamiento, "
+                    "puedes contactarnos nuevamente.\n\n"
+                    "✅ Tu caso queda registrado por si necesitas ayuda futura.\n\n"
+                    "¡Gracias por confiar en nosotros!"
+                ),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            # Cerrar sesión opcionalmente
+            try:
+                close_user_session(session_id, context, reason="user_declined_escalation")
+            except Exception as e:
+                logger.warning(f"Error cerrando sesión {session_id}: {e}")
+        
         return
 
     # Extraer session_id según el tipo de callback para otros callbacks

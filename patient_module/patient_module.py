@@ -32,62 +32,105 @@ class PatientModule:
         self.table = os.getenv('TABLE_ID')
         self.api_url = os.getenv('API_RECEPCIONISTA_URL')
 
-    def check_and_send_followups(self, today: date = None) -> None:
+    def check_and_send_followups(self, today: date = None, canal_filtro: str = None) -> None:
         """
         Envía mensajes de seguimiento usando session_id.
-        El escalamiento automático se delega completamente al ClaimManager.
+        Solo procesa la reclamación de nivel más alto por paciente.
         """
         tz_colombia = pytz.timezone('America/Bogota')
         today = datetime.now(tz_colombia).date()
         logger.info(f"🔍 Buscando reclamaciones pendientes para {today.isoformat()}")
 
+        canal_condition = ""
+        if canal_filtro:
+            if canal_filtro == "TL":
+                canal_condition = "AND (t.canal_contacto = 'TL' OR pres.id_session LIKE 'TL_%')"
+            elif canal_filtro == "WA":
+                canal_condition = "AND (t.canal_contacto = 'WA' OR pres.id_session LIKE 'WA_%')"
+
         sql = f"""
-        SELECT 
-            t.paciente_clave,
-            pres.user_id AS user_id,
-            pres.id_session AS session_id  --
-        FROM `{self.project}.{self.dataset}.{self.table}` AS t,
-             UNNEST(t.prescripciones) AS pres,
-             UNNEST(t.reclamaciones) AS rec
-        WHERE rec.fecha_revision = '{today.isoformat()}'
-          AND rec.estado_reclamacion != 'resuelto'
+        WITH reclamaciones_hoy AS (
+            SELECT 
+                t.paciente_clave,
+                pres.user_id AS user_id,
+                pres.id_session AS session_id,
+                t.canal_contacto,
+                rec.nivel_escalamiento,
+                rec.tipo_accion,
+                rec.fecha_revision,
+                rec.estado_reclamacion,
+                -- Obtener el nivel máximo por paciente
+                MAX(rec.nivel_escalamiento) OVER (PARTITION BY t.paciente_clave) AS max_nivel
+            FROM `{self.project}.{self.dataset}.{self.table}` AS t,
+                 UNNEST(t.prescripciones) AS pres,
+                 UNNEST(t.reclamaciones) AS rec
+            WHERE rec.fecha_revision = '{today.isoformat()}'
+              AND rec.estado_reclamacion != 'resuelto'
+              {canal_condition}
+        )
+        SELECT DISTINCT
+            paciente_clave,
+            user_id,
+            session_id,
+            canal_contacto
+        FROM reclamaciones_hoy 
+        WHERE nivel_escalamiento = max_nivel  -- Solo la reclamación de nivel más alto
         """
         logger.info(f"📝 SQL ejecutado: {sql}")
+        logger.info(f"🎯 Filtro de canal aplicado: {canal_filtro or 'TODOS'}")
 
         for row in self.bq.query(sql).result():
             user_id = row.user_id
             patient_key = row.paciente_clave
             session_id = row.session_id 
+            canal_detectado = getattr(row, 'canal_contacto', None)
+            
+            # 🔧 FALLBACK: Si canal_contacto es None, detectar por session_id prefix
+            if not canal_detectado:
+                if session_id.startswith("TL_"):
+                    canal_detectado = "TL"
+                elif session_id.startswith("WA_"):
+                    canal_detectado = "WA"
+                else:
+                    logger.warning(f"❓ Canal no detectado para session {session_id}")
+                    continue
+            
+            # 🔧 VERIFICACIÓN ADICIONAL: Si hay filtro, verificar que coincida
+            if canal_filtro and canal_detectado != canal_filtro:
+                logger.warning(f"⚠️ Session {session_id} ({canal_detectado}) no coincide con filtro {canal_filtro}")
+                continue
+            
+            logger.info(f"📧 Procesando {canal_detectado}: {patient_key} (session: {session_id})")
             
             try:
                 self.send_message(
                     user_id, session_id, 
                     "Hola, ¿ya le entregaron los medicamentos relacionados con su solicitud?",
                     buttons=[
-                        {"text": "✅ Sí", "callback_data": f"followup_yes_{session_id}"},   # ✅ USAR SESSION_ID
-                        {"text": "❌ No", "callback_data": f"followup_no_{session_id}"},    # ✅ USAR SESSION_ID
+                        {"text": "✅ Sí", "callback_data": f"followup_yes_{session_id}"},
+                        {"text": "❌ No", "callback_data": f"followup_no_{session_id}"},
                     ]
                 )
-                
-                # Determinar el identificador de usuario para logging
+
                 if session_id.startswith("WA_"):
                     phone_number = self._extract_phone_from_whatsapp_session(session_id)
                     user_identifier = f"WhatsApp:{phone_number}" if phone_number else f"WhatsApp:unknown"
                 else:
                     user_identifier = f"Telegram:{user_id}"
                 
-                logger.info(f"Mensaje enviado a {user_identifier} para session {session_id} (paciente {patient_key})")
+                logger.info(f"✅ Mensaje enviado a {user_identifier} para session {session_id} (paciente {patient_key})")
             except Exception as e:
-                logger.error(f"Error enviando mensaje: {e}")
+                logger.error(f"❌ Error enviando mensaje a {user_id}: {e}")
+                logger.error(f"❌ Session problemático: {session_id}")
+                logger.error(f"❌ Canal detectado: {canal_detectado}")
 
     def send_message(self, user_id: str, session_id: str, text: str, buttons: list = None) -> None:
         """Envía mensaje via API recepcionista."""
-        # Determinar el canal basado en el session_id
+       
         channel_prefix = self._get_channel_from_session(session_id)
         
         if channel_prefix == "WA":
-            # Para WhatsApp, extraer el número de teléfono desde el session_id
-            # Formato session_id: WA_573146748777_20250704_184334
+
             phone_number = self._extract_phone_from_whatsapp_session(session_id)
             if phone_number:
                 formatted_user_id = f"WA_{phone_number}"
@@ -95,12 +138,12 @@ class PatientModule:
                 logger.error(f"No se pudo extraer número de teléfono de session_id: {session_id}")
                 return
         else:
-            # Para Telegram, usar el formato tradicional
+
             formatted_user_id = f"TL_{user_id}"
         
         payload = {
             "user_id": formatted_user_id,
-            "session_id": session_id,  # ✅ USAR SESSION_ID REAL
+            "session_id": session_id, 
             "message": text
         }
         if buttons:
@@ -112,7 +155,6 @@ class PatientModule:
         try:
             resp = requests.post(f"{self.api_url}/send_message", json=payload)
 
-            # 🔍 LOG DE RESPUESTA
             logger.info(f"📥 Respuesta de recepcionista: {resp.status_code} - {resp.text}")
 
             if resp.status_code != 200:
@@ -120,18 +162,24 @@ class PatientModule:
         except Exception as e:
             logger.exception(f"❌ Excepción durante envío de mensaje: {e}")    
 
+    def check_telegram_followups(self, today: date = None) -> None:
+        """Procesa SOLO seguimientos de Telegram."""
+        logger.info("🔵 Procesando seguimientos de Telegram...")
+        self.check_and_send_followups(today, canal_filtro="TL")
+    
+    def check_whatsapp_followups(self, today: date = None) -> None:
+        """Procesa SOLO seguimientos de WhatsApp.""" 
+        logger.info("🟢 Procesando seguimientos de WhatsApp...")
+        self.check_and_send_followups(today, canal_filtro="WA")
 
     def _get_channel_from_session(self, session_id: str) -> str:
         """
-        Determina el canal (TL/WA) basándose en el session_id.
-        Busca en Firestore la información de la sesión para obtener el canal.
+        🔧 MEJORADO: Determina el canal consultando BigQuery y fallback a session_id prefix.
         """
         try:
-            # Consultar BigQuery para obtener información del canal desde prescripciones
+            # Intentar obtener canal_contacto de BigQuery
             sql = f"""
-            SELECT 
-                canal_contacto,
-                user_id
+            SELECT canal_contacto
             FROM `{self.project}.{self.dataset}.{self.table}` AS t,
                  UNNEST(t.prescripciones) AS pres
             WHERE pres.id_session = '{session_id}'
@@ -141,42 +189,25 @@ class PatientModule:
             results = self.bq.query(sql).result()
             for row in results:
                 canal_contacto = row.canal_contacto
-                user_id = row.user_id
-                
-                # Determinar canal basado en canal_contacto o user_id
-                if canal_contacto == "WA" or (user_id and user_id.startswith("WA_")):
-                    return "WA"
-                else:
-                    return "TL"
+                if canal_contacto in ["WA", "TL"]:
+                    return canal_contacto
             
-            # Si no se encuentra en prescripciones, buscar en reclamaciones
-            sql_rec = f"""
-            SELECT 
-                t.prescripciones[SAFE_OFFSET(0)].canal_contacto as canal_contacto,
-                t.prescripciones[SAFE_OFFSET(0)].user_id as user_id
-            FROM `{self.project}.{self.dataset}.{self.table}` AS t,
-                 UNNEST(t.reclamaciones) AS rec
-            WHERE rec.id_session = '{session_id}'
-            LIMIT 1
-            """
-            
-            results_rec = self.bq.query(sql_rec).result()
-            for row in results_rec:
-                canal_contacto = row.canal_contacto
-                user_id = row.user_id
-                
-                if canal_contacto == "WA" or (user_id and user_id.startswith("WA_")):
-                    return "WA"
-                else:
-                    return "TL"
-            
-            # Por defecto, asumir Telegram
-            logger.warning(f"No se pudo determinar canal para session_id {session_id}, asumiendo Telegram")
-            return "TL"
+            # Si no se encuentra o es None, usar session_id prefix
+            if session_id.startswith("WA_"):
+                return "WA"
+            elif session_id.startswith("TL_"):
+                return "TL"
+            else:
+                logger.warning(f"Canal no detectado para session_id {session_id}, asumiendo Telegram")
+                return "TL"
             
         except Exception as e:
             logger.error(f"Error determinando canal para session_id {session_id}: {e}")
-            return "TL"  # Fallback a Telegram
+            # Fallback a session_id prefix
+            if session_id.startswith("WA_"):
+                return "WA"
+            else:
+                return "TL"
 
     def _extract_phone_from_whatsapp_session(self, session_id: str) -> Optional[str]:
         """

@@ -2072,3 +2072,46 @@ def validar_datos_tutela_completos(patient_key: str) -> Dict[str, Any]:
             "error": str(e),
             "campos_faltantes": REQUIRED_TUTELA_FIELDS
         }
+    
+def determinar_tipo_reclamacion_siguiente(session_id: str) -> str:
+    """
+    Determina qué tipo de reclamación seguiría si el paciente acepta escalar.
+    
+    """
+    try:
+        # Usar funciones existentes sin modificarlas
+        patient_key = _obtener_patient_key_por_session_id(session_id)
+        if not patient_key:
+            return "una nueva reclamación"
+        
+        datos_paciente = _obtener_datos_paciente_para_escalamiento(patient_key)
+        if not datos_paciente:
+            return "una nueva reclamación"
+        
+        decision_escalamiento = _determinar_siguiente_escalamiento_automatico(datos_paciente)
+        
+        if decision_escalamiento["accion"] == "generar":
+            tipo = decision_escalamiento["tipo"]
+            
+            # Mapear tipos técnicos a texto legible
+            if tipo == "reclamacion_eps":
+                return "una reclamación ante tu EPS"
+            elif tipo == "reclamacion_supersalud":
+                return "una reclamación ante Supersalud"
+            elif tipo == "tutela":
+                return "una acción de tutela"
+            elif tipo == "desacato":
+                return "un incidente de desacato"
+            
+        elif decision_escalamiento["accion"] == "generar_multiple":
+            tipos = decision_escalamiento.get("tipos", [])
+            if "reclamacion_eps" in tipos and "reclamacion_supersalud" in tipos:
+                return "reclamaciones ante tu EPS y Supersalud"
+            else:
+                return "múltiples reclamaciones"
+        
+        return "una nueva reclamación"
+        
+    except Exception as e:
+        logger.error(f"Error determinando tipo de reclamación siguiente para session {session_id}: {e}")
+        return "una nueva reclamación"
