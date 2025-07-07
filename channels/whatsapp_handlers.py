@@ -10,6 +10,7 @@ try:
     from BYC.consentimiento import ConsentManager
     from processor_image_prescription.pip_processor import PIPProcessor
     from claim_manager.data_collection import ClaimManager
+    from claim_manager.claim_generator import generar_desacato
     from patient_module.patient_module import PatientModule
 except ImportError as e:
     print(f"Error al importar módulos: {e}")
@@ -1364,55 +1365,75 @@ class WhatsAppMessageHandler:
         except Exception as e:
             self.logger.error(f"Error verificando escalamiento automático: {e}")
 
-    async def handle_tutela_field_response(self, phone_number: str, message_text: str, session_context: Dict[str, Any]) -> bool:
-        """
-        Maneja la respuesta del usuario para un campo pendiente del flujo de tutela.
-        """
-
+    async def handle_tutela_field_response(self, phone, message, session_context):
         patient_key = session_context.get("patient_key")
-        if not patient_key:
-            await self._send_text_message(phone_number, "⚠️ No encontré tu información de paciente. Por favor inicia de nuevo.")
+        waiting = session_context.get("waiting_for_tutela_field")
+        if not (patient_key and waiting):
             return False
 
-        waiting_field = session_context.get("waiting_for_tutela_field")
-        if not waiting_field:
-            return False  # No estamos esperando un campo específico
-
-        datos_tutela = session_context.get("datos_tutela", {})
-
-        # Guardar el campo que acaba de responder el usuario
-        datos_tutela[waiting_field] = message_text.strip()
-        session_context["datos_tutela"] = datos_tutela
-        self._update_session_context(phone_number, session_context)
-
-        # Obtener el siguiente campo pendiente
-        try:
-            next_prompt = self.claim_manager.get_next_missing_tutela_field_prompt(patient_key, datos_tutela)
-        except Exception as e:
-            self.logger.error(f"Error al obtener siguiente campo de tutela: {e}", exc_info=True)
-            await self._send_text_message(phone_number, "Ocurrió un error procesando tu información. Intenta más tarde.")
-            return True
-
-        if next_prompt["field_name"]:
-            # Aún falta al menos un campo
-            session_context["waiting_for_tutela_field"]
-            self._update_session_context(phone_number, session_context)
-
-            await self._send_text_message(phone_number, next_prompt["prompt_text"])
-            return True
+        # 1) Acumular en tutel​a_data_temp (no en datos_tutela)
+        temp = session_context.get("tutela_data_temp", {})
+        # Normaliza fechas si toca
+        if waiting in ["fecha_sentencia", "fecha_radicacion_tutela"]:
+            norm = self.claim_manager._normalize_date(message)
+            if not norm:
+                await self._send_text_message(phone, 
+                    "❌ Formato de fecha inválido. Usa DD/MM/AAAA.")
+                return True
+            temp[waiting] = norm
         else:
-            # Todos los campos han sido recolectados, guardar la tutela
-            try:
-                success = self.claim_manager.save_tutela_data_simple(patient_key, datos_tutela)
-                session_context.pop("waiting_for_field", None)
-                self._update_session_context(phone_number, session_context)
+            temp[waiting] = message.strip()
+        session_context["tutela_data_temp"] = temp
+        self._update_session_context(phone, session_context)
 
-                if success:
-                    await self._send_text_message(phone_number, "✅ ¡Gracias! Ya tengo toda la información de tu tutela y procederé con el desacato.")
-                else:
-                    await self._send_text_message(phone_number, "⚠️ No pude guardar tu información. Intenta nuevamente.")
-            except Exception as e:
-                self.logger.error(f"Error guardando datos de tutela: {e}", exc_info=True)
-                await self._send_text_message(phone_number, "Ocurrió un error técnico al guardar tu información.")
+        # 2) Pedir siguiente
+        next_prompt = self.claim_manager.get_next_missing_tutela_field_prompt(patient_key, temp)
+        if next_prompt.get("field_name"):
+            session_context["waiting_for_tutela_field"] = next_prompt["field_name"]
+            self._update_session_context(phone, session_context)
+            await self._send_text_message(phone, next_prompt["prompt_text"])
             return True
+
+        # 3) Si ya no faltan más, limpiar y generar desacato
+        session_context.pop("waiting_for_tutela_field", None)
+        session_context.pop("tutela_data_temp",       None)
+        self._update_session_context(phone, session_context)
+
+        success = self.claim_manager.save_tutela_data_simple(patient_key, temp)
+        if success:
+            await self._send_text_message(phone, 
+                "✅ Datos de tutela guardados. 🔄 Generando incidente de desacato...")
+   
+            # 2) Generar el desacato
+            # usar los datos que en Firestore que se guardaron en 'tutela_data_temp'
+            desv_data = session_context.get("tutela_data_temp", {})
+            resultado_desacato = generar_desacato(patient_key, desv_data)
+
+            # 3) Guardar la reclamación de desacato
+            if resultado_desacato.get("success"):
+                guardado = await self._save_reclamation_to_database(
+                    patient_key=patient_key,
+                    tipo_accion="desacato",
+                    texto_reclamacion=resultado_desacato["texto_reclamacion"],
+                    estado_reclamacion="pendiente_radicacion",
+                    nivel_escalamiento=5,
+                    session_id=session_context.get("session_id", ""),
+                    resultado_claim_generator=resultado_desacato
+                )
+                if guardado:
+                    await self._send_text_message(phone,
+                        "🎉 ¡Desacato generado y guardado exitosamente!")
+                else:
+                    await self._send_text_message(phone,
+                        "⚠️ Desacato generado, pero hubo un error guardándolo.")
+            else:
+                await self._send_text_message(phone,
+                    "❌ Error generando tu desacato automáticamente.")
+
+
+        else:
+            await self._send_text_message(phone, 
+                "⚠️ No pude guardar los datos de tu tutela. Intenta nuevamente.")
+        return True
+
             
