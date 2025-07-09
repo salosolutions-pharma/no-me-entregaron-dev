@@ -5,7 +5,10 @@ from typing import Any, Dict, List, Optional
 import json
 
 from channels.whatsapp_business_api import WhatsAppBusinessAPIClient, WhatsAppBusinessAPIError
-
+from typing import Dict, Any
+from google.cloud import firestore
+import asyncio 
+from google.api_core.exceptions import AlreadyExists
 try:
     from BYC.consentimiento import ConsentManager
     from processor_image_prescription.pip_processor import PIPProcessor
@@ -168,7 +171,7 @@ class WhatsAppMessageHandler:
             elif callback_data.startswith("followup_"):
                 await self._handle_followup_response(phone_number, callback_data, session_context)
             elif callback_data.startswith("escalate_"):
-                await self._handle_followup_response(phone_number, callback_data, session_context)
+                await self._handle_escalate_response(phone_number, callback_data, session_context)
             else:
                 await self._send_text_message(phone_number, "Acción no reconocida. Por favor, intenta de nuevo.")
 
@@ -452,6 +455,9 @@ class WhatsAppMessageHandler:
                 update_fields["waiting_for_tutela_field"] = context["waiting_for_tutela_field"]
             if "tutela_data_temp" in context:
                 update_fields["tutela_data_temp"] = context["tutela_data_temp"]
+            if "last_escalate_cb" in context:
+                update_fields["last_escalate_cb"] = context["last_escalate_cb"]
+    
 
     
             
@@ -873,142 +879,173 @@ class WhatsAppMessageHandler:
                         "❌ Error mostrando opciones de escalamiento."
                     )
 
-            elif callback_data.startswith("escalate_yes_") or callback_data.startswith("escalate_no_"):
-                if callback_data.startswith("escalate_yes_"):
-                    session_id = callback_data[len("escalate_yes_"):]
-                    self.logger.info(f"✅ Paciente ACEPTA escalar para session: {session_id}")
-                    
-                    await self._send_text_message(
-                        phone_number,
-                        "🔄 *Procesando escalamiento...*\n\nEvaluando el mejor siguiente paso para tu caso."
-                    )
-                    
-                    try:
-
-                        from claim_manager.claim_generator import auto_escalate_patient
-                        resultado = auto_escalate_patient(session_id)
-                        self.logger.info(f"[WA] Resultado auto_escalate_patient: {resultado}")
-
-                       
-                        if resultado.get("requiere_recoleccion_tutela") and resultado.get("tipo") == "desacato":
-                            patient_key = resultado["patient_key"]
-                            
-                    
-                            datos_existentes = self.claim_manager.get_existing_tutela_data(patient_key)
-                            
-                            if datos_existentes:
-                                
-                                from claim_manager.claim_generator import generar_desacato
-                                resultado_desacato = generar_desacato(patient_key, datos_existentes)
-                                
-                                if resultado_desacato.get("success"):
-                                    await self._send_text_message(
-                                        phone_number,
-                                        "✅ *Desacato generado exitosamente*\n\n"
-                                        f"Nivel de escalamiento: *5*\n\n"
-                                        "Tu incidente de desacato ha sido preparado automáticamente usando los datos de tu tutela previa."
-                                    )
-                                else:
-                                    await self._send_text_message(
-                                        phone_number,
-                                        "❌ Error generando desacato automáticamente."
-                                    )
-                            else:
-                              
-                                field_prompt = self.claim_manager.get_next_missing_tutela_field_prompt(patient_key, {})
-                                
-                                await self._send_text_message(
-                                    phone_number,
-                                    "🔄 *Para proceder con el desacato necesito datos de tu tutela:*\n\n"
-                                    f"{field_prompt['prompt_text']}"
-                                )
-                                
-                        
-                                session_context["waiting_for_tutela_field"] = field_prompt["field_name"]
-                                session_context["patient_key"] = patient_key
-                                session_context["tutela_data_temp"] = {}
-                                self._update_session_context(phone_number, session_context)
-                            
-                            return
-                        
-                        if resultado.get("success"):
-                            tipo = resultado.get("tipo", "escalamiento")
-                            razon = resultado.get("razon", "")
-                            nivel = resultado.get("nivel_escalamiento", "")
-                            patient_key = resultado.get("patient_key", "")
-                            
-                            self.logger.info(f"✅ Escalamiento exitoso para session {session_id} → patient {patient_key}: {tipo}")
-                            
-                            if tipo == "sin_escalamiento":
-                                await self._send_text_message(
-                                    phone_number,
-                                    "📋 *Caso en revisión*\n\n"
-                                    "Tu caso está siendo revisado por nuestro equipo especializado.\n"
-                                    "Te contactaremos pronto con actualizaciones."
-                                )
-                                
-                            elif tipo.startswith("multiple_"):
-                                
-                                tipos_generados = tipo.replace("multiple_", "").replace("_", " y ").replace("reclamacion", "reclamación")
-                                await self._send_text_message(
-                                    phone_number,
-                                    f"✅ *Escalamiento múltiple exitoso*\n\n"
-                                    f"Se han generado: *{tipos_generados}*\n"
-                                    f"Nivel de escalamiento: *{nivel}*\n\n"
-                                    f"📋 *Motivo:* {razon}\n\n"
-                                    f"Nuestro equipo procesará ambas reclamaciones y te mantendremos informado."
-                                )
-                            else:
-                             
-                                tipo_legible = tipo.replace("_", " ").replace("reclamacion", "reclamación").title()
-                                await self._send_text_message(
-                                    phone_number,
-                                    f"✅ *{tipo_legible} generada exitosamente*\n\n"
-                                    f"Nivel de escalamiento: *{nivel}*\n\n"
-                                    f"📋 *Motivo:* {razon}\n\n"
-                                    f"Tu caso ha sido escalado automáticamente. Nuestro equipo procesará tu solicitud y te mantendremos informado del progreso."
-                                )
-                        else:
-                            error = resultado.get("error", "Error desconocido")
-                            self.logger.error(f"Error en escalamiento automático para session {session_id}: {error}")
-                            await self._send_text_message(
-                                phone_number,
-                                "⚠️ *Error en escalamiento automático*\n\n"
-                                "Hubo un problema procesando tu caso automáticamente.\n"
-                                "Nuestro equipo revisará tu solicitud manualmente y te contactará pronto."
-                            )
-                            
-                    except Exception as e:
-                        self.logger.error(f"Error ejecutando escalamiento para session {session_id}: {e}")
-                        await self._send_text_message(
-                            phone_number,
-                            "❌ *Error técnico*\n\n"
-                            "Ocurrió un problema técnico procesando tu escalamiento.\n"
-                            "Por favor contacta a nuestro equipo de soporte."
-                        )
-                
-                else:  
-                    session_id = callback_data[len("escalate_no_"):]
-                    self.logger.info(f"❌ Paciente RECHAZA escalar para session: {session_id}")
-                    
-                    await self._send_text_message(
-                        phone_number,
-                        "📝 *Entendido*\n\n"
-                        "Respetamos tu decisión. Si más adelante deseas continuar con el escalamiento, "
-                        "puedes contactarnos nuevamente.\n\n"
-                        "✅ Tu caso queda registrado por si necesitas ayuda futura.\n\n"
-                        "¡Gracias por confiar en nosotros!"
-                    )
-                    
-                 
-                    try:
-                        self._close_user_session(session_id, phone_number, reason="user_declined_escalation")
-                    except Exception as e:
-                        self.logger.warning(f"Error cerrando sesión {session_id}: {e}")
                     
         except Exception as e:
             self.logger.error(f"Error manejando followup de WhatsApp: {e}")
             await self._send_text_message(phone_number, "Error procesando tu respuesta. Intenta nuevamente.")
+      
+
+    async def _handle_escalate_response(self, phone_number: str, callback_data: str, session_context: Dict[str, Any]) -> None:
+        """Maneja respuestas de escalamiento (escalate_yes_, escalate_no_)."""
+         
+        sm = self.consent_manager.session_manager
+        db = sm.db                                         # cliente ya conectado a "historia"
+        dedup_ref = db.collection("wa_callbacks").document(callback_data)
+
+        loop = asyncio.get_running_loop()
+
+        def _try_create():
+            try:
+                dedup_ref.create({"ts": firestore.SERVER_TIMESTAMP})
+                return True           # primera vez
+            except AlreadyExists:
+                return False          # duplicado
+
+        is_first = await loop.run_in_executor(None, _try_create)
+
+        if not is_first:
+            self.logger.warning("⚠️ Callback duplicado ignorado")
+            return                   # ✋ salimos SIN escalar
+        
+        
+        try:
+            
+            if callback_data.startswith("escalate_yes_"):
+                session_id = callback_data[len("escalate_yes_"):]
+                self.logger.info(f"✅ Paciente ACEPTA escalar para session: {session_id}")
+                await self._send_text_message(
+                        phone_number,
+                        "🔄 *Procesando escalamiento...*\n\nEvaluando el mejor siguiente paso para tu caso."
+                    )
+                
+                try:
+                    from claim_manager.claim_generator import auto_escalate_patient
+                    resultado = auto_escalate_patient(session_id)
+                    self.logger.info(f"[WA] Resultado auto_escalate_patient: {resultado}")
+                    
+                    if resultado.get("requiere_recoleccion_tutela") and resultado.get("tipo") == "desacato":
+                        patient_key = resultado["patient_key"]
+                        
+                
+                        datos_existentes = self.claim_manager.get_existing_tutela_data(patient_key)
+                        
+                        if datos_existentes:
+                            
+                            from claim_manager.claim_generator import generar_desacato
+                            resultado_desacato = generar_desacato(patient_key, datos_existentes)
+                            
+                            if resultado_desacato.get("success"):
+                                await self._send_text_message(
+                                    phone_number,
+                                    "✅ *Desacato generado exitosamente*\n\n"
+                                    f"Nivel de escalamiento: *5*\n\n"
+                                    "Tu incidente de desacato ha sido preparado automáticamente usando los datos de tu tutela previa."
+                                )
+                            else:
+                                await self._send_text_message(
+                                    phone_number,
+                                    "❌ Error generando desacato automáticamente."
+                                )
+                        else:
+                            
+                            field_prompt = self.claim_manager.get_next_missing_tutela_field_prompt(patient_key, {})
+                            
+                            await self._send_text_message(
+                                phone_number,
+                                "🔄 *Para proceder con el desacato necesito datos de tu tutela:*\n\n"
+                                f"{field_prompt['prompt_text']}"
+                            )
+                            
+                    
+                            session_context["waiting_for_tutela_field"] = field_prompt["field_name"]
+                            session_context["patient_key"] = patient_key
+                            session_context["tutela_data_temp"] = {}
+                            self._update_session_context(phone_number, session_context)
+                        
+                        return
+                    
+                    if resultado.get("success"):
+                        tipo = resultado.get("tipo", "escalamiento")
+                        razon = resultado.get("razon", "")
+                        nivel = resultado.get("nivel_escalamiento", "")
+                        patient_key = resultado.get("patient_key", "")
+                        
+                        self.logger.info(f"✅ Escalamiento exitoso para session {session_id} → patient {patient_key}: {tipo}")
+                        
+                        if tipo == "sin_escalamiento":
+                            await self._send_text_message(
+                                phone_number,
+                                f"Caso en revision."
+                                f"Te contactaremos pronto para darle seguimiento al proceso."
+                            )
+                        elif tipo.startswith("multiple_"):
+                            
+                            tipos_generados = tipo.replace("multiple_", "").replace("_", " y ").replace("reclamacion", "reclamación")
+                            await self._send_text_message(
+                                phone_number,
+                                f"✅ *Escalamiento múltiple exitoso*\n\n"
+                                f"Se han generado: *{tipos_generados}*\n"
+                                f"Nivel de escalamiento: *{nivel}*\n\n"
+                                f"📋 *Motivo:* {razon}\n\n"
+                                f"Nuestro equipo procesará ambas reclamaciones y te mantendremos informado."
+                            )
+                        else:
+                            
+                            tipo_legible = tipo.replace("_", " ").replace("reclamacion", "reclamación").title()
+                            await self._send_text_message(
+                                phone_number,
+                                f"✅ *{tipo_legible} generada exitosamente*\n\n"
+                                f"Nivel de escalamiento: *{nivel}*\n\n"
+                                f"📋 *Motivo:* {razon}\n\n"
+                                f"Tu caso ha sido escalado automáticamente. Nuestro equipo procesará tu solicitud y te mantendremos informado del progreso."
+                            )
+                    else:
+                        error = resultado.get("error", "Error desconocido")
+                        self.logger.error(f"Error en escalamiento automático para session {session_id}: {error}")
+                        await self._send_text_message(
+                            phone_number,
+                            "⚠️ *Error en escalamiento automático*\n\n"
+                            "Hubo un problema procesando tu caso automáticamente.\n"
+                            "Nuestro equipo revisará tu solicitud manualmente y te contactará pronto."
+                        )
+                        
+                except Exception as e:
+                    self.logger.error(f"Error ejecutando escalamiento para session {session_id}: {e}")
+                    await self._send_text_message(
+                        phone_number,
+                        "❌ *Error técnico*\n\n"
+                        "Ocurrió un problema técnico procesando tu escalamiento.\n"
+                        "Por favor contacta a nuestro equipo de soporte."
+                    )
+            
+            elif callback_data.startswith("escalate_no_"):
+                session_id = callback_data[len("escalate_no_"):]
+                self.logger.info(f"❌ Paciente RECHAZA escalar para session: {session_id}")
+                
+                await self._send_text_message(
+                    phone_number,
+                    "📝 *Entendido*\n\n"
+                    "Respetamos tu decisión. Si más adelante deseas continuar con el escalamiento, "
+                    "puedes contactarnos nuevamente.\n\n"
+                    "✅ Tu caso queda registrado por si necesitas ayuda futura.\n\n"
+                    "¡Gracias por confiar en nosotros!"
+                )
+                
+                
+                try:
+                    self._close_user_session(session_id, phone_number, reason="user_declined_escalation")
+                except Exception as e:
+                    self.logger.warning(f"Error cerrando sesión {session_id}: {e}")
+        finally:
+            async def _del_later():
+                await asyncio.sleep(60)
+                try:
+                    await loop.run_in_executor(None, dedup_ref.delete)
+                except Exception as e:
+                    self.logger.debug(f"No pude borrar dedup {dedup_ref.id}: {e}")
+
+            asyncio.create_task(_del_later())           
+
 
     async def _ask_about_current_medication(self, phone_number: str, session_context: Dict[str, Any]) -> None:
         """Pregunta sobre el medicamento actual en la iteración."""

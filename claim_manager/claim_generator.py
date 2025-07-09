@@ -1588,12 +1588,105 @@ def _determinar_siguiente_escalamiento_automatico(datos_paciente: Dict) -> Dict[
         if estado_actual == 'resuelto':
             return {"accion": "mantener", "razon": "Caso resuelto"}
         
+        # VERIFICACIÓN TEMPORAL: Prevenir escalamiento inmediato después de escalamiento múltiple
+        if nivel_actual == 3 and tipo_actual in ["reclamacion_eps", "reclamacion_supersalud"]:
+            from datetime import datetime, timedelta
+            import pytz
+            
+            # Obtener fecha de la última reclamación
+            fecha_radicacion = ultima_reclamacion.get('fecha_radicacion')
+            
+            if fecha_radicacion:
+                try:
+                    # Convertir string a datetime si es necesario
+                    if isinstance(fecha_radicacion, str):
+                        fecha_radicacion = datetime.strptime(fecha_radicacion, '%Y-%m-%d').date()
+                    elif hasattr(fecha_radicacion, 'date'):
+                        fecha_radicacion = fecha_radicacion.date()
+                    
+                    # Obtener fecha actual en Colombia
+                    colombia_tz = pytz.timezone('America/Bogota')
+                    fecha_actual = datetime.now(colombia_tz).date()
+                    
+                    # Si la reclamación se creó hoy, no escalar inmediatamente
+                    if fecha_radicacion == fecha_actual:
+                        return {
+                            "accion": "mantener", 
+                            "razon": f"Escalamiento múltiple nivel 3 recién completado hoy ({fecha_actual}). Esperando plazo."
+                        }
+                        
+                except Exception as e:
+                    # Si hay error con fechas, continuar con lógica normal
+                    logger.warning(f"Error verificando fecha de escalamiento múltiple: {e}")
+        
         # Evaluar según categoría de riesgo usando la lógica original
         if categoria_riesgo == "simple":
             return _evaluar_escalamiento_simple(nivel_actual, tipo_actual)
         elif categoria_riesgo == "priorizado":
+            # VERIFICACIÓN TEMPORAL: Prevenir escalamiento inmediato después de escalamiento múltiple (PRIORIZADO)
+            if nivel_actual == 3 and tipo_actual in ["reclamacion_eps", "reclamacion_supersalud"]:
+                from datetime import datetime, timedelta
+                import pytz
+                
+                # Obtener fecha de la última reclamación
+                fecha_radicacion = ultima_reclamacion.get('fecha_radicacion')
+                
+                if fecha_radicacion:
+                    try:
+                        # Convertir string a datetime si es necesario
+                        if isinstance(fecha_radicacion, str):
+                            fecha_radicacion = datetime.strptime(fecha_radicacion, '%Y-%m-%d').date()
+                        elif hasattr(fecha_radicacion, 'date'):
+                            fecha_radicacion = fecha_radicacion.date()
+                        
+                        # Obtener fecha actual en Colombia
+                        colombia_tz = pytz.timezone('America/Bogota')
+                        fecha_actual = datetime.now(colombia_tz).date()
+                        
+                        # Si la reclamación se creó hoy, no escalar inmediatamente
+                        if fecha_radicacion == fecha_actual:
+                            return {
+                                "accion": "mantener", 
+                                "razon": f"Escalamiento múltiple nivel 3 PRIORIZADO recién completado hoy ({fecha_actual}). Esperando plazo."
+                            }
+                            
+                    except Exception as e:
+                        # Si hay error con fechas, continuar con lógica normal
+                        logger.warning(f"Error verificando fecha de escalamiento múltiple PRIORIZADO: {e}")
+            
             return _evaluar_escalamiento_priorizado(nivel_actual, tipo_actual)
         elif categoria_riesgo == "vital":
+            # VERIFICACIÓN TEMPORAL: Prevenir escalamiento inmediato después de escalamiento múltiple (VITAL)
+            if nivel_actual == 3 and tipo_actual == "tutela":
+                from datetime import datetime, timedelta
+                import pytz
+                
+                # Obtener fecha de la última reclamación
+                fecha_radicacion = ultima_reclamacion.get('fecha_radicacion')
+                
+                if fecha_radicacion:
+                    try:
+                        # Convertir string a datetime si es necesario
+                        if isinstance(fecha_radicacion, str):
+                            fecha_radicacion = datetime.strptime(fecha_radicacion, '%Y-%m-%d').date()
+                        elif hasattr(fecha_radicacion, 'date'):
+                            fecha_radicacion = fecha_radicacion.date()
+                        
+                        # Obtener fecha actual en Colombia
+                        colombia_tz = pytz.timezone('America/Bogota')
+                        fecha_actual = datetime.now(colombia_tz).date()
+                        
+                        # Si la reclamación se creó hoy, no escalar inmediatamente
+                        if fecha_radicacion == fecha_actual:
+                            return {
+                                "accion": "mantener", 
+                                "razon": f"Escalamiento nivel 3 VITAL recién completado hoy ({fecha_actual}). Esperando plazo."
+                            }
+                            
+                    except Exception as e:
+                        # Si hay error con fechas, continuar con lógica normal
+                        logger.warning(f"Error verificando fecha de escalamiento VITAL: {e}")
+            
             return _evaluar_escalamiento_vital(nivel_actual, tipo_actual)
         
         return {"accion": "error", "razon": "Categoría de riesgo no reconocida"}
