@@ -2004,6 +2004,11 @@ def _guardar_escalamiento_individual(client, patient_key: str, resultado: Dict, 
         elif "desacato" in tipo:
             dias_revision = 10
         
+        if "tutela" in tipo or "desacato" in tipo:
+            fecha_radic_expr = "DATE_ADD(CURRENT_DATE(), INTERVAL 2 DAY)"
+        else:
+            fecha_radic_expr = "NULL"
+
         estado_update_logic = f"""
             CASE
                 -- Cuando se genera desacato (nivel 5), marcar tutela (nivel 4) como escalada
@@ -2026,38 +2031,41 @@ def _guardar_escalamiento_individual(client, patient_key: str, resultado: Dict, 
         """
 
         sql = f"""
-        UPDATE `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}` AS t
-        SET reclamaciones = ARRAY_CONCAT(
-            ARRAY(
-                SELECT AS STRUCT
-                    r.med_no_entregados,
-                    r.tipo_accion,
-                    r.texto_reclamacion,
-                    {estado_update_logic} AS estado_reclamacion,
-                    r.nivel_escalamiento,
-                    r.url_documento,
-                    r.numero_radicado,
-                    r.fecha_radicacion,
-                    r.fecha_revision,
-                    r.id_session
-                FROM UNNEST(t.reclamaciones) AS r
-            ),
-            [STRUCT(
-                '{resultado.get("medicamentos_afectados", "")}' AS med_no_entregados,
-                '{tipo}' AS tipo_accion,
-                '''{texto_escaped}''' AS texto_reclamacion,
-                'pendiente_radicacion' AS estado_reclamacion,
-                {nivel} AS nivel_escalamiento,
-                '{pdf_url}' AS url_documento,  -- ✅ INCLUIR PDF URL
-                '' AS numero_radicado,
-                CURRENT_DATE() AS fecha_radicacion,
-                DATE_ADD(CURRENT_DATE(), INTERVAL {dias_revision} DAY) AS fecha_revision,
-                '{current_session_id}' AS id_session
-            )]
-        )
-        WHERE paciente_clave = '{patient_key}'
+            UPDATE `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}` AS t
+            SET reclamaciones = ARRAY_CONCAT(
+                ARRAY(
+                    SELECT AS STRUCT
+                        r.med_no_entregados,
+                        r.tipo_accion,
+                        r.texto_reclamacion,
+                        {estado_update_logic} AS estado_reclamacion,
+                        r.nivel_escalamiento,
+                        r.url_documento,
+                        r.numero_radicado,
+                        r.fecha_radicacion,
+                        r.fecha_revision,
+                        r.id_session
+                    FROM UNNEST(t.reclamaciones) AS r
+                ),
+                ARRAY(
+                    SELECT AS STRUCT
+                        CAST('{resultado.get("medicamentos_afectados", "")}' AS STRING) AS med_no_entregados,
+                        CAST('{tipo}' AS STRING) AS tipo_accion,
+                        CAST('''{texto_escaped}''' AS STRING) AS texto_reclamacion,
+                        CAST('pendiente_radicacion' AS STRING) AS estado_reclamacion,
+                        CAST({nivel} AS INT64) AS nivel_escalamiento,
+                        CAST('{pdf_url}' AS STRING) AS url_documento,
+                        CAST('' AS STRING) AS numero_radicado,
+                        CAST({fecha_radic_expr} AS DATE) AS fecha_radicacion,
+                        DATE_ADD(CAST({fecha_radic_expr} AS DATE), INTERVAL {dias_revision} DAY) AS fecha_revision,
+                        CAST('{current_session_id}' AS STRING) AS id_session
+                )
+            )
+            WHERE paciente_clave = '{patient_key}'
         """
-        
+
+
+        logger.info(f"fecha_radicacion {fecha_radic_expr}")
         client.query(sql).result()
         logger.info(f"✅ Escalamiento {tipo} guardado para {patient_key} en nivel {nivel} con PDF: {pdf_url}")
         return True
