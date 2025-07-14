@@ -3,7 +3,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import json
-
+import re
 from channels.whatsapp_business_api import WhatsAppBusinessAPIClient, WhatsAppBusinessAPIError
 from typing import Dict, Any
 from google.cloud import firestore
@@ -19,6 +19,27 @@ except ImportError as e:
     print(f"Error al importar módulos: {e}")
 
 logger = logging.getLogger(__name__)
+
+def format_whatsapp_text(message: str) -> str:
+    """
+    Formatea el texto para que sea compatible con el markdown nativo de WhatsApp.
+    """
+    if not message:
+        return message
+    
+    # Cambia **negrita** por *negrita* (formato Telegram/Slack → WhatsApp)
+    message = re.sub(r'\*\*(.*?)\*\*', r'*\1*', message)
+    
+    # Reemplaza enlaces markdown [texto](url) por texto (url)
+    message = re.sub(r'\[(.*?)\]\((.*?)\)', r'\1 (\2)', message)
+    
+    # Reemplaza __subrayado__ por texto simple (WhatsApp no lo soporta)
+    message = re.sub(r'__(.*?)__', r'\1', message)
+    
+    # Opcional: Limpia triple asteriscos ***texto*** → *texto*
+    message = re.sub(r'\*\*\*(.*?)\*\*\*', r'*\1*', message)
+    
+    return message
 
 class WhatsAppMessageHandler:
     """Maneja los diferentes tipos de mensajes de WhatsApp."""
@@ -480,9 +501,10 @@ class WhatsAppMessageHandler:
         """Envía un mensaje de texto."""
         try:
             normalized_phone = self.wa_client.validate_phone_number(phone_number)
-            self.wa_client.send_text_message(normalized_phone, message)
+            formatted_message = format_whatsapp_text(message)
+            self.wa_client.send_text_message(normalized_phone, formatted_message)
             self.logger.info(f"Mensaje enviado a {phone_number}")
-            self.logger.info(f"Contenido Mensaje {message}")
+            self.logger.info(f"Contenido Mensaje {formatted_message}")
         except WhatsAppBusinessAPIError as e:
             self.logger.error(f"Error enviando mensaje a {phone_number}: {e}")
 
@@ -1309,23 +1331,20 @@ class WhatsAppMessageHandler:
 
                         if supersalud_disponible.get("disponible"):
                             success_message = (
-                                "🎉 ¡Perfecto! Ya tenemos toda la información necesaria para radicar tu reclamación.\n\n"
-                                "📄 **Reclamación EPS generada exitosamente**\n\n"
+                                "🎉 ¡Perfecto!Reclamación EPS generada exitosamente.\n\n"
                                 "📋 En las próximas 48 horas te enviaremos el número de radicado.\n\n"
-                                "🔄 **Sistema de escalamiento activado:**\n"
-                                "• Si no hay respuesta en el plazo establecido, automáticamente escalaremos tu caso a la Superintendencia Nacional de Salud\n"
-                                "• Te mantendremos informado en cada paso del proceso\n\n"
-                                "✅ Proceso completado exitosamente. Si necesitas algo más, no dudes en contactarnos.\n\n"
-                                 "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                                "📅 Cuando se cumpla el plazo de respuesta, te contactaremos para verificar si recibiste tus medicamentos.\n\n"
+                                "✅ Proceso completado. Te mantendremos informado del progreso. ¡Gracias por confiar en nosotros!"
                             )
+
                         else:
                             success_message = (
-                                "🎉 ¡Perfecto! Ya tenemos toda la información necesaria para radicar tu reclamación.\n\n"
-                                "📄 **Reclamación EPS generada exitosamente**\n\n"
+                                "🎉 ¡Perfecto!Reclamación EPS generada exitosamente.\n\n"
                                 "📋 En las próximas 48 horas te enviaremos el número de radicado.\n\n"
-                                "✅ Proceso completado exitosamente. Si necesitas algo más, no dudes en contactarnos.\n\n"
-                                "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
+                                "📅 Cuando se cumpla el plazo de respuesta, te contactaremos para verificar si recibiste tus medicamentos.\n\n"
+                                "✅ Proceso completado. Te mantendremos informado del progreso. ¡Gracias por confiar en nosotros!"
                             )
+
                     else:
                         self.logger.error(f"Error guardando reclamación para paciente {patient_key}")
                         success_message = ( 

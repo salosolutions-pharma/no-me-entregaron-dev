@@ -400,6 +400,4 @@ class PIPProcessor:
 
 💊 **Medicamentos encontrados:**
 {medicamentos_display}
-
-🔴 **Por favor, selecciona los medicamentos que NO te han entregado** de la lista anterior.
-Los medicamentos que NO selecciones se marcarán como ya entregados."""
+"""

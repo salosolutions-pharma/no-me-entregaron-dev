@@ -498,27 +498,34 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                         )
                     elif tipo.startswith("multiple_"):
                         # Escalamiento múltiple (EPS + Supersalud)
-                        tipos_generados = tipo.replace("multiple_", "").replace("_", " y ").replace("reclamacion", "reclamación")
                         await query.edit_message_text(
                             text=format_telegram_text(
-                                f"✅ *Escalamiento múltiple exitoso*\n\n"
-                                f"Se han generado: *{tipos_generados}*\n"
+                                f"✅ *¡Escalamiento múltiple realizado!*\n\n"
+                                f"Por la falta de respuesta suficiente, tu caso fue escalado tanto a la *EPS* como a la *Superintendencia Nacional de Salud*.\n\n"
                                 f"Nivel de escalamiento: *{nivel}*\n\n"
-                                f"📋 *Motivo:* {razon}\n\n"
-                                f"Nuestro equipo procesará ambas reclamaciones y te mantendremos informado."
+                                f"Procesaremos ambas reclamaciones y te mantendremos informado de cualquier novedad. ¡Seguimos contigo!"
                             ),
                             parse_mode=ParseMode.MARKDOWN
                         )
                     else:
                         # Escalamiento simple
                         tipo_legible = tipo.replace("_", " ").replace("reclamacion", "reclamación").title()
-                        await query.edit_message_text(
-                            text=format_telegram_text(
+                        # Personalizar mensaje para Supersalud u otros
+                        if "supersalud" in tipo.lower():
+                            mensaje = (
+                                f"✅ *¡Tu caso ha sido escalado a la Superintendencia Nacional de Salud!*\n\n"
+                                f"Detectamos que la EPS no respondió en el plazo establecido, así que tomamos acción por ti: tu solicitud fue remitida a Supersalud para una gestión prioritaria.\n\n"
+                                f"Nivel de escalamiento: *{nivel}*\n\n"
+                                f"Nuestro equipo hará seguimiento y te informaremos sobre cualquier novedad. ¡Seguimos acompañándote hasta que recibas tus medicamentos!"
+                            )
+                        else:
+                            mensaje = (
                                 f"✅ *{tipo_legible} generada exitosamente*\n\n"
                                 f"Nivel de escalamiento: *{nivel}*\n\n"
-                                f"📋 *Motivo:* {razon}\n\n"
                                 f"Tu caso ha sido escalado automáticamente. Nuestro equipo procesará tu solicitud y te mantendremos informado del progreso."
-                            ),
+                            )
+                        await query.edit_message_text(
+                            text=format_telegram_text(mensaje),
                             parse_mode=ParseMode.MARKDOWN
                         )
                 else:
@@ -947,23 +954,20 @@ async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_
 
                     if supersalud_disponible.get("disponible"):
                         success_message = (
-                            "🎉 ¡Perfecto! Ya tenemos toda la información necesaria para radicar tu reclamación.\n\n"
-                            "📄 **Reclamación EPS generada exitosamente**\n\n"
-                            "📋 En las próximas 48 horas te enviaremos el número de radicado.\n\n"
-                            "🔄 **Sistema de escalamiento activado:**\n"
-                            "• Si no hay respuesta en el plazo establecido, automáticamente escalaremos tu caso a la Superintendencia Nacional de Salud\n"
-                            "• Te mantendremos informado en cada paso del proceso\n\n"
-                            "✅ Proceso completado exitosamente. Si necesitas algo más, no dudes en contactarnos.\n\n"
-                             "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
-                        )
+                            "🎉 ¡Perfecto!Reclamación EPS generada exitosamente.\n\n"
+                                "📋 En las próximas 48 horas te enviaremos el número de radicado.\n\n"
+                                "📅 Cuando se cumpla el plazo de respuesta, te contactaremos para verificar si recibiste tus medicamentos.\n\n"
+                                "✅ Proceso completado. Te mantendremos informado del progreso. ¡Gracias por confiar en nosotros!"
+                            )
+
                     else:
                         success_message = (
-                            "🎉 ¡Perfecto! Ya tenemos toda la información necesaria para radicar tu reclamación.\n\n"
-                            "📄 **Reclamación EPS generada exitosamente**\n\n"
-                            "📋 En las próximas 48 horas te enviaremos el número de radicado.\n\n"
-                            "✅ Proceso completado exitosamente. Si necesitas algo más, no dudes en contactarnos.\n\n"
-                            "🚪 Esta sesión se cerrará ahora. ¡Gracias por confiar en nosotros!"
-                        )
+                            "🎉 ¡Perfecto!Reclamación EPS generada exitosamente.\n\n"
+                                "📋 En las próximas 48 horas te enviaremos el número de radicado.\n\n"
+                                "📅 Cuando se cumpla el plazo de respuesta, te contactaremos para verificar si recibiste tus medicamentos.\n\n"
+                                "✅ Proceso completado. Te mantendremos informado del progreso. ¡Gracias por confiar en nosotros!"
+                            )
+
                 else:
                     logger.error(f"Error guardando reclamación para paciente {patient_key}")
                     success_message = ( 
@@ -1340,8 +1344,6 @@ def format_telegram_text(text: str) -> str:
     text = text.replace('_', r'\_')
     text = text.replace('[', r'\[')
     text = text.replace(']', r'\]')
-    text = text.replace('(', r'\(')
-    text = text.replace(')', r'\)')
     
     return text
 
