@@ -38,7 +38,7 @@ load_dotenv()
 PROJECT_ID = os.getenv("PROJECT_ID", "")
 FIRESTORE_DATABASE_NAME = "historia"
 FIRESTORE_COLLECTION_SESSIONS = "sesiones_activas"
-BIGQUERY_DATASET_ID = os.getenv("DATASET_ID", "NME_dev")
+BIGQUERY_DATASET_ID = os.getenv("DATASET_ID")
 BIGQUERY_TABLE_PATIENTS = os.getenv("TABLE_ID", "pacientes")
 BIGQUERY_TABLE_HISTORY = os.getenv("BIGQUERY_TABLE_ID", "historial_conversacion")
 

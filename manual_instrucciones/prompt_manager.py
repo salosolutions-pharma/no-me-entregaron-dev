@@ -21,7 +21,7 @@ class PromptManager:
     def __init__(self) -> None:
         """Inicializa PromptManager configurando el cliente de BigQuery y definiendo la tabla de prompts."""
         self.project_id = os.getenv("PROJECT_ID")
-        self.dataset_id = os.getenv("BIGQUERY_DATASET_ID", "NME_dev")
+        self.dataset_id = os.getenv("BIGQUERY_DATASET_ID")
         self.table_id = os.getenv("BIGQUERY_PROMPTS_TABLE_ID", "manual_instrucciones")
 
         if not self.project_id:

@@ -954,18 +954,16 @@ async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_
 
                     if supersalud_disponible.get("disponible"):
                         success_message = (
-                            "🎉 ¡Perfecto!Reclamación EPS generada exitosamente.\n\n"
+                            "🎉 ¡Perfecto! Reclamación EPS generada exitosamente.¡Gracias por confiar en nosotros!\n\n"
                                 "📋 En las próximas 48 horas te enviaremos el número de radicado.\n\n"
-                                "📅 Cuando se cumpla el plazo de respuesta, te contactaremos para verificar si recibiste tus medicamentos.\n\n"
-                                "✅ Proceso completado. Te mantendremos informado del progreso. ¡Gracias por confiar en nosotros!"
+                                "📅 Cuando se cumpla el plazo de respuesta, te contactaremos para verificar si recibiste tus medicamentos."
                             )
 
                     else:
                         success_message = (
-                            "🎉 ¡Perfecto!Reclamación EPS generada exitosamente.\n\n"
+                            "🎉 ¡Perfecto! Reclamación EPS generada exitosamente.¡Gracias por confiar en nosotros!\n\n"
                                 "📋 En las próximas 48 horas te enviaremos el número de radicado.\n\n"
-                                "📅 Cuando se cumpla el plazo de respuesta, te contactaremos para verificar si recibiste tus medicamentos.\n\n"
-                                "✅ Proceso completado. Te mantendremos informado del progreso. ¡Gracias por confiar en nosotros!"
+                                "📅 Cuando se cumpla el plazo de respuesta, te contactaremos para verificar si recibiste tus medicamentos."
                             )
 
                 else:
