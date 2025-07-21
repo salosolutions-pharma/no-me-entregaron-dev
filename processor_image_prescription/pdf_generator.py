@@ -96,6 +96,7 @@ class PDFGenerator:
     def generate_tutela_pdf(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Genera un PDF de tutela y lo sube a Cloud Storage.
+        ✅ CORREGIDO: Tutela NO requiere tutela_id.
         
         Args:
             claim_data: Datos de la reclamación generada por ClaimGenerator
@@ -155,9 +156,10 @@ class PDFGenerator:
                 # Generar PDF
                 doc.build(story)
                 
-                # Subir a Cloud Storage
+                # ✅ CORREGIDO: Nombre de archivo SIN tutela_id (no es necesario para tutela)
                 timestamp = datetime.now(COLOMBIA_TZ).strftime("%Y%m%d_%H%M%S")
                 pdf_filename = f"tutela_{patient_key}_{timestamp}.pdf"
+                logger.info(f"📎 PDF tutela generado (escalamiento automático): {pdf_filename}")
                 
                 try:
                     pdf_url = upload_image_to_bucket(
@@ -177,6 +179,7 @@ class PDFGenerator:
                         "patient_key": patient_key,
                         "generated_at": datetime.now(COLOMBIA_TZ).isoformat(),
                         "file_size_bytes": temp_path.stat().st_size
+                        # ✅ CORREGIDO: NO incluir tutela_id para tutela
                     }
                     
                 except CloudStorageServiceError as e:
@@ -195,11 +198,13 @@ class PDFGenerator:
                 "error": f"Error generando PDF: {str(e)}",
                 "document_type": "tutela",
                 "patient_key": claim_data.get("patient_key", "unknown")
+                # ✅ CORREGIDO: NO incluir tutela_id para tutela
             }
     
     def generate_desacato_pdf(self, claim_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Genera un PDF de incidente de desacato y lo sube a Cloud Storage.
+        ✅ CORREGIDO: Desacato SÍ requiere tutela_id obligatorio.
         
         Args:
             claim_data: Datos del desacato generado por ClaimGenerator
@@ -213,9 +218,21 @@ class PDFGenerator:
             
             patient_key = claim_data.get("patient_key")
             texto_desacato = claim_data.get("texto_reclamacion", "")
+            tutela_id = claim_data.get("tutela_id")
             
             if not patient_key or not texto_desacato:
                 raise PDFGeneratorError("Faltan datos esenciales para generar el PDF de desacato")
+            
+            # ✅ MANTENER: tutela_id es OBLIGATORIO para desacato
+            if not tutela_id or not str(tutela_id).strip():
+                logger.error(f"❌ tutela_id OBLIGATORIO faltante para PDF de desacato del paciente {patient_key}")
+                return {
+                    "success": False,
+                    "error": "tutela_id es obligatorio para generar PDF de desacato",
+                    "document_type": "desacato",
+                    "patient_key": patient_key,
+                    "tutela_id": ""
+                }
             
             # Crear archivo temporal
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temp_file:
@@ -264,9 +281,10 @@ class PDFGenerator:
                 # Generar PDF
                 doc.build(story)
                 
-                # Subir a Cloud Storage
+                # ✅ MANTENER: Incluir tutela_id en el nombre del archivo (obligatorio para desacato)
                 timestamp = datetime.now(COLOMBIA_TZ).strftime("%Y%m%d_%H%M%S")
-                pdf_filename = f"desacato_{patient_key}_{timestamp}.pdf"
+                pdf_filename = f"desacato_{patient_key}_{tutela_id}_{timestamp}.pdf"
+                logger.info(f"📎 PDF desacato con tutela_id: {tutela_id}")
                 
                 try:
                     pdf_url = upload_image_to_bucket(
@@ -284,6 +302,7 @@ class PDFGenerator:
                         "pdf_filename": pdf_filename,
                         "document_type": "desacato",
                         "patient_key": patient_key,
+                        "tutela_id": tutela_id,  # ✅ MANTENER: Incluir tutela_id para desacato
                         "numero_sentencia_referencia": claim_data.get("numero_sentencia_referencia", ""),
                         "juzgado": claim_data.get("juzgado", ""),
                         "generated_at": datetime.now(COLOMBIA_TZ).isoformat(),
@@ -305,9 +324,9 @@ class PDFGenerator:
                 "success": False,
                 "error": f"Error generando PDF: {str(e)}",
                 "document_type": "desacato",
-                "patient_key": claim_data.get("patient_key", "unknown")
+                "patient_key": claim_data.get("patient_key", "unknown"),
+                "tutela_id": claim_data.get("tutela_id", "")
             }
-
 
 def create_pdf_generator() -> PDFGenerator:
     """Factory function para crear instancia del generador de PDFs."""
@@ -320,29 +339,48 @@ def create_pdf_generator() -> PDFGenerator:
 
 # Función de conveniencia
 def generar_pdf_tutela(claim_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Función de conveniencia para generar PDF de tutela."""
+    """
+    Función de conveniencia para generar PDF de tutela.
+    ✅ CORREGIDO: No maneja tutela_id para tutela.
+    """
     try:
         pdf_generator = create_pdf_generator()
-        return pdf_generator.generate_tutela_pdf(claim_data)
+        result = pdf_generator.generate_tutela_pdf(claim_data)
+        
+        # ✅ CORREGIDO: Log sin tutela_id para tutela
+        if result.get("success"):
+            logger.info(f"✅ PDF tutela generado exitosamente")
+        
+        return result
     except Exception as e:
         logger.error(f"Error en función de conveniencia para PDF tutela: {e}")
         return {
             "success": False,
             "error": f"Error generando PDF: {str(e)}",
             "document_type": "tutela"
+            # ✅ CORREGIDO: NO incluir tutela_id para tutela
         }
     
-
 # Función de conveniencia para desacato
 def generar_pdf_desacato(claim_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Función de conveniencia para generar PDF de desacato."""
+    """
+    Función de conveniencia para generar PDF de desacato.
+    ✅ MANTENER: Maneja tutela_id obligatorio para desacato.
+    """
     try:
         pdf_generator = create_pdf_generator()
-        return pdf_generator.generate_desacato_pdf(claim_data)
+        result = pdf_generator.generate_desacato_pdf(claim_data)
+        
+        # ✅ MANTENER: Log con tutela_id para desacato
+        if result.get("success") and result.get("tutela_id"):
+            logger.info(f"✅ PDF desacato generado con tutela_id: {result['tutela_id']}")
+        
+        return result
     except Exception as e:
         logger.error(f"Error en función de conveniencia para PDF desacato: {e}")
         return {
             "success": False,
             "error": f"Error generando PDF: {str(e)}",
-            "document_type": "desacato"
+            "document_type": "desacato",
+            "tutela_id": claim_data.get("tutela_id", "") if claim_data else ""
         }

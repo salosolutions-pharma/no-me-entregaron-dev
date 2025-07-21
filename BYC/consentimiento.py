@@ -32,15 +32,28 @@ class ConsentManager:
                 return "Lo siento, hay un problema técnico. Por favor intenta más tarde."
 
             context_info = self._build_session_context(session_context or {})
-            
+            canal = self._get_channel_from_context(session_context or {})
+            logger.info(f"🔍 Canal detectado para prompt: {canal}")
+
             farewell_keywords = [
                 "hasta luego", "adiós", "chao", "bye", "gracias", 
                 "no necesito nada más", "ya no necesito ayuda"
             ]
             is_farewell = any(keyword in user_message.lower() for keyword in farewell_keywords)
 
+            # ✅ MODIFICADO: Formatear el prompt con la variable {canal}
+            try:
+                formatted_prompt = byc_prompt.format(canal=canal)
+                logger.info(f"✅ Prompt formateado correctamente con canal: {canal}")
+            except KeyError as e:
+                logger.warning(f"⚠️ Variable faltante en prompt: {e}. Usando prompt sin formatear.")
+                formatted_prompt = byc_prompt
+            except Exception as e:
+                logger.error(f"❌ Error formateando prompt: {e}")
+                formatted_prompt = byc_prompt
+
             full_prompt = f"""
-{byc_prompt}
+{formatted_prompt}
 
 === CONTEXTO ACTUAL DE LA SESIÓN ===
 {context_info}
@@ -53,10 +66,11 @@ class ConsentManager:
   * Responde cordialmente despidiéndote.
   * Indica que la sesión se cerrará.
   * Menciona que pueden regresar cuando necesiten ayuda.
-- Sigue el flujo: 1) Teléfono → 2) Consentimiento → 3) Fórmula médica
+- Sigue el flujo: 1) Teléfono (SOLO si canal=TL) → 2) Consentimiento → 3) Fórmula médica
 - Mantén un tono amigable y profesional con emojis.
 - NO menciones que estás usando un prompt o que eres un LLM.
 - ✅ IMPORTANTE: Usa formato Telegram para negritas: *texto* en lugar de **texto**
+- ✅ CANAL ACTUAL: {canal}
 
 ¿Es este un mensaje de despedida?: {"SÍ" if is_farewell else "NO"}
 
@@ -70,18 +84,55 @@ Responde ahora como el asistente "No Me Entregaron":
             logger.error(f"Error generando respuesta con prompt BYC: {e}")
             return "Disculpa, hubo un error técnico. Por favor intenta nuevamente."
 
+    def _get_channel_from_context(self, session_context: Dict[str, Any]) -> str:
+        """
+        ✅ NUEVA FUNCIÓN: Detecta el canal desde el contexto de sesión.
+        Prioriza diferentes fuentes de información del canal.
+        """
+        # Intentar diferentes campos que pueden contener la información del canal
+        possible_fields = [
+            "detected_channel",  # Telegram
+            "canal",            # WhatsApp 
+            "channel",          # Genérico
+            "canal_contacto"    # BigQuery
+        ]
+        
+        for field in possible_fields:
+            channel_value = session_context.get(field)
+            if channel_value and channel_value in ["TL", "WA"]:
+                logger.info(f"📍 Canal detectado desde campo '{field}': {channel_value}")
+                return channel_value
+        
+        # Si no se encuentra, intentar deducir desde session_id
+        session_id = session_context.get("session_id", "")
+        if session_id.startswith("TL_"):
+            logger.info("📍 Canal detectado desde session_id prefix: TL")
+            return "TL"
+        elif session_id.startswith("WA_"):
+            logger.info("📍 Canal detectado desde session_id prefix: WA") 
+            return "WA"
+        
+        # Fallback por defecto
+        logger.warning("⚠️ No se pudo detectar canal, usando fallback: TL")
+        return "TL"
+
     def _build_session_context(self, session_context: Dict[str, Any]) -> str:
         """Construye una descripción del contexto de la sesión actual para el LLM."""
         context_lines = []
-        canal = session_context.get("canal", "DESCONOCIDO")
-        context_lines.append(f"🌐 Canal de comunicación: {canal}") 
+        
+        # ✅ MODIFICADO: Usar la nueva función para detectar canal
+        canal = self._get_channel_from_context(session_context)
+        context_lines.append(f"🌐 Canal de comunicación: {canal}")
 
         if session_context.get("phone_shared"):
             context_lines.append("✅ El usuario YA compartió su número de teléfono")
             if session_context.get("phone"):
                 context_lines.append(f"   📞 Teléfono: {session_context['phone']}")
         else:
-            context_lines.append("❌ El usuario NO ha compartido su número de teléfono")
+            if canal == "TL":
+                context_lines.append("❌ El usuario NO ha compartido su número de teléfono")
+            else:
+                context_lines.append("ℹ️ Canal WhatsApp - Número ya disponible implícitamente")
 
         if session_context.get("consent_given"):
             context_lines.append("✅ El usuario YA otorgó su consentimiento para tratamiento de datos")

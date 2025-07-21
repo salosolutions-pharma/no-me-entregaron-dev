@@ -224,7 +224,8 @@ class ClaimManager:
 
 
     def get_next_missing_tutela_field_prompt(self, patient_key: str, 
-                                        datos_tutela_actuales: Dict[str, Any] = None) -> Dict[str, Optional[str]]:
+                                    datos_tutela_actuales: Dict[str, Any] = None,
+                                    tutela_id: str = None) -> Dict[str, Optional[str]]:
         """
         Genera prompts para recolectar datos específicos de tutela para desacato.
         Solo pide los 5 campos esenciales que necesita el usuario proporcionar.
@@ -232,11 +233,19 @@ class ClaimManager:
         Args:
             patient_key: Clave del paciente
             datos_tutela_actuales: Datos de tutela ya recolectados
+            tutela_id: ID específico de la tutela (OBLIGATORIO)
             
         Returns:
             Dict con field_name y prompt_text para el siguiente campo faltante
         """
         try:
+            if not tutela_id or not tutela_id.strip():
+                logger.error(f"tutela_id es obligatorio para recolección de campos de tutela")
+                return {
+                    "field_name": None,
+                    "prompt_text": "😓 Error técnico: ID de tutela requerido. Por favor, inténtalo nuevamente."
+                }
+            
             # Campos mínimos necesarios para desacato
             REQUIRED_TUTELA_FIELDS = [
                 "numero_sentencia",
@@ -288,25 +297,27 @@ class ClaimManager:
             for field in REQUIRED_TUTELA_FIELDS:
                 value = datos_tutela_actuales.get(field)
                 if not value or not str(value).strip():
+                    logger.info(f"🔍 Campo faltante para tutela_id {tutela_id}: {field}")
                     return {
                         "field_name": field,
                         "prompt_text": TUTELA_FIELD_PROMPTS[field]
                     }
             
             # Todos los campos están completos
+            logger.info(f"✅ Todos los campos de tutela completos para tutela_id: {tutela_id}")
             return {
                 "field_name": None,
                 "prompt_text": "✅ Tengo todos los datos de tu tutela. Generando el incidente de desacato..."
             }
             
         except Exception as e:
-            logger.error(f"Error en get_next_missing_tutela_field_prompt para '{patient_key}': {e}")
+            logger.error(f"Error en get_next_missing_tutela_field_prompt para '{patient_key}' (tutela_id: {tutela_id}): {e}")
             return {
                 "field_name": None,
                 "prompt_text": "😓 Ocurrió un error. Por favor, inténtalo nuevamente."
             }
         
-    def get_existing_tutela_data(self, patient_key: str) -> Optional[Dict[str, Any]]:
+    def get_existing_tutela_data(self, patient_key: str, tutela_id: str) -> Optional[Dict[str, Any]]:
         """
         Obtiene datos existentes de tutela para un paciente desde la tabla tutelas.
         
@@ -328,14 +339,15 @@ class ClaimManager:
                 ciudad,
                 created_at
             FROM `{PROJECT_ID}.{DATASET_ID}.tutelas`
-            WHERE paciente_clave = @patient_key
+            WHERE paciente_clave = @patient_key AND tutela_id = @tutela_id
             ORDER BY created_at DESC
             LIMIT 1
             """
             
             job_config = bigquery.QueryJobConfig(
                 query_parameters=[
-                    bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)
+                    bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key),
+                    bigquery.ScalarQueryParameter("tutela_id", "STRING", tutela_id),
                 ]
             )
             
@@ -357,21 +369,27 @@ class ClaimManager:
             logger.error(f"Error obteniendo datos de tutela existentes para {patient_key}: {e}")
             return None
 
-    def save_tutela_data_simple(self, patient_key: str, tutela_data: Dict[str, Any]) -> bool:
+    def save_tutela_data_simple(self, patient_key: str, tutela_id: str, tutela_data: Dict[str, Any]) -> bool:
         """
         Guarda datos mínimos de tutela en la tabla tutelas simplificada.
         
         Args:
             patient_key: Clave del paciente
+            tutela_id: ID específico de la tutela (OBLIGATORIO)
             tutela_data: Datos de tutela recolectados del usuario
             
         Returns:
             bool: True si se guardó correctamente
         """
         try:
+            if not tutela_id or not tutela_id.strip():
+                logger.error(f"tutela_id es obligatorio para guardar datos de tutela")
+                return False
+            
             # Preparar registro simplificado
             tutela_record = {
                 "paciente_clave": patient_key,
+                "tutela_id": tutela_id,
                 "numero_sentencia": str(tutela_data.get("numero_sentencia", "")).strip(),
                 "fecha_sentencia": tutela_data.get("fecha_sentencia"),  # Ya en formato YYYY-MM-DD
                 "fecha_radicacion_tutela": tutela_data.get("fecha_radicacion_tutela"),  # Ya en formato YYYY-MM-DD
@@ -382,18 +400,18 @@ class ClaimManager:
             
             # Validar datos mínimos
             if not tutela_record["numero_sentencia"] or not tutela_record["juzgado"]:
-                logger.error(f"Datos de tutela incompletos para {patient_key}: faltan número o juzgado")
+                logger.error(f"Datos de tutela incompletos para {patient_key} (tutela_id: {tutela_id}): faltan número o juzgado")
                 return False
             
             # Guardar en tabla tutelas
             table_reference = f"{PROJECT_ID}.{DATASET_ID}.tutelas"
             load_table_from_json_direct([tutela_record], table_reference)
             
-            logger.info(f"✅ Datos de tutela guardados exitosamente para paciente {patient_key}")
+            logger.info(f"✅ Datos de tutela guardados exitosamente para paciente {patient_key} (tutela_id: {tutela_id})")
             return True
             
         except Exception as e:
-            logger.error(f"❌ Error guardando datos de tutela simples para {patient_key}: {e}")
+            logger.error(f"❌ Error guardando datos de tutela simples para {patient_key} (tutela_id: {tutela_id}): {e}")
             return False
         
     def _get_field_display_name(self, field_name: str) -> str:
@@ -591,22 +609,28 @@ Respuesta:"""
             logger.error(f"❌ Error en update_informante_with_merge: {e}")
             return False
 
-    def save_tutela_data_to_bigquery(self, patient_key: str, tutela_data: Dict[str, Any]) -> bool:
+    def save_tutela_data_to_bigquery(self, patient_key: str, tutela_id: str, tutela_data: Dict[str, Any]) -> bool:
         """
         Guarda los datos básicos de tutela en la tabla tutelas simplificada.
         MODIFICADO: Ahora usa estructura simplificada con solo campos esenciales.
         
         Args:
             patient_key: Clave del paciente
+            tutela_id: ID específico de la tutela (OBLIGATORIO)
             tutela_data: Datos de la tutela recolectados del usuario
             
         Returns:
             bool: True si se guardó correctamente
         """
         try:
+            if not tutela_id or not tutela_id.strip():
+                logger.error(f"tutela_id es obligatorio para guardar datos de tutela en BigQuery")
+                return False
+            
             # ✅ NUEVA ESTRUCTURA SIMPLIFICADA - Solo campos esenciales
             tutela_record = {
                 "paciente_clave": patient_key,
+                "tutela_id": tutela_id,
                 "numero_sentencia": str(tutela_data.get("numero_sentencia", "")).strip(),
                 "fecha_sentencia": tutela_data.get("fecha_sentencia"),  # Formato YYYY-MM-DD
                 "fecha_radicacion_tutela": tutela_data.get("fecha_radicacion_tutela"),  # Formato YYYY-MM-DD  
@@ -617,21 +641,20 @@ Respuesta:"""
             
             # ✅ VALIDACIÓN MÍNIMA - Solo campos críticos
             if not tutela_record["numero_sentencia"] or not tutela_record["juzgado"]:
-                logger.error(f"Datos de tutela incompletos para {patient_key}: faltan número o juzgado")
+                logger.error(f"Datos de tutela incompletos para {patient_key} (tutela_id: {tutela_id}): faltan número o juzgado")
                 return False
             
             # ✅ GUARDAR en tabla simplificada
             table_reference = f"{PROJECT_ID}.{DATASET_ID}.tutelas"
             load_table_from_json_direct([tutela_record], table_reference)
             
-            logger.info(f"✅ Datos de tutela guardados en estructura simplificada para paciente {patient_key}")
+            logger.info(f"✅ Datos de tutela guardados en estructura simplificada para paciente {patient_key} (tutela_id: {tutela_id})")
             return True
             
         except Exception as e:
-            logger.error(f"❌ Error guardando datos de tutela simplificados para paciente {patient_key}: {e}")
+            logger.error(f"❌ Error guardando datos de tutela simplificados para paciente {patient_key} (tutela_id: {tutela_id}): {e}")
             return False
         
-
 try:
     claim_manager = ClaimManager()
     logger.info("ClaimManager instanciado correctamente.")

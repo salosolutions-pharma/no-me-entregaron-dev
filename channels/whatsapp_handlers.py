@@ -292,6 +292,29 @@ class WhatsAppMessageHandler:
             await self._send_text_message(phone_number, "Ocurrió un error procesando tu imagen. Por favor envía la foto nuevamente.")
 
     # Métodos auxiliares privados
+    def _ensure_tutela_id_in_context(self, session_context: Dict[str, Any], phone_number: str) -> str:
+        """
+        Asegura que hay un tutela_id en el contexto de la sesión.
+        Si no existe, genera uno nuevo y lo persiste.
+        
+        Args:
+            session_context: Contexto de sesión de WhatsApp
+            phone_number: Número de teléfono del usuario
+            
+        Returns:
+            str: tutela_id (existente o recién generado)
+        """
+        current_tutela_id = session_context.get("current_tutela_id")
+        if not current_tutela_id:
+            from claim_manager.claim_generator import generate_tutela_id
+            current_tutela_id = generate_tutela_id()
+            session_context["current_tutela_id"] = current_tutela_id
+            self._update_session_context(phone_number, session_context)
+            self.logger.info(f"🆔 Generado nuevo tutela_id para WhatsApp: {current_tutela_id}")
+        else:
+            self.logger.info(f"🆔 Usando tutela_id existente en WhatsApp: {current_tutela_id}")
+        
+        return current_tutela_id
     
     def _find_active_session(self, normalized_phone: str) -> Optional[str]:
         """Busca una sesión activa para el número de teléfono dado."""
@@ -393,14 +416,11 @@ class WhatsAppMessageHandler:
                         session_data = session_doc.to_dict()
                         self.logger.info(f"Datos de sesión recuperados de Firestore: {list(session_data.keys())}")
                         
-                        # Log específico para medicamentos para debug
-                        if "pending_medications" in session_data:
-                            medications = session_data["pending_medications"]
-                            self.logger.info(f"Medicamentos encontrados en Firestore: {len(medications)} items")
-                        else:
-                            self.logger.warning(f"No se encontraron pending_medications en Firestore para sesión {session_id}")
-                    else:
-                        self.logger.warning(f"Documento de sesión {session_id} no existe en Firestore")
+                        # Log específico para tutela_id si existe
+                        if "current_tutela_id" in session_data:
+                            tutela_id = session_data["current_tutela_id"]
+                            self.logger.info(f"🆔 Tutela ID recuperado de Firestore: {tutela_id}")
+                            
                 except Exception as e:
                     self.logger.error(f"Error recuperando datos de sesión desde Firestore: {e}", exc_info=True)
                 
@@ -415,7 +435,7 @@ class WhatsAppMessageHandler:
                     "detected_channel": "WA"
                 }
                 
-                # Agregar datos específicos del flujo de medicamentos si existen
+                # Agregar datos específicos del flujo si existen
                 if "pending_medications" in session_data:
                     context["pending_medications"] = session_data["pending_medications"]
                 if "selected_undelivered" in session_data:
@@ -432,14 +452,17 @@ class WhatsAppMessageHandler:
                     context["waiting_for_tutela_field"] = session_data["waiting_for_tutela_field"]
                 if "tutela_data_temp" in session_data:
                     context["tutela_data_temp"] = session_data["tutela_data_temp"]
-
                 
+                # ✅ NUEVO: Recuperar tutela_id si existe
+                if "current_tutela_id" in session_data:
+                    context["current_tutela_id"] = session_data["current_tutela_id"]
+                    self.logger.info(f"🆔 Tutela ID incluido en contexto: {session_data['current_tutela_id']}")
+
                 return context
+                
             except Exception as e:
                 self.logger.error(f"Error obteniendo contexto de sesión: {e}")
                 return {}
-        
-        return {}
 
     def _update_session_context(self, phone_number: str, context: Dict[str, Any]) -> None:
         """Actualiza el contexto de sesión persistiendo en Firestore."""
@@ -478,24 +501,24 @@ class WhatsAppMessageHandler:
                 update_fields["tutela_data_temp"] = context["tutela_data_temp"]
             if "last_escalate_cb" in context:
                 update_fields["last_escalate_cb"] = context["last_escalate_cb"]
-    
-
-    
             
+            # ✅ NUEVO: Persistir tutela_id en Firestore
+            if "current_tutela_id" in context:
+                update_fields["current_tutela_id"] = context["current_tutela_id"]
+                self.logger.info(f"🆔 Guardando tutela_id en Firestore: {context['current_tutela_id']}")
+                
             if update_fields:
                 session_ref.update(update_fields)
                 self.logger.info(f"Contexto actualizado en Firestore para sesión {session_id}: {list(update_fields.keys())}")
                 
-                # Log específico para medicamentos
-                if "pending_medications" in update_fields:
-                    meds = update_fields["pending_medications"]
-                    self.logger.info(f"Medicamentos guardados en Firestore: {len(meds)} items - {[m.get('nombre', 'sin nombre') for m in meds]}")
+                # Log específico para tutela_id
+                if "current_tutela_id" in update_fields:
+                    self.logger.info(f"🆔 Tutela ID persistido correctamente: {update_fields['current_tutela_id']}")
             else:
                 self.logger.warning(f"No hay campos para actualizar en sesión {session_id}")
             
         except Exception as e:
             self.logger.error(f"Error actualizando contexto de sesión: {e}")
-            # Log pero no fallar, para no romper el flujo
 
     async def _send_text_message(self, phone_number: str, message: str) -> None:
         """Envía un mensaje de texto."""
@@ -929,9 +952,8 @@ class WhatsAppMessageHandler:
             self.logger.warning("⚠️ Callback duplicado ignorado")
             return                   # ✋ salimos SIN escalar
         
-        
         try:
-            
+        
             if callback_data.startswith("escalate_yes_"):
                 session_id = callback_data[len("escalate_yes_"):]
                 self.logger.info(f"✅ Paciente ACEPTA escalar para session: {session_id}")
@@ -945,48 +967,37 @@ class WhatsAppMessageHandler:
                     resultado = auto_escalate_patient(session_id)
                     self.logger.info(f"[WA] Resultado auto_escalate_patient: {resultado}")
                     
+                    # ✅ MODIFICADO: Verificar si requiere recolección de tutela
                     if resultado.get("requiere_recoleccion_tutela") and resultado.get("tipo") == "desacato":
                         patient_key = resultado["patient_key"]
                         
-                
-                        datos_existentes = self.claim_manager.get_existing_tutela_data(patient_key)
+                        # ✅ CRÍTICO: Usar tutela_id desde resultado, NO buscar datos existentes antiguos
+                        tutela_id = resultado.get("tutela_id")
+                        if not tutela_id:
+                            from claim_manager.claim_generator import generate_tutela_id
+                            tutela_id = generate_tutela_id()
+                            self.logger.info(f"🆔 Generado tutela_id para escalamiento WhatsApp: {tutela_id}")
                         
-                        if datos_existentes:
-                            
-                            from claim_manager.claim_generator import generar_desacato
-                            resultado_desacato = generar_desacato(patient_key, datos_existentes)
-                            
-                            if resultado_desacato.get("success"):
-                                await self._send_text_message(
-                                    phone_number,
-                                    "✅ *Desacato generado exitosamente*\n\n"
-                                    f"Nivel de escalamiento: *5*\n\n"
-                                    "Tu incidente de desacato ha sido preparado automáticamente usando los datos de tu tutela previa."
-                                )
-                            else:
-                                await self._send_text_message(
-                                    phone_number,
-                                    "❌ Error generando desacato automáticamente."
-                                )
-                        else:
-                            
-                            field_prompt = self.claim_manager.get_next_missing_tutela_field_prompt(patient_key, {})
-                            
-                            await self._send_text_message(
-                                phone_number,
-                                "🔄 *Para proceder con el desacato necesito datos de tu tutela:*\n\n"
-                                f"{field_prompt['prompt_text']}"
-                            )
-                            
-                    
-                            session_context["waiting_for_tutela_field"] = field_prompt["field_name"]
-                            session_context["patient_key"] = patient_key
-                            session_context["tutela_data_temp"] = {}
-                            self._update_session_context(phone_number, session_context)
+
+                        session_context["current_tutela_id"] = tutela_id
+                        session_context["patient_key"] = patient_key
+                        session_context["tutela_data_temp"] = {}
+                        self._update_session_context(phone_number, session_context)
+
+                        field_prompt = self.claim_manager.get_next_missing_tutela_field_prompt(
+                            patient_key, {}, tutela_id  
+                        )
                         
+                        await self._send_text_message(
+                            phone_number,
+                            f"🔄 *Para proceder con el desacato necesito datos de tu tutela:*\n\n{field_prompt['prompt_text']}"
+                        )
+                        
+                        session_context["waiting_for_tutela_field"] = field_prompt["field_name"]
+                        self._update_session_context(phone_number, session_context)
                         return
                     
-                    if resultado.get("success"):
+                    elif resultado.get("success"):
                         tipo = resultado.get("tipo", "escalamiento")
                         razon = resultado.get("razon", "")
                         nivel = resultado.get("nivel_escalamiento", "")
@@ -997,22 +1008,11 @@ class WhatsAppMessageHandler:
                         if tipo == "sin_escalamiento":
                             await self._send_text_message(
                                 phone_number,
-                                f"Caso en revision."
-                                f"Te contactaremos pronto para darle seguimiento al proceso."
-                            )
-                        elif tipo.startswith("multiple_"):
-                            
-                            tipos_generados = tipo.replace("multiple_", "").replace("_", " y ").replace("reclamacion", "reclamación")
-                            await self._send_text_message(
-                                phone_number,
-                                f"✅ *Escalamiento múltiple exitoso*\n\n"
-                                f"Se han generado: *{tipos_generados}*\n"
-                                f"Nivel de escalamiento: *{nivel}*\n\n"
-                                f"📋 *Motivo:* {razon}\n\n"
-                                f"Nuestro equipo procesará ambas reclamaciones y te mantendremos informado."
+                                "📋 *Caso en revisión*\n\n"
+                                "Tu caso está siendo revisado por nuestro equipo especializado.\n"
+                                "Te contactaremos pronto con actualizaciones."
                             )
                         else:
-                            
                             tipo_legible = tipo.replace("_", " ").replace("reclamacion", "reclamación").title()
                             await self._send_text_message(
                                 phone_number,
@@ -1021,6 +1021,8 @@ class WhatsAppMessageHandler:
                                 f"📋 *Motivo:* {razon}\n\n"
                                 f"Tu caso ha sido escalado automáticamente. Nuestro equipo procesará tu solicitud y te mantendremos informado del progreso."
                             )
+                    
+                    # ✅ Solo mostrar error si NO es recolección de tutela Y NO es exitoso
                     else:
                         error = resultado.get("error", "Error desconocido")
                         self.logger.error(f"Error en escalamiento automático para session {session_id}: {error}")
@@ -1052,7 +1054,6 @@ class WhatsAppMessageHandler:
                     "✅ Tu caso queda registrado por si necesitas ayuda futura.\n\n"
                     "¡Gracias por confiar en nosotros!"
                 )
-                
                 
                 try:
                     self._close_user_session(session_id, phone_number, reason="user_declined_escalation")
@@ -1458,23 +1459,34 @@ class WhatsAppMessageHandler:
     async def _check_automatic_escalation(self, phone_number: str, patient_key: str, session_id: str) -> None:
         """Verifica si hay escalamiento automático disponible."""
         try:
-            # Implementar lógica de escalamiento automático si está disponible
-            # Por ahora, solo enviamos mensaje informativo
+
             await self._send_text_message(phone_number, "🔄 Verificando disponibilidad de escalamiento automático...")
-            
-            # Aquí iría la lógica de escalamiento automático similar a Telegram
             
         except Exception as e:
             self.logger.error(f"Error verificando escalamiento automático: {e}")
 
     async def handle_tutela_field_response(self, phone, message, session_context):
+        """
+        Maneja las respuestas de campos de tutela para generar desacato.
+        ✅ MODIFICADO: Asegura tutela_id obligatorio desde el inicio.
+        """
         patient_key = session_context.get("patient_key")
         waiting = session_context.get("waiting_for_tutela_field")
         if not (patient_key and waiting):
             return False
 
-        # 1) Acumular en tutel​a_data_temp (no en datos_tutela)
+        current_tutela_id = self._ensure_tutela_id_in_context(session_context, phone)
+        if not current_tutela_id:
+            logger.error("❌ No se pudo obtener/generar tutela_id para recolección WhatsApp")
+            await self._send_text_message(phone, 
+                "❌ Error técnico generando ID de tutela. Por favor intenta de nuevo.")
+            return True
+        
+        self.logger.info(f"🆔 Usando tutela_id en WhatsApp: {current_tutela_id}")
+
+        # 1) Acumular en tutela_data_temp
         temp = session_context.get("tutela_data_temp", {})
+        
         # Normaliza fechas si toca
         if waiting in ["fecha_sentencia", "fecha_radicacion_tutela"]:
             norm = self.claim_manager._normalize_date(message)
@@ -1485,11 +1497,15 @@ class WhatsAppMessageHandler:
             temp[waiting] = norm
         else:
             temp[waiting] = message.strip()
+        
         session_context["tutela_data_temp"] = temp
         self._update_session_context(phone, session_context)
 
-        # 2) Pedir siguiente
-        next_prompt = self.claim_manager.get_next_missing_tutela_field_prompt(patient_key, temp)
+        # 2) Pedir siguiente campo - ✅ MODIFICADO: Pasar tutela_id obligatorio
+        next_prompt = self.claim_manager.get_next_missing_tutela_field_prompt(
+            patient_key, temp, current_tutela_id
+        )
+        
         if next_prompt.get("field_name"):
             session_context["waiting_for_tutela_field"] = next_prompt["field_name"]
             self._update_session_context(phone, session_context)
@@ -1498,18 +1514,17 @@ class WhatsAppMessageHandler:
 
         # 3) Si ya no faltan más, limpiar y generar desacato
         session_context.pop("waiting_for_tutela_field", None)
-        session_context.pop("tutela_data_temp",       None)
+        session_context.pop("tutela_data_temp", None)
         self._update_session_context(phone, session_context)
 
-        success = self.claim_manager.save_tutela_data_simple(patient_key, temp)
+        success = self.claim_manager.save_tutela_data_simple(patient_key, current_tutela_id, temp)
+        
         if success:
             await self._send_text_message(phone, 
                 "✅ Datos de tutela guardados. 🔄 Generando incidente de desacato...")
-   
-            # 2) Generar el desacato
-            # usar los datos que en Firestore que se guardaron en 'tutela_data_temp'
-            desv_data = session_context.get("tutela_data_temp", {})
-            resultado_desacato = generar_desacato(patient_key, desv_data)
+
+            # 2) Generar el desacato CON tutela_id OBLIGATORIO
+            resultado_desacato = generar_desacato(patient_key, temp, current_tutela_id)
 
             # 3) Guardar la reclamación de desacato
             if resultado_desacato.get("success"):
@@ -1524,18 +1539,22 @@ class WhatsAppMessageHandler:
                 )
                 if guardado:
                     await self._send_text_message(phone,
-                        "🎉 ¡Desacato generado y guardado exitosamente!")
+                        f"🎉 ¡Desacato generado y guardado exitosamente!\n\n"
+                        f"🆔 Tutela ID: {current_tutela_id}\n"
+                        f"📋 Nivel de escalamiento: 5")
                 else:
                     await self._send_text_message(phone,
                         "⚠️ Desacato generado, pero hubo un error guardándolo.")
             else:
                 await self._send_text_message(phone,
                     "❌ Error generando tu desacato automáticamente.")
-
-
         else:
             await self._send_text_message(phone, 
                 "⚠️ No pude guardar los datos de tu tutela. Intenta nuevamente.")
+        
+        session_context.pop("current_tutela_id", None)
+        self._update_session_context(phone, session_context)
+        
         return True
 
             

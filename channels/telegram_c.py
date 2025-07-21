@@ -64,6 +64,28 @@ except Exception as e:
     logger.critical(f"Error al inicializar componentes: {e}. Abortando.")
     sys.exit(1)
 
+def ensure_tutela_id_in_context(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """
+    Asegura que hay un tutela_id en el contexto del usuario.
+    Si no existe, genera uno nuevo.
+    
+    Args:
+        context: Context de Telegram
+        
+    Returns:
+        str: tutela_id (existente o recién generado)
+    """
+    current_tutela_id = context.user_data.get("current_tutela_id")
+    if not current_tutela_id:
+        from claim_manager.claim_generator import generate_tutela_id
+        current_tutela_id = generate_tutela_id()
+        context.user_data["current_tutela_id"] = current_tutela_id
+        logger.info(f"🆔 Generado nuevo tutela_id: {current_tutela_id}")
+    else:
+        logger.info(f"🆔 Usando tutela_id existente: {current_tutela_id}")
+    
+    return current_tutela_id
+
 def validar_requisitos_desacato(patient_key: str) -> Dict[str, Any]:
     """
     Función auxiliar para validar requisitos de desacato.
@@ -418,7 +440,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 )
         return
 
-    # 🆕 NUEVO: Manejar respuestas de escalamiento
     elif data.startswith("escalate_yes_") or data.startswith("escalate_no_"):
         if data.startswith("escalate_yes_"):
             session_id = data[len("escalate_yes_"):]
@@ -430,56 +451,40 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             )
             
             try:
-                # 🔄 AQUÍ VA TODO EL CÓDIGO ORIGINAL DE auto_escalate_patient
                 from claim_manager.claim_generator import auto_escalate_patient
                 resultado = auto_escalate_patient(session_id)
                 
-                # ✅ NUEVO: Verificar si requiere recolección de datos de tutela
+                # ✅ PRIMERO: Verificar si requiere recolección de tutela
                 if resultado.get("requiere_recoleccion_tutela") and resultado.get("tipo") == "desacato":
                     patient_key = resultado["patient_key"]
                     
-                    # Verificar si ya tiene datos de tutela
-                    datos_existentes = claim_manager.get_existing_tutela_data(patient_key)
+                    tutela_id = resultado.get("tutela_id")
+                    if not tutela_id:
+                        from claim_manager.claim_generator import generate_tutela_id
+                        tutela_id = generate_tutela_id()
+                        logger.info(f"🆔 Generado tutela_id para escalamiento: {tutela_id}")
                     
-                    if datos_existentes:
-                        # Ya tiene datos, usar para generar desacato
-                        from claim_manager.claim_generator import generar_desacato
-                        resultado_desacato = generar_desacato(patient_key, datos_existentes)
-                        
-                        if resultado_desacato.get("success"):
-                            await query.edit_message_text(
-                                text=format_telegram_text(
-                                    "✅ *Desacato generado exitosamente*\n\n"
-                                    f"Nivel de escalamiento: *5*\n\n"
-                                    "Tu incidente de desacato ha sido preparado automáticamente usando los datos de tu tutela previa."
-                                ),
-                                parse_mode=ParseMode.MARKDOWN
-                            )
-                        else:
-                            await query.edit_message_text(
-                                text=format_telegram_text("❌ Error generando desacato automáticamente."),
-                                parse_mode=ParseMode.MARKDOWN
-                            )
-                    else:
-                        # No tiene datos, iniciar recolección
-                        field_prompt = claim_manager.get_next_missing_tutela_field_prompt(patient_key, {})
-                        
-                        await query.edit_message_text(
-                            text=format_telegram_text(
-                                "🔄 *Para proceder con el desacato necesito datos de tu tutela:*\n\n"
-                                f"{field_prompt['prompt_text']}"
-                            ),
-                            parse_mode=ParseMode.MARKDOWN
-                        )
-                        
-                        # Guardar estado en context
-                        context.user_data["waiting_for_tutela_field"] = field_prompt["field_name"]
-                        context.user_data["patient_key"] = patient_key
-                        context.user_data["tutela_data_temp"] = {}
+                    field_prompt = claim_manager.get_next_missing_tutela_field_prompt(
+                        patient_key, {}, tutela_id  
+                    )
+                    
+                    await query.edit_message_text(
+                        text=format_telegram_text(
+                            "🔄 *Para proceder con el desacato necesito datos de tu tutela:*\n\n"
+                            f"{field_prompt['prompt_text']}"
+                        ),
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    
+                    context.user_data["waiting_for_tutela_field"] = field_prompt["field_name"]
+                    context.user_data["patient_key"] = patient_key
+                    context.user_data["tutela_data_temp"] = {}
+                    context.user_data["current_tutela_id"] = tutela_id
                     
                     return
                 
-                if resultado.get("success"):
+                # ✅ ÚNICO CAMBIO: if → elif
+                elif resultado.get("success"):
                     tipo = resultado.get("tipo", "escalamiento")
                     razon = resultado.get("razon", "")
                     nivel = resultado.get("nivel_escalamiento", "")
@@ -528,6 +533,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                             text=format_telegram_text(mensaje),
                             parse_mode=ParseMode.MARKDOWN
                         )
+                # ✅ TERCERO: Solo mostrar error si no es recolección Y no es exitoso
                 else:
                     error = resultado.get("error", "Error desconocido")
                     logger.error(f"Error en escalamiento automático para session {session_id}: {error}")
@@ -1183,6 +1189,7 @@ async def handle_field_response(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_tutela_field_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Maneja las respuestas de campos de tutela para generar desacato.
+    ✅ MODIFICADO: Asegura tutela_id obligatorio desde el inicio.
     
     Args:
         update: Update de Telegram
@@ -1197,7 +1204,19 @@ async def handle_tutela_field_response(update: Update, context: ContextTypes.DEF
     tutela_data = context.user_data.get("tutela_data_temp", {})
     user_response = update.message.text.strip()
     
+    # ✅ CRÍTICO: Asegurar tutela_id desde el inicio
+    current_tutela_id = ensure_tutela_id_in_context(context)
+    if not current_tutela_id:
+        logger.error("❌ No se pudo obtener/generar tutela_id para recolección")
+        await send_and_log_message(
+            chat_id,
+            "❌ Error técnico generando ID de tutela. Por favor intenta de nuevo.",
+            context
+        )
+        return True
+    
     logger.info(f"Procesando respuesta de campo tutela '{field_name}': {user_response[:50]}...")
+    logger.info(f"🆔 Usando tutela_id: {current_tutela_id}")
     
     try:
         # Normalizar según el tipo de campo
@@ -1214,12 +1233,13 @@ async def handle_tutela_field_response(update: Update, context: ContextTypes.DEF
                 return True
             tutela_data[field_name] = normalized_value
         else:
-
             # Campos de texto normales
             tutela_data[field_name] = user_response
         
-        # Verificar si faltan más campos
-        field_prompt = claim_manager.get_next_missing_tutela_field_prompt(patient_key, tutela_data)
+        # ✅ MODIFICADO: Usar tutela_id OBLIGATORIO
+        field_prompt = claim_manager.get_next_missing_tutela_field_prompt(
+            patient_key, tutela_data, current_tutela_id
+        )
         
         if field_prompt.get("field_name"):
             # Aún faltan campos
@@ -1228,9 +1248,10 @@ async def handle_tutela_field_response(update: Update, context: ContextTypes.DEF
             context.user_data["tutela_data_temp"] = tutela_data
             
         else:
-            # ✅ Todos los campos completos
+            # ✅ TODOS LOS CAMPOS COMPLETOS
             context.user_data.pop("waiting_for_tutela_field", None)
             context.user_data.pop("tutela_data_temp", None)
+            # ✅ MANTENER current_tutela_id hasta completar el proceso
             
             await send_and_log_message(
                 chat_id,
@@ -1238,14 +1259,14 @@ async def handle_tutela_field_response(update: Update, context: ContextTypes.DEF
                 context
             )
             
-            # 1. Guardar datos de tutela
-            success = claim_manager.save_tutela_data_simple(patient_key, tutela_data)
+            # 1. Guardar datos de tutela CON tutela_id OBLIGATORIO
+            success = claim_manager.save_tutela_data_simple(patient_key, current_tutela_id, tutela_data)
             
             if success:
-                # 2. Generar desacato
+                # 2. Generar desacato CON tutela_id OBLIGATORIO
                 try:
                     from claim_manager.claim_generator import generar_desacato
-                    resultado_desacato = generar_desacato(patient_key, tutela_data)
+                    resultado_desacato = generar_desacato(patient_key, tutela_data, current_tutela_id)
                     
                     if resultado_desacato.get("success"):
                         # 3. Guardar reclamación de desacato
@@ -1262,10 +1283,11 @@ async def handle_tutela_field_response(update: Update, context: ContextTypes.DEF
                         if guardado:
                             await send_and_log_message(
                                 chat_id,
-                                "✅ *Desacato generado exitosamente*\n\n"
-                                "Nivel de escalamiento: *5*\n\n"
-                                "📋 Tu incidente de desacato ha sido preparado con los datos de tu tutela.\n\n"
-                                "Nuestro equipo procesará tu solicitud y te mantendremos informado del progreso.",
+                                f"✅ *Desacato generado exitosamente*\n\n"
+                                f"🆔 Tutela ID: `{current_tutela_id}`\n"
+                                f"Nivel de escalamiento: *5*\n\n"
+                                f"📋 Tu incidente de desacato ha sido preparado con los datos de tu tutela.\n\n"
+                                f"Nuestro equipo procesará tu solicitud y te mantendremos informado del progreso.",
                                 context
                             )
                         else:
@@ -1299,6 +1321,9 @@ async def handle_tutela_field_response(update: Update, context: ContextTypes.DEF
                     "Por favor intenta más tarde o contacta a nuestro equipo.",
                     context
                 )
+            
+            # ✅ LIMPIAR tutela_id al finalizar el proceso
+            context.user_data.pop("current_tutela_id", None)
         
         return True
         
