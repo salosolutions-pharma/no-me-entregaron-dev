@@ -10,7 +10,7 @@ from google.oauth2.service_account import Credentials
 
 logger = logging.getLogger(__name__)
 
-_PRESCRIPTION_STORAGE_PREFIX = "prescripciones"
+_PRESCRIPTION_STORAGE_PREFIX = os.getenv("BUCKET_PRESCRIPCIONES")
 
 
 class CloudStorageServiceError(RuntimeError):

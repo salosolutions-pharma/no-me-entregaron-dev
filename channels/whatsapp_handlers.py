@@ -540,6 +540,119 @@ class WhatsAppMessageHandler:
         except WhatsAppBusinessAPIError as e:
             self.logger.error(f"Error enviando mensaje interactivo a {phone_number}: {e}")
 
+    async def _send_document_to_whatsapp(self, phone_number: str, document_url: str, 
+                                       filename: str, caption: str = "") -> bool:
+        """Envía un documento PDF al usuario de WhatsApp."""
+        try:
+            import tempfile
+            import requests
+            from pathlib import Path
+            
+            # Descargar el archivo desde Cloud Storage
+            self.logger.info(f"📥 Descargando PDF desde: {document_url}")
+            
+            # Convertir gs:// URL a https:// URL pública
+            if document_url.startswith("gs://"):
+                # Extraer bucket y path
+                gs_parts = document_url.replace("gs://", "").split("/", 1)
+                bucket_name = gs_parts[0]
+                file_path = gs_parts[1] if len(gs_parts) > 1 else ""
+                
+                # URL pública de Google Cloud Storage
+                public_url = f"https://storage.googleapis.com/{bucket_name}/{file_path}"
+            else:
+                public_url = document_url
+            
+            # Descargar el archivo
+            response = requests.get(public_url, timeout=30)
+            response.raise_for_status()
+            
+            # Crear archivo temporal
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temp_file:
+                temp_file.write(response.content)
+                temp_path = Path(temp_file.name)
+            
+            try:
+                # Subir archivo temporal a un servidor accesible para WhatsApp
+                # (WhatsApp Business API requiere URLs públicas accesibles)
+                
+                # Opción 1: Usar la URL pública de Google Cloud Storage directamente
+                normalized_phone = self.wa_client.validate_phone_number(phone_number)
+                self.wa_client.send_document_message(
+                    normalized_phone, 
+                    public_url,  # WhatsApp descarga desde la URL pública
+                    filename, 
+                    caption
+                )
+                
+                self.logger.info(f"📎 PDF enviado exitosamente a WhatsApp: {filename}")
+                return True
+                
+            finally:
+                # Limpiar archivo temporal
+                if temp_path.exists():
+                    temp_path.unlink()
+            
+        except Exception as e:
+            self.logger.error(f"Error enviando PDF a WhatsApp: {e}")
+            
+            # Fallback: enviar mensaje con enlace si falla
+            try:
+                fallback_message = (
+                    f"📎 {caption}\n\n"
+                    f"Hubo un problema enviando tu documento directamente.\n"
+                    f"Puedes descargarlo desde: {document_url}"
+                )
+                
+                await self._send_text_message(phone_number, fallback_message)
+            except:
+                pass
+                
+            return False
+        
+    async def _send_pdf_for_escalation(self, phone_number: str, patient_key: str, tipo: str) -> None:
+        """Busca y envía el PDF de la reclamación recién creada."""
+        try:
+            from processor_image_prescription.bigquery_pip import get_bigquery_client, PROJECT_ID, DATASET_ID, TABLE_ID
+            from google.cloud import bigquery
+            
+            client = get_bigquery_client()
+            
+            query_sql = f"""
+            SELECT reclamaciones
+            FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
+            WHERE paciente_clave = @patient_key
+            """
+            
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)]
+            )
+            
+            results = client.query(query_sql, job_config=job_config).result()
+            
+            for row in results:
+                reclamaciones = row.reclamaciones if row.reclamaciones else []
+                # Buscar la reclamación más reciente del tipo específico
+                for rec in reversed(reclamaciones):
+                    if (rec.get("tipo_accion") == tipo and 
+                        rec.get("url_documento") and 
+                        rec.get("url_documento").strip()):
+                        
+                        pdf_url = rec["url_documento"]
+                        pdf_filename = f"{tipo}_{patient_key}.pdf"
+                        
+                        await self._send_document_to_whatsapp(
+                            phone_number, pdf_url, pdf_filename,
+                            f"📎 Documento de {tipo}"
+                        )
+                        return
+                break
+                
+            self.logger.warning(f"No se encontró PDF para {tipo} del paciente {patient_key}")
+            
+        except Exception as e:
+            self.logger.error(f"Error enviando PDF de {tipo}: {e}")
+
     async def _log_user_message(self, session_id: str, message_text: str, message_type: str = "conversation") -> None:
         """Registra un mensaje del usuario en la sesión."""
         if self.consent_manager and self.consent_manager.session_manager:
@@ -1021,6 +1134,10 @@ class WhatsAppMessageHandler:
                                 f"📋 *Motivo:* {razon}\n\n"
                                 f"Tu caso ha sido escalado automáticamente. Nuestro equipo procesará tu solicitud y te mantendremos informado del progreso."
                             )
+                            
+                            # ✅ NUEVO: Enviar PDF para tutela y desacato
+                            if tipo in ["tutela", "desacato"]:
+                                await self._send_pdf_for_escalation(phone_number, patient_key, tipo)
                     
                     # ✅ Solo mostrar error si NO es recolección de tutela Y NO es exitoso
                     else:
@@ -1542,6 +1659,15 @@ class WhatsAppMessageHandler:
                         f"🎉 ¡Desacato generado y guardado exitosamente!\n\n"
                         f"🆔 Tutela ID: {current_tutela_id}\n"
                         f"📋 Nivel de escalamiento: 5")
+                    
+                    # ✅ NUEVO: Enviar PDF de desacato
+                    if resultado_desacato.get("pdf_url") and resultado_desacato.get("pdf_filename"):
+                        await self._send_document_to_whatsapp(
+                            phone,
+                            resultado_desacato["pdf_url"],
+                            resultado_desacato["pdf_filename"],
+                            f"📎 Incidente de desacato - Tutela ID: {current_tutela_id}"
+                        )
                 else:
                     await self._send_text_message(phone,
                         "⚠️ Desacato generado, pero hubo un error guardándolo.")

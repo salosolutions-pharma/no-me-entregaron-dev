@@ -37,7 +37,7 @@ class PDFGenerator:
         # Usar bucket de documentos generados o el de prescripciones como fallback
         self.bucket_name = bucket_name or os.getenv("BUCKET_DOCUMENTOS_GENERADOS")
         if not self.bucket_name:
-            self.bucket_name = os.getenv("BUCKET_PRESCRIPCIONES", "prescripciones")
+            self.bucket_name = os.getenv("BUCKET_PRESCRIPCIONES")
             logger.warning("BUCKET_DOCUMENTOS_GENERADOS no configurado. Usando bucket de prescripciones.")
         
         logger.info(f"PDFGenerator inicializado con bucket: {self.bucket_name}")
@@ -170,6 +170,7 @@ class PDFGenerator:
                     )
                     
                     logger.info(f"PDF de tutela generado y subido: {pdf_url}")
+                    logger.info(f"📎 PDF tutela listo para envío automático")
                     
                     return {
                         "success": True,
@@ -295,6 +296,7 @@ class PDFGenerator:
                     )
                     
                     logger.info(f"PDF de desacato generado y subido: {pdf_url}")
+                    logger.info(f"📎 PDF desacato listo para envío automático")
                     
                     return {
                         "success": True,

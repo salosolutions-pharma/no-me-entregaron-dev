@@ -533,6 +533,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                             text=format_telegram_text(mensaje),
                             parse_mode=ParseMode.MARKDOWN
                         )
+                        
+                        # ✅ NUEVO: Enviar PDF para tutela y desacato
+                        if tipo in ["tutela", "desacato"]:
+                            await _send_pdf_for_escalation(query.message.chat_id, patient_key, tipo, context)
+                            
                 # ✅ TERCERO: Solo mostrar error si no es recolección Y no es exitoso
                 else:
                     error = resultado.get("error", "Error desconocido")
@@ -1204,8 +1209,12 @@ async def handle_tutela_field_response(update: Update, context: ContextTypes.DEF
     tutela_data = context.user_data.get("tutela_data_temp", {})
     user_response = update.message.text.strip()
     
-    # ✅ CRÍTICO: Asegurar tutela_id desde el inicio
+    session_context = get_session_context(context)
+    current_session_id = session_context.get("session_id") or context.user_data.get("session_id", "")
     current_tutela_id = ensure_tutela_id_in_context(context)
+
+    logger.info(f"🔍 Session ID detectado: '{current_session_id}'")
+
     if not current_tutela_id:
         logger.error("❌ No se pudo obtener/generar tutela_id para recolección")
         await send_and_log_message(
@@ -1269,16 +1278,24 @@ async def handle_tutela_field_response(update: Update, context: ContextTypes.DEF
                     resultado_desacato = generar_desacato(patient_key, tutela_data, current_tutela_id)
                     
                     if resultado_desacato.get("success"):
-                        # 3. Guardar reclamación de desacato
-                        guardado = await save_reclamacion_to_database(
-                            patient_key=patient_key,
-                            tipo_accion="desacato",
-                            texto_reclamacion=resultado_desacato["texto_reclamacion"],
-                            estado_reclamacion="pendiente_radicacion",
-                            nivel_escalamiento=5,
-                            session_id=context.user_data.get("session_id", ""),
-                            resultado_claim_generator=resultado_desacato
-                        )
+                        # 3. Guardar reclamación de desacato usando la función completa
+                        try:
+                            from processor_image_prescription.bigquery_pip import get_bigquery_client
+                            from claim_manager.claim_generator import _guardar_escalamiento_individual
+                            
+                            client = get_bigquery_client()
+                            
+                            guardado = _guardar_escalamiento_individual(
+                                client, 
+                                patient_key, 
+                                resultado_desacato, 
+                                5,  # nivel_escalamiento
+                                current_session_id  # Ya lo obtuvimos al inicio
+                            )
+
+                        except Exception as e:
+                            logger.error(f"Error guardando desacato con función completa: {e}")
+                            guardado = False
                         
                         if guardado:
                             await send_and_log_message(
@@ -1290,6 +1307,16 @@ async def handle_tutela_field_response(update: Update, context: ContextTypes.DEF
                                 f"Nuestro equipo procesará tu solicitud y te mantendremos informado del progreso.",
                                 context
                             )
+                            
+                            # ✅ NUEVO: Enviar PDF de desacato
+                            if resultado_desacato.get("pdf_url") and resultado_desacato.get("pdf_filename"):
+                                await _send_document_to_telegram(
+                                    chat_id,
+                                    resultado_desacato["pdf_url"],
+                                    resultado_desacato["pdf_filename"], 
+                                    context,
+                                    f"Incidente de desacato - Tutela ID: {current_tutela_id}"
+                                )
                         else:
                             await send_and_log_message(
                                 chat_id,
@@ -1370,6 +1397,129 @@ def format_telegram_text(text: str) -> str:
     
     return text
 
+async def _send_document_to_telegram(chat_id: int, document_url: str, 
+                                   filename: str, context: ContextTypes.DEFAULT_TYPE,
+                                   caption: str = "") -> bool:
+    """Envía un documento PDF al usuario de Telegram descargando directamente desde Cloud Storage."""
+    try:
+        from google.cloud import storage
+        import tempfile
+        from pathlib import Path
+        
+        # Extraer bucket y path desde gs:// URL
+        if not document_url.startswith("gs://"):
+            logger.error(f"URL no válida para Cloud Storage: {document_url}")
+            return False
+            
+        gs_parts = document_url.replace("gs://", "").split("/", 1)
+        bucket_name = gs_parts[0]
+        blob_name = gs_parts[1] if len(gs_parts) > 1 else ""
+        
+        logger.info(f"📥 Descargando PDF directamente desde Cloud Storage: bucket={bucket_name}, blob={blob_name}")
+        
+        # Crear cliente de Cloud Storage usando credenciales por defecto
+        from processor_image_prescription.cloud_storage_pip import get_cloud_storage_client
+        storage_client = get_cloud_storage_client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(blob_name)
+        
+        # Verificar que el blob existe
+        if not blob.exists():
+            logger.error(f"El archivo no existe en Cloud Storage: {document_url}")
+            return False
+        
+        # Crear archivo temporal
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temp_file:
+            temp_path = Path(temp_file.name)
+        
+        try:
+            # Descargar directamente desde Cloud Storage al archivo temporal
+            blob.download_to_filename(str(temp_path))
+            logger.info(f"📥 PDF descargado exitosamente: {temp_path.stat().st_size} bytes")
+            
+            # Enviar el archivo como documento
+            with open(temp_path, 'rb') as pdf_file:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=pdf_file,
+                    filename=filename,
+                    caption=caption,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            
+            logger.info(f"📎 PDF enviado exitosamente a Telegram: {filename}")
+            return True
+            
+        finally:
+            # Limpiar archivo temporal
+            if temp_path.exists():
+                temp_path.unlink()
+                logger.debug(f"Archivo temporal eliminado: {temp_path}")
+        
+    except Exception as e:
+        logger.error(f"Error enviando PDF a Telegram: {e}")
+        
+        # Fallback SEGURO: Solo notificar que hay un documento, SIN URLs
+        try:
+            fallback_message = format_telegram_text(
+                f"📎 *{caption}*\n\n"
+                f"Tu documento `{filename}` ha sido generado exitosamente.\n"
+                f"Por motivos técnicos temporales, nuestro equipo te lo enviará por otro medio.\n\n"
+                f"¡Disculpa las molestias!"
+            )
+            
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=fallback_message,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except:
+            pass
+            
+        return False
+
+async def _send_pdf_for_escalation(chat_id: int, patient_key: str, tipo: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Busca y envía el PDF de la reclamación recién creada."""
+    try:
+        from processor_image_prescription.bigquery_pip import get_bigquery_client, PROJECT_ID, DATASET_ID, TABLE_ID
+        from google.cloud import bigquery
+        
+        client = get_bigquery_client()
+        
+        query_sql = f"""
+        SELECT reclamaciones
+        FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
+        WHERE paciente_clave = @patient_key
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)]
+        )
+        
+        results = client.query(query_sql, job_config=job_config).result()
+        
+        for row in results:
+            reclamaciones = row.reclamaciones if row.reclamaciones else []
+            # Buscar la reclamación más reciente del tipo específico
+            for rec in reversed(reclamaciones):
+                if (rec.get("tipo_accion") == tipo and 
+                    rec.get("url_documento") and 
+                    rec.get("url_documento").strip()):
+                    
+                    pdf_url = rec["url_documento"]
+                    pdf_filename = f"{tipo}_{patient_key}.pdf"
+                    
+                    await _send_document_to_telegram(
+                        chat_id, pdf_url, pdf_filename, context,
+                        f"Documento de {tipo}"
+                    )
+                    return
+            break
+            
+        logger.warning(f"No se encontró PDF para {tipo} del paciente {patient_key}")
+        
+    except Exception as e:
+        logger.error(f"Error enviando PDF de {tipo}: {e}")
 
 def create_application() -> Application:
     '''Carga y configura una instancia de Application de python-telegram-bot:

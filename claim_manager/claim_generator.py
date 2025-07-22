@@ -546,6 +546,8 @@ class ClaimGenerator:
                         pdf_url = pdf_result["pdf_url"]
                         pdf_filename = pdf_result["pdf_filename"]
                         logger.info(f"✅ PDF generado automáticamente: {pdf_url}")
+                        logger.info(f"📎 PDF listo para envío: {pdf_filename}")
+
                     else:
                         error_msg = pdf_result.get("error") if pdf_result else "Unknown error"
                         logger.error(f"❌ Error generando PDF: {error_msg}")
@@ -2045,6 +2047,14 @@ def _guardar_escalamiento_individual(client, patient_key: str, resultado: Dict, 
         tipo = resultado.get("tipo") or resultado.get("tipo_reclamacion") or "reclamacion_eps"
         texto_reclamacion = resultado.get("texto_reclamacion", "")
         
+        # ✅ NUEVO: LOGS DE DEBUG PARA ENTENDER EL PROBLEMA
+        logger.info(f"🔍 DEBUG ESCALAMIENTO:")
+        logger.info(f"   - Patient key: {patient_key}")
+        logger.info(f"   - Nivel actual: {nivel}")
+        logger.info(f"   - Tipo actual: {tipo}")
+        if nivel == 5 and tipo == "desacato":
+            logger.info(f"🔄 DEBERÍA actualizar tutela nivel 4 a 'escalado'")
+        
         # ✅ Escapar texto para SQL (reemplazar comillas simples)
         texto_escaped = texto_reclamacion.replace("'", "''") if texto_reclamacion else ""
         
@@ -2117,7 +2127,29 @@ def _guardar_escalamiento_individual(client, patient_key: str, resultado: Dict, 
             ]
         )
         
-        client.query(sql, job_config=job_config).result()
+        update_result = client.query(sql, job_config=job_config).result()
+        
+        # ✅ NUEVO: LOG PARA VERIFICAR SI LA ACTUALIZACIÓN FUNCIONÓ
+        rows_updated = getattr(update_result, 'num_dml_affected_rows', 0)
+        logger.info(f"🔧 Actualización de estados: {rows_updated} filas afectadas")
+        
+        # ✅ NUEVO: VERIFICAR EL ESTADO DE LA TUTELA DESPUÉS DE LA ACTUALIZACIÓN
+        if nivel == 5 and tipo == "desacato":
+            verify_query = f"""
+            SELECT r.tipo_accion, r.nivel_escalamiento, r.estado_reclamacion
+            FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}` AS t,
+            UNNEST(t.reclamaciones) AS r
+            WHERE t.paciente_clave = @patient_key
+            AND r.tipo_accion = 'tutela'
+            AND r.nivel_escalamiento = 4
+            """
+            
+            verify_results = client.query(verify_query, job_config=job_config).result()
+            for row in verify_results:
+                logger.info(f"🔍 ESTADO TUTELA DESPUÉS DE UPDATE: {row.estado_reclamacion}")
+                break
+            else:
+                logger.warning(f"⚠️ NO se encontró tutela nivel 4 para paciente {patient_key}")
         
         # ✅ AHORA AGREGAR el nuevo registro usando una sintaxis más simple
         # Usar ARRAY concatenation más explícita
