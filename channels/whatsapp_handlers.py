@@ -541,74 +541,96 @@ class WhatsAppMessageHandler:
             self.logger.error(f"Error enviando mensaje interactivo a {phone_number}: {e}")
 
     async def _send_document_to_whatsapp(self, phone_number: str, document_url: str, 
-                                       filename: str, caption: str = "") -> bool:
-        """Envía un documento PDF al usuario de WhatsApp."""
+                                   filename: str, caption: str = "") -> bool:
+        """Envía un documento PDF al usuario de WhatsApp usando Media API."""
         try:
             import tempfile
-            import requests
             from pathlib import Path
             
-            # Descargar el archivo desde Cloud Storage
-            self.logger.info(f"📥 Descargando PDF desde: {document_url}")
+            self.logger.info(f"📥 Preparando envío de PDF por WhatsApp: {document_url}")
             
-            # Convertir gs:// URL a https:// URL pública
+            # Descargar PDF desde Cloud Storage
             if document_url.startswith("gs://"):
-                # Extraer bucket y path
-                gs_parts = document_url.replace("gs://", "").split("/", 1)
-                bucket_name = gs_parts[0]
-                file_path = gs_parts[1] if len(gs_parts) > 1 else ""
-                
-                # URL pública de Google Cloud Storage
-                public_url = f"https://storage.googleapis.com/{bucket_name}/{file_path}"
+                # Usar función para descargar desde Google Cloud Storage
+                pdf_content = await self._download_pdf_from_cloud_storage(document_url)
             else:
-                public_url = document_url
-            
-            # Descargar el archivo
-            response = requests.get(public_url, timeout=30)
-            response.raise_for_status()
+                # URL pública directa
+                import requests
+                response = requests.get(document_url, timeout=30)
+                response.raise_for_status()
+                pdf_content = response.content
             
             # Crear archivo temporal
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temp_file:
-                temp_file.write(response.content)
+                temp_file.write(pdf_content)
                 temp_path = Path(temp_file.name)
             
             try:
-                # Subir archivo temporal a un servidor accesible para WhatsApp
-                # (WhatsApp Business API requiere URLs públicas accesibles)
-                
-                # Opción 1: Usar la URL pública de Google Cloud Storage directamente
+                # Enviar usando el método mejorado del cliente
                 normalized_phone = self.wa_client.validate_phone_number(phone_number)
-                self.wa_client.send_document_message(
-                    normalized_phone, 
-                    public_url,  # WhatsApp descarga desde la URL pública
-                    filename, 
+                success = self.wa_client.send_pdf_complete(
+                    normalized_phone,
+                    str(temp_path),
+                    filename,
                     caption
                 )
                 
-                self.logger.info(f"📎 PDF enviado exitosamente a WhatsApp: {filename}")
-                return True
-                
+                if success:
+                    self.logger.info(f"📎 PDF enviado exitosamente a WhatsApp: {filename}")
+                    return True
+                else:
+                    self.logger.error(f"❌ Error enviando PDF por WhatsApp")
+                    
+                    # Fallback: enviar mensaje con enlace
+                    fallback_message = (
+                        f"📎 {caption}\n\n"
+                        f"Hubo un problema enviando tu documento directamente.\n"
+                        f"Nuestro equipo te contactará con el documento."
+                    )
+                    await self._send_text_message(phone_number, fallback_message)
+                    return False
+                    
             finally:
                 # Limpiar archivo temporal
                 if temp_path.exists():
                     temp_path.unlink()
             
         except Exception as e:
-            self.logger.error(f"Error enviando PDF a WhatsApp: {e}")
+            self.logger.error(f"❌ Error enviando PDF a WhatsApp: {e}")
             
-            # Fallback: enviar mensaje con enlace si falla
+            # Fallback final
             try:
                 fallback_message = (
                     f"📎 {caption}\n\n"
-                    f"Hubo un problema enviando tu documento directamente.\n"
-                    f"Puedes descargarlo desde: {document_url}"
+                    f"Hubo un problema técnico enviando tu documento.\n"
+                    f"Nuestro equipo procesará tu solicitud y te contactará pronto."
                 )
-                
                 await self._send_text_message(phone_number, fallback_message)
             except:
                 pass
                 
             return False
+
+    async def _download_pdf_from_cloud_storage(self, gs_url: str) -> bytes:
+        """Descarga un PDF desde Google Cloud Storage"""
+        try:
+            from google.cloud import storage
+            
+            # Extraer bucket y blob del gs:// URL
+            parts = gs_url.replace('gs://', '').split('/', 1)
+            bucket_name = parts[0]
+            blob_name = parts[1] if len(parts) > 1 else ""
+            
+            client = storage.Client()
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+            
+            self.logger.info(f"📥 Descargando PDF desde Cloud Storage: {gs_url}")
+            return blob.download_as_bytes()
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error descargando PDF desde {gs_url}: {e}")
+            raise
         
     async def _send_pdf_for_escalation(self, phone_number: str, patient_key: str, tipo: str) -> None:
         """Busca y envía el PDF de la reclamación recién creada."""

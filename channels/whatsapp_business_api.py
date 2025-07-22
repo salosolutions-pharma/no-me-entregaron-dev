@@ -222,3 +222,88 @@ class WhatsAppBusinessAPIClient:
         # o usando la Graph API de una manera más compleja
         logger.info(f"Para configurar webhook, usa la interfaz de Facebook: {webhook_url}")
         return True
+    
+    def upload_media(self, file_path: str, media_type: str = "document") -> Optional[str]:
+        """Sube un archivo a WhatsApp Media API y retorna el media_id"""
+        endpoint = f"{self.phone_number_id}/media"
+        url = f"{self.base_url}/{endpoint}"
+        
+        # Headers sin Content-Type (se genera automáticamente)
+        headers = {
+            "Authorization": f"Bearer {self.access_token}"
+        }
+        
+        try:
+            with open(file_path, 'rb') as file:
+                files = {
+                    'file': ('document.pdf', file, 'application/pdf'),
+                    'messaging_product': (None, 'whatsapp'),
+                    'type': (None, 'application/pdf')
+                }
+                
+                logger.info(f"📤 Subiendo archivo a WhatsApp Media API: {file_path}")
+                response = requests.post(url, headers=headers, files=files, timeout=30)
+                
+                if response.status_code == 200:
+                    media_id = response.json().get('id')
+                    logger.info(f"✅ Archivo subido exitosamente. Media ID: {media_id}")
+                    return media_id
+                else:
+                    logger.error(f"❌ Error subiendo archivo: {response.status_code} - {response.text}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"❌ Error en upload_media: {e}")
+            return None
+
+    def send_document_with_media_id(self, to: str, media_id: str, 
+                                filename: str = "documento.pdf", 
+                                caption: Optional[str] = None) -> Dict[str, Any]:
+        """Envía un documento usando media_id obtenido del upload"""
+        clean_to = self.validate_phone_number(to)
+        
+        data = {
+            "messaging_product": "whatsapp",
+            "to": clean_to,
+            "type": "document",
+            "document": {
+                "id": media_id,
+                "filename": filename
+            }
+        }
+        
+        if caption:
+            data["document"]["caption"] = caption
+        
+        logger.info(f"📱 Enviando documento por WhatsApp a {clean_to}")
+        endpoint = f"{self.phone_number_id}/messages"
+        return self._make_request("POST", endpoint, data)
+
+    def send_pdf_complete(self, to: str, pdf_path: str, 
+                        filename: str = None, caption: str = None) -> bool:
+        """Método completo: sube y envía PDF en un solo paso"""
+        try:
+            logger.info(f"🔄 Iniciando envío de PDF por WhatsApp: {pdf_path}")
+            
+            # 1. Subir archivo
+            media_id = self.upload_media(pdf_path)
+            if not media_id:
+                return False
+            
+            # 2. Enviar documento
+            final_filename = filename or os.path.basename(pdf_path)
+            result = self.send_document_with_media_id(to, media_id, final_filename, caption)
+            
+            # 3. Verificar éxito
+            success = 'messages' in result and len(result['messages']) > 0
+            
+            if success:
+                logger.info("✅ PDF enviado exitosamente por WhatsApp")
+            else:
+                logger.error(f"❌ Error enviando PDF: {result}")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"❌ Error en send_pdf_complete: {e}")
+            return False
