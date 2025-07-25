@@ -147,28 +147,25 @@ def update_single_field_safe(patient_key: str, field_name: str, field_value: Any
         #     logger.warning(f"Tipo no soportado para UPDATE directo: {type(field_value)}")
         #     return False
 
-        if isinstance(field_value, bool):
-            field_type = "BOOL"
-        elif isinstance(field_value, int):
-            field_type = "INT64"
-        elif isinstance(field_value, float):
-            field_type = "FLOAT64"
-        elif isinstance(field_value, list):
-            # NOTA: Para listas deberías hacer un query especializado, no SET = @param
-            # Así que aquí puedes retornar False o hacer un handler especial como ya tienes arriba
-            ...
+        if field_name in ["correo", "telefono_contacto", "informante"]:  # los campos tipo array
+            # Si el valor es string, conviértelo en array
+            if isinstance(field_value, str):
+                value_for_bq = [field_value] if field_value else []
+            elif isinstance(field_value, list):
+                value_for_bq = field_value
+            else:
+                value_for_bq = []
+            field_type = "ARRAY<STRING>"
         else:
-            field_type = "STRING"
-        if isinstance(field_value, bool):
-            field_type = "BOOL"
-        elif isinstance(field_value, int):
-            field_type = "INT64"
-        elif isinstance(field_value, float):
-            field_type = "FLOAT64"
-        elif field_value is None:
-            field_type = "STRING"  # o el tipo real, pero None se pasa como NULL
-        else:
-            field_type = "STRING"
+            value_for_bq = field_value
+            if isinstance(field_value, bool):
+                field_type = "BOOL"
+            elif isinstance(field_value, int):
+                field_type = "INT64"
+            elif isinstance(field_value, float):
+                field_type = "FLOAT64"
+            else:
+                field_type = "STRING"
 
         # UPDATE seguro
         update_query = f"""
@@ -179,7 +176,9 @@ def update_single_field_safe(patient_key: str, field_name: str, field_value: Any
 
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
-                bigquery.ScalarQueryParameter("field_value", field_type, field_value),
+                bigquery.ArrayQueryParameter("field_value", "STRING", value_for_bq)
+                if field_type.startswith("ARRAY") else
+                bigquery.ScalarQueryParameter("field_value", field_type, value_for_bq),
                 bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)
             ]
         )
