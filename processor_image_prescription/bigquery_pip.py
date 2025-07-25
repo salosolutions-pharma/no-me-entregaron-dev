@@ -126,36 +126,60 @@ def update_single_field_safe(patient_key: str, field_name: str, field_value: Any
 
         # ✅ RESTO DEL CÓDIGO EXISTENTE SIN CAMBIOS
         # Preparar valor para SQL
-        if field_value is None:
-            sql_value = "NULL"
-        elif isinstance(field_value, str):
-            escaped_value = field_value.replace("'", "''")
-            sql_value = f"'{escaped_value}'"
-        elif isinstance(field_value, bool):
-            sql_value = "TRUE" if field_value else "FALSE"
-        elif isinstance(field_value, (int, float)):
-            sql_value = str(field_value)
+        # if field_value is None:
+        #     sql_value = "NULL"
+        # elif isinstance(field_value, str):
+        #     escaped_value = field_value.replace("'", "''")
+        #     sql_value = f"'{escaped_value}'"
+        # elif isinstance(field_value, bool):
+        #     sql_value = "TRUE" if field_value else "FALSE"
+        # elif isinstance(field_value, (int, float)):
+        #     sql_value = str(field_value)
+        # elif isinstance(field_value, list):
+        #     if all(isinstance(item, str) for item in field_value):
+        #         escaped_items = [f"'{item.replace(chr(39), chr(39)+chr(39))}'" 
+        #                        for item in field_value if item.strip()]
+        #         sql_value = f"[{', '.join(escaped_items)}]"
+        #     else:
+        #         logger.warning(f"Array complejo no soportado para UPDATE directo: {field_value}")
+        #         return False
+        # else:
+        #     logger.warning(f"Tipo no soportado para UPDATE directo: {type(field_value)}")
+        #     return False
+
+        if isinstance(field_value, bool):
+            field_type = "BOOL"
+        elif isinstance(field_value, int):
+            field_type = "INT64"
+        elif isinstance(field_value, float):
+            field_type = "FLOAT64"
         elif isinstance(field_value, list):
-            if all(isinstance(item, str) for item in field_value):
-                escaped_items = [f"'{item.replace(chr(39), chr(39)+chr(39))}'" 
-                               for item in field_value if item.strip()]
-                sql_value = f"[{', '.join(escaped_items)}]"
-            else:
-                logger.warning(f"Array complejo no soportado para UPDATE directo: {field_value}")
-                return False
+            # NOTA: Para listas deberías hacer un query especializado, no SET = @param
+            # Así que aquí puedes retornar False o hacer un handler especial como ya tienes arriba
+            ...
         else:
-            logger.warning(f"Tipo no soportado para UPDATE directo: {type(field_value)}")
-            return False
+            field_type = "STRING"
+        if isinstance(field_value, bool):
+            field_type = "BOOL"
+        elif isinstance(field_value, int):
+            field_type = "INT64"
+        elif isinstance(field_value, float):
+            field_type = "FLOAT64"
+        elif field_value is None:
+            field_type = "STRING"  # o el tipo real, pero None se pasa como NULL
+        else:
+            field_type = "STRING"
 
         # UPDATE seguro
         update_query = f"""
             UPDATE `{table_reference}`
-            SET {field_name} = {sql_value}
+            SET {field_name} = @field_value
             WHERE paciente_clave = @patient_key
         """
 
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
+                bigquery.ScalarQueryParameter("field_value", field_type, field_value),
                 bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)
             ]
         )

@@ -66,6 +66,11 @@ class WhatsAppMessageHandler:
             message_text = text_obj.get("body", "") if isinstance(text_obj, dict) else str(text_obj)
             message_id = message_data.get("id", "")
 
+            # ✅ DEDUPLICACIÓN: Verificar si ya procesamos este mensaje
+            if not await self._check_and_mark_processed(f"msg_{message_id}"):
+                self.logger.warning(f"⚠️ Mensaje duplicado ignorado: {message_id}")
+                return
+
             # Marcar mensaje como leído
             try:
                 self.wa_client.mark_message_as_read(message_id)
@@ -171,6 +176,12 @@ class WhatsAppMessageHandler:
             interactive_data = message_data.get("interactive", {})
             button_reply = interactive_data.get("button_reply", {})
             callback_data = button_reply.get("id", "")
+            message_id = message_data.get("id", "")
+
+            # ✅ DEDUPLICACIÓN: Verificar si ya procesamos este callback
+            if not await self._check_and_mark_processed(f"cb_{callback_data}_{message_id}"):
+                self.logger.warning(f"⚠️ Callback duplicado ignorado: {callback_data}")
+                return
 
             self.logger.info(f"Callback WhatsApp recibido de {phone_number}: {callback_data}")
 
@@ -211,6 +222,12 @@ class WhatsAppMessageHandler:
             phone_number = message_data["from"]
             image_data = message_data.get("image", {})
             media_id = image_data.get("id", "")
+            message_id = message_data.get("id", "")
+
+            # ✅ DEDUPLICACIÓN: Verificar si ya procesamos esta imagen
+            if not await self._check_and_mark_processed(f"img_{media_id}_{message_id}"):
+                self.logger.warning(f"⚠️ Imagen duplicada ignorada: {media_id}")
+                return
 
             self.logger.info(f"Procesando imagen de {phone_number}, media_id: {media_id}")
 
@@ -292,6 +309,59 @@ class WhatsAppMessageHandler:
             await self._send_text_message(phone_number, "Ocurrió un error procesando tu imagen. Por favor envía la foto nuevamente.")
 
     # Métodos auxiliares privados
+    async def _check_and_mark_processed(self, unique_id: str, ttl_minutes: int = 5) -> bool:
+        """
+        Verifica si un mensaje/callback ya fue procesado y lo marca como procesado.
+        Usa Firestore para deduplicación distribuida.
+        
+        Args:
+            unique_id: Identificador único del mensaje/callback
+            ttl_minutes: Tiempo de vida del registro en minutos
+            
+        Returns:
+            True si es la primera vez (procesar), False si es duplicado (ignorar)
+        """
+        try:
+            sm = self.consent_manager.session_manager
+            db = sm.db
+            dedup_ref = db.collection("wa_deduplication").document(unique_id)
+
+            loop = asyncio.get_running_loop()
+
+            def _try_create():
+                try:
+                    dedup_ref.create({
+                        "ts": firestore.SERVER_TIMESTAMP,
+                        "processed_at": firestore.SERVER_TIMESTAMP
+                    })
+                    return True  # Primera vez, procesar
+                except AlreadyExists:
+                    return False  # Duplicado, ignorar
+
+            is_first = await loop.run_in_executor(None, _try_create)
+
+            if is_first:
+                # Programar limpieza automática
+                async def _cleanup_later():
+                    await asyncio.sleep(ttl_minutes * 60)
+                    try:
+                        await loop.run_in_executor(None, dedup_ref.delete)
+                        self.logger.debug(f"🧹 Limpieza automática de deduplicación: {unique_id}")
+                    except Exception as e:
+                        self.logger.debug(f"Error en limpieza automática {unique_id}: {e}")
+
+                asyncio.create_task(_cleanup_later())
+                self.logger.debug(f"✅ Procesando por primera vez: {unique_id}")
+                return True
+            else:
+                self.logger.warning(f"⚠️ Duplicado detectado y bloqueado: {unique_id}")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"Error en deduplicación para {unique_id}: {e}")
+            # En caso de error, permitir el procesamiento para evitar bloqueos
+            return True
+
     def _ensure_tutela_id_in_context(self, session_context: Dict[str, Any], phone_number: str) -> str:
         """
         Asegura que hay un tutela_id en el contexto de la sesión.
@@ -733,6 +803,12 @@ class WhatsAppMessageHandler:
             await self._send_text_message(phone_number, "Error de sistema al procesar consentimiento.")
             return
 
+        # ✅ DEDUPLICACIÓN para consentimiento
+        consent_key = f"consent_{session_id}_{granted}"
+        if not await self._check_and_mark_processed(consent_key):
+            self.logger.warning("⚠️ Respuesta de consentimiento duplicada ignorada")
+            return
+
         self.logger.info(f"Procesando consentimiento para {phone_number}, session_id: {session_id}, granted: {granted}")
         
         consent_status = "autorizado" if granted else "no autorizado"
@@ -871,6 +947,12 @@ class WhatsAppMessageHandler:
     async def _handle_regimen_selection(self, phone_number: str, regimen_type: str, session_context: Dict[str, Any]) -> None:
         """Maneja selección de régimen de salud."""
         try:
+            # ✅ DEDUPLICACIÓN para régimen
+            regimen_key = f"regimen_{phone_number}_{regimen_type}"
+            if not await self._check_and_mark_processed(regimen_key):
+                self.logger.warning("⚠️ Selección de régimen duplicada ignorada")
+                return
+                
             patient_key = session_context.get("patient_key")
             session_id = session_context.get("session_id")
             
@@ -897,6 +979,12 @@ class WhatsAppMessageHandler:
     async def _handle_informante_selection(self, phone_number: str, informante_type: str, session_context: Dict[str, Any]) -> None:
         """Maneja selección de informante siguiendo la lógica de Telegram."""
         try:
+            # ✅ DEDUPLICACIÓN para informante
+            informante_key = f"informante_{phone_number}_{informante_type}"
+            if not await self._check_and_mark_processed(informante_key):
+                self.logger.warning("⚠️ Selección de informante duplicada ignorada")
+                return
+                
             patient_key = session_context.get("patient_key")
             session_id = session_context.get("session_id")
             
@@ -936,6 +1024,11 @@ class WhatsAppMessageHandler:
     async def _handle_medication_selection(self, phone_number: str, callback_data: str, session_context: Dict[str, Any]) -> None:
         """Maneja selección de medicamentos."""
         try:
+            # ✅ DEDUPLICACIÓN para medicamentos
+            if not await self._check_and_mark_processed(f"med_{callback_data}_{phone_number}"):
+                self.logger.warning("⚠️ Callback de medicamento duplicado ignorado")
+                return
+                
             session_id = session_context.get("session_id")
             medications = session_context.get("pending_medications", [])
             patient_key = session_context.get("patient_key")
@@ -994,6 +1087,11 @@ class WhatsAppMessageHandler:
     async def _handle_followup_response(self, phone_number: str, callback_data: str, session_context: Dict[str, Any]) -> None:
         """Maneja respuestas de seguimiento para WhatsApp (equivalente a Telegram)."""
         try:
+            # ✅ DEDUPLICACIÓN para followup
+            if not await self._check_and_mark_processed(f"followup_{callback_data}_{phone_number}"):
+                self.logger.warning("⚠️ Callback de followup duplicado ignorado")
+                return
+                
             self.logger.info(f"Procesando followup de WhatsApp: {callback_data}")
             
             if session_context.get("waiting_for_tutela_field"):
@@ -1067,25 +1165,11 @@ class WhatsAppMessageHandler:
 
     async def _handle_escalate_response(self, phone_number: str, callback_data: str, session_context: Dict[str, Any]) -> None:
         """Maneja respuestas de escalamiento (escalate_yes_, escalate_no_)."""
-         
-        sm = self.consent_manager.session_manager
-        db = sm.db                                         # cliente ya conectado a "historia"
-        dedup_ref = db.collection("wa_callbacks").document(callback_data)
-
-        loop = asyncio.get_running_loop()
-
-        def _try_create():
-            try:
-                dedup_ref.create({"ts": firestore.SERVER_TIMESTAMP})
-                return True           # primera vez
-            except AlreadyExists:
-                return False          # duplicado
-
-        is_first = await loop.run_in_executor(None, _try_create)
-
-        if not is_first:
-            self.logger.warning("⚠️ Callback duplicado ignorado")
-            return                   # ✋ salimos SIN escalar
+        
+        # ✅ USAR DEDUPLICACIÓN UNIVERSAL
+        if not await self._check_and_mark_processed(f"escalate_{callback_data}", ttl_minutes=2):
+            self.logger.warning("⚠️ Callback de escalamiento duplicado ignorado")
+            return
         
         try:
         
@@ -1198,15 +1282,10 @@ class WhatsAppMessageHandler:
                     self._close_user_session(session_id, phone_number, reason="user_declined_escalation")
                 except Exception as e:
                     self.logger.warning(f"Error cerrando sesión {session_id}: {e}")
-        finally:
-            async def _del_later():
-                await asyncio.sleep(60)
-                try:
-                    await loop.run_in_executor(None, dedup_ref.delete)
-                except Exception as e:
-                    self.logger.debug(f"No pude borrar dedup {dedup_ref.id}: {e}")
-
-            asyncio.create_task(_del_later())           
+                    
+        except Exception as e:
+            self.logger.error(f"Error manejando respuesta de escalamiento: {e}")
+            await self._send_text_message(phone_number, "Error procesando escalamiento. Intenta nuevamente.")           
 
 
     async def _ask_about_current_medication(self, phone_number: str, session_context: Dict[str, Any]) -> None:
@@ -1704,5 +1783,3 @@ class WhatsAppMessageHandler:
         self._update_session_context(phone, session_context)
         
         return True
-
-            
