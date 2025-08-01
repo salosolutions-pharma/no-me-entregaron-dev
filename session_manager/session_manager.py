@@ -14,8 +14,8 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 PROJECT_ID: str = os.getenv("PROJECT_ID", "")
-FIRESTORE_COLLECTION_SESSIONS_ACTIVE: str = "sesiones_activas"
-FIRESTORE_DATABASE_NAME: str = "historia"
+FIRESTORE_COLLECTION_SESSIONS_ACTIVE: str = os.getenv("FIRESTORE_COLLECTION_SESSIONS_ACTIVE", "")
+FIRESTORE_DATABASE_NAME: str = os.getenv("FIRESTORE_DATABASE_NAME", "")
 
 
 class SessionManagerError(Exception):

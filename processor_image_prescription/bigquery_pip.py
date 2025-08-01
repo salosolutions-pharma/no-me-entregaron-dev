@@ -221,24 +221,27 @@ def add_reclamacion_safe(patient_key: str, nueva_reclamacion: Dict[str, Any]) ->
     try:
         # ✅ USAR solo los campos que existen en el esquema real
         update_query = f"""
-        UPDATE `{table_reference}`
-        SET reclamaciones = ARRAY_CONCAT(
-            IFNULL(reclamaciones, []), 
-            [STRUCT(
-                @med_no_entregados AS med_no_entregados,
-                @tipo_accion AS tipo_accion,
-                @texto_reclamacion AS texto_reclamacion,
-                @estado_reclamacion AS estado_reclamacion,
-                @nivel_escalamiento AS nivel_escalamiento,
-                @url_documento AS url_documento,
-                @numero_radicado AS numero_radicado,
-                @fecha_radicacion AS fecha_radicacion,
-                @fecha_revision AS fecha_revision,
-                @id_session AS id_session
-            )]
-        )
-        WHERE paciente_clave = @patient_key
-        """
+            UPDATE `{table_reference}`
+            SET reclamaciones = (
+                SELECT ARRAY_CONCAT(
+                    IFNULL(reclamaciones, []),
+                    [STRUCT(
+                        @med_no_entregados AS med_no_entregados,
+                        @tipo_accion AS tipo_accion,
+                        @texto_reclamacion AS texto_reclamacion,
+                        @estado_reclamacion AS estado_reclamacion,
+                        @nivel_escalamiento AS nivel_escalamiento,
+                        @url_documento AS url_documento,
+                        @numero_radicado AS numero_radicado,
+                        @fecha_radicacion AS fecha_radicacion,
+                        @fecha_revision AS fecha_revision,
+                        @id_session AS id_session
+                    )]
+                )
+                FROM UNNEST([1])
+            )
+            WHERE paciente_clave = @patient_key
+            """
 
         query_parameters = [
             bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key),
@@ -675,11 +678,52 @@ def insert_or_update_patient_data(patient_data: Dict[str, Any],
         load_table_from_json_direct([new_patient_record], table_reference)
         logger.info(f"✅ Paciente '{patient_key}' insertado.")
 
+def _get_next_patient_index() -> int:
+    """
+    Obtiene el próximo índice auto-incremental para un nuevo paciente.
+    Consulta el máximo índice actual y retorna el siguiente.
+    """
+    if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
+        raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
+
+    client = get_bigquery_client()
+    table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
+
+    try:
+        # Obtener el máximo índice actual
+        max_index_query = f"""
+            SELECT MAX(`index`) as max_index
+            FROM `{table_reference}`
+        """
+
+        logger.info("🔢 Obteniendo próximo índice de paciente...")
+        query_job = client.query(max_index_query)
+        results = query_job.result()
+
+        max_index = 0
+        for row in results:
+            max_index = row.max_index if row.max_index is not None else 0
+            break
+
+        next_index = max_index + 1
+        logger.info(f"✅ Próximo índice de paciente: {next_index}")
+        return next_index
+
+    except Exception as e:
+        logger.error(f"❌ Error obteniendo próximo índice: {e}")
+        # En caso de error, usar timestamp como fallback para evitar duplicados
+        import time
+        fallback_index = int(time.time()) % 1000000  # Usar últimos 6 dígitos del timestamp
+        logger.warning(f"⚠️ Usando índice fallback: {fallback_index}")
+        return fallback_index        
+
 
 def _prepare_clean_patient_record(patient_data: Dict[str, Any], 
                                  fields_to_update: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Prepara un registro limpio del paciente."""
+    next_index = _get_next_patient_index()
     new_patient_record = {
+        "index": next_index,
         "paciente_clave": patient_data.get("paciente_clave", ""),
         "pais": patient_data.get("pais", "CO"),
         "tipo_documento": patient_data.get("tipo_documento") or "",

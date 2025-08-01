@@ -102,18 +102,6 @@ class WhatsAppMessageHandler:
                 )
                 return
 
-            # 2) Verificar inactividad de sesión
-            if self.consent_manager and session_id:
-                expired = self.consent_manager.session_manager.check_session_inactivity(session_id)
-                if expired:
-                    # Sesión caducada: limpiar y reiniciar
-                    self._update_session_context(phone_number, {})
-                    await self._send_text_message(
-                        phone_number,
-                        "¡Hola de nuevo! 👋 Tu sesión expiró por inactividad. Empecemos otra vez."
-                    )
-                    return
-
             # 3) Manejo de despedida
             if (self.consent_manager and
                 self.consent_manager.should_close_session(message_text, session_context)):
@@ -324,7 +312,7 @@ class WhatsAppMessageHandler:
         try:
             sm = self.consent_manager.session_manager
             db = sm.db
-            dedup_ref = db.collection("wa_deduplication").document(unique_id)
+            dedup_ref = db.collection("wa_deduplication-dev").document(unique_id)
 
             loop = asyncio.get_running_loop()
 
@@ -397,21 +385,9 @@ class WhatsAppMessageHandler:
             
             for doc in docs:
                 session_data = doc.to_dict()
-                # Verificar que no haya expirado (6 horas)
-                last_activity = session_data.get("last_activity_at")
-                if last_activity:
-                    from datetime import datetime, timedelta
-                    import pytz
-                    colombia_tz = pytz.timezone('America/Bogota')
-                    current_time = datetime.now(colombia_tz)
-                    last_activity_time = last_activity.astimezone(colombia_tz)
-                    
-                    if (current_time - last_activity_time) < timedelta(hours=6):
-                        return doc.id
-                    else:
-                        # Sesión expirada, cerrarla
-                        self.consent_manager.session_manager.close_session(doc.id, "expired")
-            
+                # Solo devolver la sesión activa sin verificar tiempo
+                return doc.id
+
             return None
             
         except Exception as e:
@@ -1088,7 +1064,7 @@ class WhatsAppMessageHandler:
         """Maneja respuestas de seguimiento para WhatsApp (equivalente a Telegram)."""
         try:
             # ✅ DEDUPLICACIÓN para followup
-            if not await self._check_and_mark_processed(f"followup_{callback_data}_{phone_number}"):
+            if not await self._check_and_mark_processed(f"{callback_data}_{phone_number}"):
                 self.logger.warning("⚠️ Callback de followup duplicado ignorado")
                 return
                 
@@ -1240,11 +1216,26 @@ class WhatsAppMessageHandler:
                                 f"📋 *Motivo:* {razon}\n\n"
                                 f"Tu caso ha sido escalado automáticamente. Nuestro equipo procesará tu solicitud y te mantendremos informado del progreso."
                             )
-                            
-                            # ✅ NUEVO: Enviar PDF para tutela y desacato
+
+                            # ✅ NUEVO: Guardar metadata del PDF en BigQuery si aplica
+                            if resultado.get("pdf_url"):
+                                from processor_image_prescription.bigquery_pip import save_document_url_to_reclamacion
+                                try:
+                                    save_document_url_to_reclamacion(
+                                        patient_key=patient_key,
+                                        session_id=session_id,
+                                        url_documento=resultado["pdf_url"],
+                                        tipo_documento=tipo
+                                    )
+                                    self.logger.info(f"✅ URL del documento guardado correctamente en BigQuery")
+                                except Exception as save_err:
+                                    self.logger.warning(f"⚠️ Error guardando URL del documento: {save_err}")
+
+                            # ✅ Enviar PDF para tutela y desacato
                             if tipo in ["tutela", "desacato"]:
                                 await self._send_pdf_for_escalation(phone_number, patient_key, tipo)
-                    
+
+            
                     # ✅ Solo mostrar error si NO es recolección de tutela Y NO es exitoso
                     else:
                         error = resultado.get("error", "Error desconocido")
@@ -1744,37 +1735,47 @@ class WhatsAppMessageHandler:
             # 2) Generar el desacato CON tutela_id OBLIGATORIO
             resultado_desacato = generar_desacato(patient_key, temp, current_tutela_id)
 
-            # 3) Guardar la reclamación de desacato
+            # 3) ✅ CORREGIDO: Usar función correcta para guardar desacato (como tutela)
             if resultado_desacato.get("success"):
-                guardado = await self._save_reclamation_to_database(
-                    patient_key=patient_key,
-                    tipo_accion="desacato",
-                    texto_reclamacion=resultado_desacato["texto_reclamacion"],
-                    estado_reclamacion="pendiente_radicacion",
-                    nivel_escalamiento=5,
-                    session_id=session_context.get("session_id", ""),
-                    resultado_claim_generator=resultado_desacato
-                )
-                if guardado:
-                    await self._send_text_message(phone,
-                        f"🎉 ¡Desacato generado y guardado exitosamente!\n\n"
-                        f"🆔 Tutela ID: {current_tutela_id}\n"
-                        f"📋 Nivel de escalamiento: 5")
+                try:
+                    # Importar la función que SÍ funciona (la que usa tutela)
+                    from claim_manager.claim_generator import _guardar_escalamiento_individual
+                    from processor_image_prescription.bigquery_pip import get_bigquery_client
                     
-                    # ✅ NUEVO: Enviar PDF de desacato
-                    if resultado_desacato.get("pdf_url") and resultado_desacato.get("pdf_filename"):
-                        await self._send_document_to_whatsapp(
-                            phone,
-                            resultado_desacato["pdf_url"],
-                            resultado_desacato["pdf_filename"],
-                            f"📎 Incidente de desacato - Tutela ID: {current_tutela_id}"
-                        )
-                else:
+                    client = get_bigquery_client()
+                    session_id = session_context.get("session_id", "")
+                    
+                    # Usar la misma función que tutela (que ya funciona correctamente)
+                    guardado = _guardar_escalamiento_individual(
+                        client=client,
+                        patient_key=patient_key,
+                        resultado=resultado_desacato,
+                        nivel=5,  # Desacato siempre es nivel 5
+                        current_session_id=session_id
+                    )
+                    
+                    if guardado:
+                        await self._send_text_message(phone,
+                            f"🎉 ¡Desacato generado y guardado exitosamente!\n\n"
+                            f"🆔 Tutela ID: {current_tutela_id}\n"
+                            f"📋 Nivel de escalamiento: 5")
+                        
+                        # Enviar PDF de desacato
+                        if resultado_desacato.get("pdf_url") and resultado_desacato.get("pdf_filename"):
+                            await self._send_document_to_whatsapp(
+                                phone,
+                                resultado_desacato["pdf_url"],
+                                resultado_desacato["pdf_filename"],
+                                f"📎 Incidente de desacato - Tutela ID: {current_tutela_id}"
+                            )
+                    else:
+                        await self._send_text_message(phone,
+                            "⚠️ Desacato generado, pero hubo un error guardándolo.")
+                            
+                except Exception as e:
+                    self.logger.error(f"Error usando función correcta para desacato: {e}")
                     await self._send_text_message(phone,
-                        "⚠️ Desacato generado, pero hubo un error guardándolo.")
-            else:
-                await self._send_text_message(phone,
-                    "❌ Error generando tu desacato automáticamente.")
+                        "⚠️ Error técnico guardando desacato.")
         else:
             await self._send_text_message(phone, 
                 "⚠️ No pude guardar los datos de tu tutela. Intenta nuevamente.")

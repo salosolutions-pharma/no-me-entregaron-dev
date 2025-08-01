@@ -36,6 +36,42 @@ except ImportError as e:
     print(f"Error al importar módulos: {e}")
     sys.exit(1)
 
+def get_session_id_from_patient_key(patient_key: str) -> str:
+    """Busca el session_id más reciente del paciente en BigQuery."""
+    try:
+        from processor_image_prescription.bigquery_pip import get_bigquery_client, PROJECT_ID, DATASET_ID, TABLE_ID
+        from google.cloud import bigquery
+        
+        client = get_bigquery_client()
+        
+        query = f"""
+        SELECT pres.id_session
+        FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}` AS t,
+        UNNEST(t.prescripciones) AS pres
+        WHERE t.paciente_clave = @patient_key
+        AND (pres.id_session LIKE 'TL_%' OR t.canal_contacto = 'TL')  -- ✅ SOLO TELEGRAM
+        ORDER BY pres.fecha_atencion DESC
+        LIMIT 1
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)]
+        )
+        
+        results = client.query(query, job_config=job_config).result()
+        
+        for row in results:
+            session_id = row.id_session
+            logger.info(f"🔍 Session ID de Telegram encontrado en BigQuery: '{session_id}'")
+            return session_id or ""
+            
+        logger.warning(f"⚠️ No se encontró session_id de Telegram para patient_key: {patient_key}")
+        return ""
+        
+    except Exception as e:
+        logger.error(f"❌ Error buscando session_id de Telegram para {patient_key}: {e}")
+        return ""
+    
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
     level=logging.INFO
@@ -232,17 +268,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     session_id = session_context.get("session_id")
 
     try:
-        #✅ NUEVO: Verificar inactividad solo cuando el usuario escribe
-        if session_id and consent_manager:
-            session_expired = consent_manager.session_manager.check_session_inactivity(session_id)
-            if session_expired:
-                # Limpiar sesión expirada y empezar nueva
-                context.user_data.clear()
-                response = ("¡Hola de nuevo! 👋 Tu sesión anterior expiró por inactividad. "
-                          "No te preocupes, podemos comenzar tu solicitud desde el inicio.")
-                await send_and_log_message(chat_id, response, context)
-                return
-
+        
         # ✅ VERIFICAR si el usuario se está despidiendo
         if (consent_manager and 
             consent_manager.should_close_session(user_message, session_context) and 
@@ -453,6 +479,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             try:
                 from claim_manager.claim_generator import auto_escalate_patient
                 resultado = auto_escalate_patient(session_id)
+                resultado["id_session"] = session_id
                 
                 # ✅ PRIMERO: Verificar si requiere recolección de tutela
                 if resultado.get("requiere_recoleccion_tutela") and resultado.get("tipo") == "desacato":
@@ -1210,7 +1237,10 @@ async def handle_tutela_field_response(update: Update, context: ContextTypes.DEF
     user_response = update.message.text.strip()
     
     session_context = get_session_context(context)
-    current_session_id = session_context.get("session_id") or context.user_data.get("session_id", "")
+    current_session_id = (session_context.get("session_id") or 
+                     context.user_data.get("session_id") or 
+                     get_session_id_from_patient_key(patient_key) or "")
+    
     current_tutela_id = ensure_tutela_id_in_context(context)
 
     logger.info(f"🔍 Session ID detectado: '{current_session_id}'")
@@ -1276,7 +1306,14 @@ async def handle_tutela_field_response(update: Update, context: ContextTypes.DEF
                 try:
                     from claim_manager.claim_generator import generar_desacato
                     resultado_desacato = generar_desacato(patient_key, tutela_data, current_tutela_id)
+                    resultado_desacato["id_session"] = current_session_id
                     
+                    logger.info(f"🔍 DEBUG SESSION ID PARA DESACATO:")
+                    logger.info(f"   - context.user_data keys: {list(context.user_data.keys())}")
+                    logger.info(f"   - context.user_data session_id: '{context.user_data.get('session_id')}'")
+                    logger.info(f"   - current_session_id variable: '{current_session_id}'")
+                    logger.info(f"   - resultado_desacato id_session: '{resultado_desacato.get('id_session')}'")
+
                     if resultado_desacato.get("success"):
                         # 3. Guardar reclamación de desacato usando la función completa
                         try:
@@ -1286,11 +1323,11 @@ async def handle_tutela_field_response(update: Update, context: ContextTypes.DEF
                             client = get_bigquery_client()
                             
                             guardado = _guardar_escalamiento_individual(
-                                client, 
-                                patient_key, 
-                                resultado_desacato, 
+                                client,
+                                patient_key,
+                                resultado_desacato,
                                 5,  # nivel_escalamiento
-                                current_session_id  # Ya lo obtuvimos al inicio
+                                current_session_id # <--- Usa esta variable que ya tiene el ID de sesión correcto
                             )
 
                         except Exception as e:

@@ -2046,6 +2046,9 @@ def _guardar_escalamiento_individual(client, patient_key: str, resultado: Dict, 
         medicamentos = resultado.get("medicamentos_afectados", "")
         tipo = resultado.get("tipo") or resultado.get("tipo_reclamacion") or "reclamacion_eps"
         texto_reclamacion = resultado.get("texto_reclamacion", "")
+
+        if not current_session_id:
+            current_session_id = resultado.get("id_session", "")
         
         # ✅ NUEVO: LOGS DE DEBUG PARA ENTENDER EL PROBLEMA
         logger.info(f"🔍 DEBUG ESCALAMIENTO:")
