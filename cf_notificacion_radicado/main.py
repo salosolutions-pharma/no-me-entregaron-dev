@@ -8,9 +8,10 @@ import requests
 from google.cloud import bigquery
 from flask import Request
 import functions_framework
+from utils.logger_config import setup_structured_logging  # 👈 AGREGAR
 
 # Configuración de logging
-logging.basicConfig(level=logging.INFO)
+setup_structured_logging()  # 👈 CAMBIAR ESTA LÍNEA
 logger = logging.getLogger(__name__)
 
 class RadicadoSender:

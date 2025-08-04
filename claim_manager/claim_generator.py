@@ -12,6 +12,7 @@ from processor_image_prescription.bigquery_pip import (
     TABLE_ID
 )
 from google.cloud import bigquery
+from utils.logger_config import setup_structured_logging
 
 def generate_tutela_id() -> str:
     """Devuelve un UUID-4 como string para identificar una tutela."""
@@ -24,9 +25,10 @@ REQUIRED_TUTELA_FIELDS = [
     "juzgado",
     "ciudad"
 ]
+if not logging.getLogger().hasHandlers():  # 👈 AGREGAR
+    setup_structured_logging() 
 
 logger = logging.getLogger(__name__)
-
 
 class ClaimGeneratorError(Exception):
     """Excepción para errores específicos del generador de reclamaciones."""

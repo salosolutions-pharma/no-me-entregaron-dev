@@ -5,15 +5,17 @@ import re
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Dict, List, Union, Optional
-
+from utils.logger_config import setup_structured_logging 
 from motor_eps.parser import EPSParser, EPSParserError
 from llm_core import LLMCore
 from manual_instrucciones.prompt_manager import prompt_manager
 from .cloud_storage_pip import upload_image_to_bucket, CloudStorageServiceError
 from .bigquery_pip import insert_or_update_patient_data
 
-logger = logging.getLogger(__name__)
+if not logging.getLogger().hasHandlers():  # 👈 AGREGAR
+    setup_structured_logging()            # 👈 AGREGAR
 
+logger = logging.getLogger(__name__)
 
 class PIPProcessorError(RuntimeError):
     """Excepción base para errores en PIPProcessor."""
@@ -119,8 +121,8 @@ class PIPProcessor:
 
             self._process_eps(cleaned_data)
             cleaned_data["categoria_riesgo"] = self._classify_risk(cleaned_data)
-            cleaned_data["canal_contacto"] = cleaned_data.get("canal_contacto", "TL")
-
+            cleaned_data["canal_contacto"] = cleaned_data.get("canal_contacto") or self._detect_channel_from_session_id(session_id)
+            
             bigquery_data = self._prepare_data_for_bigquery(cleaned_data, session_id, patient_key, telegram_user_id)
             try:
                 insert_or_update_patient_data(bigquery_data)
@@ -339,6 +341,18 @@ class PIPProcessor:
         if any(keyword in combined_text for keyword in self.RISK_KEYWORDS["priorizado"]):
             return "priorizado"
         return "simple"
+    
+    def _detect_channel_from_session_id(self, session_id: str) -> str:
+        """
+        Detecta el canal desde session_id. Reutiliza la lógica que ya existe en PatientModule.
+        """
+        if session_id.startswith("WA_"):
+            return "WA"
+        elif session_id.startswith("TL_"):
+            return "TL"
+        else:
+            logger.warning(f"Session ID sin prefijo reconocido: {session_id}")
+            return "TL"
 
     def _detect_missing_fields(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Detecta campos que podrían necesitar completarse interactivamente."""

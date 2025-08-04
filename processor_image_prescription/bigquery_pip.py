@@ -3,12 +3,15 @@ import logging
 import os
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
-
+from utils.logger_config import setup_structured_logging
 from dotenv import load_dotenv
 from google.api_core.exceptions import GoogleAPIError
 from google.cloud import bigquery
 
 load_dotenv()
+
+if not logging.getLogger().hasHandlers():  # 👈 AGREGAR
+    setup_structured_logging()            # 👈 AGREGAR
 
 logger = logging.getLogger(__name__)
 

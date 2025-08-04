@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import json
 import re
+from utils.logger_config import setup_structured_logging
 from channels.whatsapp_business_api import WhatsAppBusinessAPIClient, WhatsAppBusinessAPIError
 from typing import Dict, Any
 from google.cloud import firestore
@@ -17,6 +18,9 @@ try:
     from patient_module.patient_module import PatientModule
 except ImportError as e:
     print(f"Error al importar módulos: {e}")
+
+if not logging.getLogger().hasHandlers():
+    setup_structured_logging()
 
 logger = logging.getLogger(__name__)
 

@@ -1,9 +1,10 @@
 from flask import Request
 import logging
 from patient_module.patient_module import PatientModule
+from utils.logger_config import setup_structured_logging
 
 # Nivel de logging para Cloud Functions
-logging.getLogger().setLevel(logging.INFO)
+setup_structured_logging()
 
 def scheduled_followup(request: Request):
     """Trigger para seguimientos de TELEGRAM únicamente."""

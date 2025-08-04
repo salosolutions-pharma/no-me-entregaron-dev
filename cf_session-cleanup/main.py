@@ -2,9 +2,10 @@ from flask import Request
 import logging
 from datetime import datetime, timedelta
 import pytz
+from utils.logger_config import setup_structured_logging  # 👈 AGREGAR
 
-# Nivel de logging para Cloud Functions
-logging.getLogger().setLevel(logging.INFO)
+# Configurar logging estructurado
+setup_structured_logging()  # 👈 AGREGAR
 
 def scheduled_session_cleanup(request: Request):
     """

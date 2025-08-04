@@ -8,6 +8,7 @@ import functions_framework
 import pytz
 from google.api_core.exceptions import GoogleAPIError
 from google.cloud import firestore
+from utils.logger_config import setup_structured_logging  # 👈 AGREGAR ESTA LÍNEA
 
 from processor_image_prescription.bigquery_pip import (
     get_bigquery_client,
@@ -17,6 +18,8 @@ from processor_image_prescription.bigquery_pip import (
     DATASET_ID,
 )
 
+# Configurar logging estructurado
+setup_structured_logging()  # 👈 AGREGAR ESTA LÍNEA
 logger = logging.getLogger(__name__)
 
 TABLE_ID_HISTORY = os.getenv("BIGQUERY_TABLE_ID_HISTORY", "")

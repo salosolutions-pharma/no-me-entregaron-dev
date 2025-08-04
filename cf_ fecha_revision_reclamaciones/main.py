@@ -8,8 +8,10 @@ from flask import Request
 from google.cloud import bigquery
 import pytz
 import traceback
+from utils.logger_config import setup_structured_logging  # 👈 AGREGAR
+
 # Configuración
-logging.basicConfig(level=logging.INFO)
+setup_structured_logging()  # 👈 CAMBIAR ESTA LÍNEA
 logger = logging.getLogger(__name__)
 
 PROJECT_ID = os.getenv("PROJECT_ID")

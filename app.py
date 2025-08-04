@@ -8,8 +8,11 @@ from channels.telegram_c import create_application
 from channels.whatsapp import create_whatsapp_service
 import traceback
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from utils.logger_config import setup_structured_logging
 
+setup_structured_logging()
 logger = logging.getLogger(__name__)
+
 app = FastAPI()
 app.state.telegram_app = None
 app.state.whatsapp_service = None

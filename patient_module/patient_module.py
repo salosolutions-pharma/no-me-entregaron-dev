@@ -7,6 +7,7 @@ from typing import Dict, List, Any, Optional
 import pytz
 import requests
 from google.cloud import bigquery
+from utils.logger_config import setup_structured_logging  # 👈 AGREGAR ESTA LÍNEA
 
 from llm_core import LLMCore
 from claim_manager.claim_generator import (
@@ -20,9 +21,8 @@ from claim_manager.claim_generator import (
 # Configuración de logging
 target = os.getenv('LOG_TARGET', 'stdout')
 if target == 'stdout':
-    logging.basicConfig(level=logging.INFO)
+    setup_structured_logging()
 logger = logging.getLogger(__name__)
-
 
 class PatientModule:
     def __init__(self):

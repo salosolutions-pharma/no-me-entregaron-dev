@@ -72,10 +72,9 @@ def get_session_id_from_patient_key(patient_key: str) -> str:
         logger.error(f"❌ Error buscando session_id de Telegram para {patient_key}: {e}")
         return ""
     
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
-    level=logging.INFO
-)
+from utils.logger_config import setup_structured_logging
+
+setup_structured_logging()
 logger = logging.getLogger(__name__)
 
 load_dotenv()
@@ -809,8 +808,8 @@ async def handle_medication_selection(query, context: ContextTypes.DEFAULT_TYPE,
         selected_undelivered = context.user_data.get("selected_undelivered", [])
 
         logger.info(f"Acción: {action}, Sesión: {session_id}, Índice: {med_index}")
-        logger.info(f"Medicamentos disponibles: {len(medications)}, Seleccionados: {selected_undelivered}")
-
+        session_id = context.user_data.get("session_id", "NO_SESSION")
+        logger.info(f"session_id: {session_id} | Medicamentos disponibles: {len(medications)}, Seleccionados: {selected}")
         if action == "toggle" and med_index != -1:
             if med_index < 0 or med_index >= len(medications):
                 logger.error(f"Índice de medicamento fuera de rango: {med_index}")

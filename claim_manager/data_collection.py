@@ -2,7 +2,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 from datetime import datetime
-
+from utils.logger_config import setup_structured_logging
 from google.api_core.exceptions import GoogleAPIError
 from google.cloud import bigquery
 from manual_instrucciones.prompt_manager import prompt_manager
@@ -19,8 +19,10 @@ from processor_image_prescription.bigquery_pip import (
     load_table_from_json_direct,
 )
 
-logger = logging.getLogger(__name__)
+if not logging.getLogger().hasHandlers():  # 👈 AGREGAR
+    setup_structured_logging()            # 👈 AGREGAR
 
+logger = logging.getLogger(__name__)
 
 class ClaimManagerError(Exception):
     """Excepción para errores específicos del ClaimManager."""
