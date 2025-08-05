@@ -716,7 +716,7 @@ async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     processing_msg = await update.message.reply_text(
-        "📸 En estos momentos estoy leyendo tu fórmula médica, por favor espera..."
+        "📸 Leyendo tu fórmula médica... Un momento por favor."
     )
     temp_image_path: Optional[Path] = None
 
@@ -739,7 +739,7 @@ async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         if isinstance(result, dict):
             context.user_data["prescription_uploaded"] = True
-            await log_user_message(session_id, "He leido tu formula y he encontrado:", "prescription_processed")
+            await log_user_message(session_id, "Fórmula médica procesada correctamente", "prescription_processed")
             context.user_data["patient_key"] = result["patient_key"]
             context.user_data["pip_result"] = result
 
@@ -750,7 +750,7 @@ async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 await send_and_log_message(chat_id, selection_msg, context)
                 await send_and_log_message(
                     chat_id,
-                    "👆 Selecciona los medicamentos que **NO** te han entregado:",
+                    "👆 Marca los medicamentos que **NO** recibiste:",
                     context,
                     reply_markup=create_medications_keyboard(medications, [], session_id),
                 )
@@ -759,11 +759,11 @@ async def process_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             else:
                 await continue_with_missing_fields(update, context, result)
         else:
-            await send_and_log_message(chat_id, "Hubo un problema procesando tu fórmula. Por favor envia la foto nuevamente.", context)
+            await send_and_log_message(chat_id, "No pude leer tu fórmula. Envía la foto nuevamente, por favor.", context)
 
     except Exception as e:
         logger.error(f"Error procesando imagen: {e}", exc_info=True)
-        await send_and_log_message(chat_id, "Ocurrió un error procesando tu imagen. Por favor envia la foto nuevamente.", context)
+        await send_and_log_message(chat_id, "Hubo un problema con la imagen. Intenta enviarla de nuevo.", context)
     finally:
         if temp_image_path and temp_image_path.exists():
             temp_image_path.unlink()
@@ -1036,7 +1036,6 @@ async def prompt_next_missing_field(chat_id: int, context: ContextTypes.DEFAULT_
 
         logger.info(f"Proceso completo finalizado para paciente {patient_key} - sesión Cerrada")
 
-
 async def save_reclamacion_to_database(patient_key: str, tipo_accion: str, 
                                      texto_reclamacion: str, estado_reclamacion: str,
                                      nivel_escalamiento: int, session_id: str,
@@ -1045,6 +1044,7 @@ async def save_reclamacion_to_database(patient_key: str, tipo_accion: str,
     Guarda una nueva reclamación en la tabla pacientes.
     VERSIÓN CORREGIDA: No incluye campos de radicación (numero_radicado, fecha_radicacion).
     Solo incluye campos que maneja el claim_manager según arquitectura.
+    ✅ CORREGIDO: med_no_entregados se guarda como LISTA, no como string.
     """
     try:
         from processor_image_prescription.bigquery_pip import get_bigquery_client, add_reclamacion_safe
@@ -1067,7 +1067,7 @@ async def save_reclamacion_to_database(patient_key: str, tipo_accion: str,
         )
         
         results = client.query(get_query, job_config=job_config).result()
-        med_no_entregados_from_prescriptions = ""
+        meds_no_entregados = []  # ✅ CAMBIO: Inicializar como lista vacía
         
         for row in results:
             prescripciones = row.prescripciones if row.prescripciones else []
@@ -1075,26 +1075,28 @@ async def save_reclamacion_to_database(patient_key: str, tipo_accion: str,
                 ultima_prescripcion = prescripciones[-1]
                 medicamentos = ultima_prescripcion.get("medicamentos", [])
                 
-                meds_no_entregados = []
+                # ✅ CAMBIO: Construir lista directamente
                 for med in medicamentos:
                     if isinstance(med, dict) and med.get("entregado") == "no entregado":
                         nombre = med.get("nombre", "")
                         if nombre:
                             meds_no_entregados.append(nombre)
-                
-                med_no_entregados_from_prescriptions = ", ".join(meds_no_entregados)
             break
-
-        # Preparar nueva reclamación - SOLO campos que maneja claim_manager
+        
+        # ✅ CAMBIO: Usar directamente la lista, no convertir a string
         nueva_reclamacion = {
-            "med_no_entregados": med_no_entregados_from_prescriptions,
+            "med_no_entregados": meds_no_entregados,  # ✅ LISTA directa
             "tipo_accion": tipo_accion,
             "texto_reclamacion": texto_reclamacion,
             "estado_reclamacion": estado_reclamacion,
             "nivel_escalamiento": nivel_escalamiento,
-            "url_documento": "",  # Se actualiza después si hay PDF
-            "id_session": session_id  # ✅ INCLUIR session_id según requisitos
+            "url_documento": "",  
+            "id_session": session_id  
         }
+        
+        # ✅ LOG para debug
+        logger.info(f"🔍 Medicamentos no entregados (lista): {meds_no_entregados}")
+        logger.info(f"🔍 Total medicamentos no entregados: {len(meds_no_entregados)}")
         
         # Usar función segura para agregar reclamación
         success = add_reclamacion_safe(patient_key, nueva_reclamacion)
@@ -1109,7 +1111,6 @@ async def save_reclamacion_to_database(patient_key: str, tipo_accion: str,
     except Exception as e:
         logger.error(f"❌ Error en save_reclamacion_to_database: {e}")
         return False
-
 
 async def handle_informante_selection(query, context: ContextTypes.DEFAULT_TYPE, informante_type: str) -> None:
     """Maneja la selección de 'paciente' o 'cuidador'."""

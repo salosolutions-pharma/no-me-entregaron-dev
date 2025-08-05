@@ -170,16 +170,15 @@ class ClaimManager:
             # ✅ USAR PROMPTS ESTÁTICOS (sin LLM) para campos comunes
             STATIC_PROMPTS = {
                 "correo": "📧 Para continuar con tu reclamación, necesito tu **correo electrónico**. ¿Me lo puedes compartir, por favor?",
-                "telefono_contacto": "📱 Para continuar, necesito tu **número de teléfono** de contacto. ¿Me lo puedes compartir?",
+                "telefono_contacto": "📱 ¿Cuál es tu **número de teléfono** de contacto?",
                 "ciudad": "🏙️ ¿En qué **ciudad** resides actualmente?",
                 "direccion": "🏠 ¿Cuál es tu **dirección** de residencia completa?",
-                "regimen": "🏥 ¿Cuál es tu régimen de salud: Contributivo o Subsidiado?",
-                "farmacia": "🏥 ¿En qué **farmacia** recoges habitualmente tus medicamentos? (Ej: Cruz Verde, Copidrogas, Audifarma)",
+                "regimen": "🏥 ¿Cuál es tu **régimen de salud**: Contributivo o Subsidiado?\n¿Tú o alguien de tu familia paga cada mes a la EPS?\n👉 Si es así, estás en el régimen contributivo.\n👉 Si no, estás en el subsidiado.",                "farmacia": "🏥 ¿En qué **farmacia** recoges habitualmente tus medicamentos? (Ej: Cruz Verde, Copidrogas, Audifarma)",
                 "sede_farmacia": "📍 ¿Cuál es la **sede específica** de la farmacia donde recoges tus medicamentos?",
                 "nombre_paciente": "👤 Para continuar, necesito tu **nombre completo**. ¿Me lo puedes compartir?",
                 "tipo_documento": "🆔 ¿Cuál es tu **tipo de documento**? (CC, TI, CE, PP)",
                 "numero_documento": "🔢 ¿Cuál es tu **número de documento**?",
-                "fecha_nacimiento": "📅 ¿Podrías indicarme tu **fecha de nacimiento** en formato DD/MM/AAAA? (Ej: 15/03/1990)",
+                "fecha_nacimiento": "📅 ¿Podrías indicarme tu **fecha de nacimiento**? (Ej: 15/03/1990)",
             }
             
             # ✅ SI es un campo común, usar prompt estático (MUY RÁPIDO)

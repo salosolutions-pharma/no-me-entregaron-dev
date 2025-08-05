@@ -25,16 +25,16 @@ class PIPProcessor:
     """Procesa imágenes de recetas médicas utilizando LLMs, sube imágenes a Cloud Storage y almacena los datos en BigQuery."""
 
     ERROR_MESSAGES = {
-        "pip_prompt_not_found": "No se encontró el prompt para procesar la fórmula médica. Por favor, contacta con soporte.",
-        "invalid_prescription": "Por favor, envía una foto de una fórmula médica válida y legible para poder procesarla correctamente.",
-        "json_extraction_failed": "No pude extraer la información de tu fórmula correctamente. ¿Podrías enviar una foto más clara?",
-        "json_parse_failed": "Hubo un problema al entender la información de tu fórmula. ¿Podrías enviarla de nuevo?",
-        "extraction_error": "No pude extraer la información de tu fórmula. Asegúrate de que sea una imagen clara y legible.",
-        "no_data_extracted": "No pude encontrar los datos principales en tu fórmula. ¿Es una receta médica válida?",
-        "invalid_patient_data": "La fórmula médica no contiene datos esenciales del paciente. Por favor verifica que sea una receta válida.",
-        "cloud_upload_error": "No se pudo guardar la imagen en la nube. Por favor, inténtalo de nuevo más tarde.",
-        "bigquery_save_error": "No se pudo guardar la información en nuestra base de datos. Inténtalo de nuevo.",
-        "unexpected_error": "Ocurrió un error inesperado al procesar tu fórmula. Por favor, inténtalo de nuevo.",
+        "pip_prompt_not_found": "Error del sistema. Contacta con soporte, por favor.",
+        "invalid_prescription": "📸 Esta imagen no parece ser una fórmula médica.\n\nEnvía una foto clara de tu fórmula completa.",
+        "json_extraction_failed": "No pude leer tu fórmula. ¿Puedes enviar una foto más clara?",
+        "json_parse_failed": "Hubo un problema leyendo tu fórmula. ¿Puedes enviarla de nuevo?",
+        "extraction_error": "No pude leer tu fórmula. Asegúrate de que la foto sea clara.",
+        "no_data_extracted": "No encontré los datos en tu fórmula. ¿Es una receta médica válida?",
+        "invalid_patient_data": "Tu fórmula no tiene todos los datos necesarios. Verifica que sea válida.",
+        "cloud_upload_error": "No pude guardar la imagen. Intenta de nuevo más tarde.",
+        "bigquery_save_error": "No pude guardar tu información. Intenta de nuevo.",
+        "unexpected_error": "Hubo un error procesando tu fórmula. Intenta de nuevo.",
     }
 
     RISK_KEYWORDS = {

@@ -1,6 +1,7 @@
 import logging
 import tempfile
 from pathlib import Path
+import asyncio
 from typing import Any, Dict, List, Optional
 import json
 import re
@@ -10,6 +11,8 @@ from typing import Dict, Any
 from google.cloud import firestore
 import asyncio 
 from google.api_core.exceptions import AlreadyExists
+from enum import Enum
+
 try:
     from BYC.consentimiento import ConsentManager
     from processor_image_prescription.pip_processor import PIPProcessor
@@ -23,6 +26,7 @@ if not logging.getLogger().hasHandlers():
     setup_structured_logging()
 
 logger = logging.getLogger(__name__)
+
 
 def format_whatsapp_text(message: str) -> str:
     """
@@ -45,6 +49,40 @@ def format_whatsapp_text(message: str) -> str:
     
     return message
 
+class SessionState:
+    """Estados de sesión para manejo de múltiples prescripciones."""
+    WAITING_CONSENT = "waiting_consent"
+    WAITING_FIRST_PRESCRIPTION = "waiting_first_prescription"
+    WAITING_ADDITIONAL_PRESCRIPTION = "waiting_additional_prescription"
+    ASKING_MORE_PRESCRIPTIONS = "asking_more_prescriptions"
+    SELECTING_MEDICATIONS = "selecting_medications"
+    COMPLETING_FIELDS = "completing_fields"
+    GENERATING_CLAIM = "generating_claim"
+
+
+class PrescriptionConstants:
+    """Constantes para manejo de múltiples prescripciones."""
+    MAX_PRESCRIPTIONS_PER_SESSION = 8
+    PRESCRIPTION_TIMEOUT_HOURS = 4
+    DEFAULT_PATIENT_KEY_PREFIX = "WA"
+    
+    # Callback data patterns
+    MORE_PRESCRIPTIONS_YES = "more_prescriptions_yes"
+    MORE_PRESCRIPTIONS_NO = "more_prescriptions_no"
+    
+    # Context keys
+    PRESCRIPTIONS_DATA = "prescriptions_data"
+    CONSOLIDATED_MEDICATIONS = "consolidated_medications"
+    CURRENT_STATE = "current_state"
+    EXPECTING_MORE_PRESCRIPTIONS = "expecting_more_prescriptions"
+    TOTAL_PRESCRIPTIONS = "total_prescriptions"
+    MAIN_PATIENT_KEY = "main_patient_key"
+
+
+class PrescriptionError(Exception):
+    """Excepciones específicas para manejo de múltiples prescripciones."""
+    pass
+
 class WhatsAppMessageHandler:
     """Maneja los diferentes tipos de mensajes de WhatsApp."""
     
@@ -56,6 +94,437 @@ class WhatsAppMessageHandler:
         self.claim_manager = claim_manager
         self.logger = logger
 
+    def _initialize_multiple_prescription_context(self, session_context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Inicializa el contexto para manejo de múltiples prescripciones.
+        
+        Args:
+            session_context: Contexto actual de la sesión
+            
+        Returns:
+            Dict con contexto inicializado para múltiples prescripciones
+        """
+        if PrescriptionConstants.PRESCRIPTIONS_DATA not in session_context:
+            session_context[PrescriptionConstants.PRESCRIPTIONS_DATA] = []
+        
+        if PrescriptionConstants.CONSOLIDATED_MEDICATIONS not in session_context:
+            session_context[PrescriptionConstants.CONSOLIDATED_MEDICATIONS] = []
+        
+        if PrescriptionConstants.CURRENT_STATE not in session_context:
+            session_context[PrescriptionConstants.CURRENT_STATE] = SessionState.WAITING_FIRST_PRESCRIPTION
+        
+        if PrescriptionConstants.TOTAL_PRESCRIPTIONS not in session_context:
+            session_context[PrescriptionConstants.TOTAL_PRESCRIPTIONS] = 0
+        
+        if PrescriptionConstants.EXPECTING_MORE_PRESCRIPTIONS not in session_context:
+            session_context[PrescriptionConstants.EXPECTING_MORE_PRESCRIPTIONS] = False
+        
+        self.logger.info(f"Contexto de múltiples prescripciones inicializado para sesión")
+        return session_context
+
+    def _add_prescription_to_context(self, session_context: Dict[str, Any], 
+                                    prescription_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Añade una nueva prescripción al contexto de la sesión.
+        
+        Args:
+            session_context: Contexto actual de la sesión
+            prescription_data: Datos de la prescripción procesada
+            
+        Returns:
+            Dict con contexto actualizado
+        """
+        try:
+            # Inicializar si es necesario
+            self._initialize_multiple_prescription_context(session_context)
+            
+            # Obtener o crear patient_key principal
+            main_patient_key = self._get_or_create_main_patient_key(session_context, prescription_data)
+            session_context[PrescriptionConstants.MAIN_PATIENT_KEY] = main_patient_key
+            
+            # Añadir prescripción con índice
+            prescription_index = len(session_context[PrescriptionConstants.PRESCRIPTIONS_DATA]) + 1
+            prescription_data["prescription_index"] = prescription_index
+            prescription_data["main_patient_key"] = main_patient_key
+            
+            session_context[PrescriptionConstants.PRESCRIPTIONS_DATA].append(prescription_data)
+            session_context[PrescriptionConstants.TOTAL_PRESCRIPTIONS] = prescription_index
+            
+            # Consolidar medicamentos
+            self._update_consolidated_medications(session_context)
+            
+            self.logger.info(f"Prescripción {prescription_index} añadida al contexto. "
+                            f"Patient key: {main_patient_key}")
+            
+            return session_context
+            
+        except Exception as e:
+            self.logger.error(f"Error añadiendo prescripción al contexto: {e}")
+            raise PrescriptionError(f"Error añadiendo prescripción: {str(e)}")
+
+    def _get_or_create_main_patient_key(self, session_context: Dict[str, Any], 
+                                       prescription_data: Dict[str, Any]) -> str:
+        """
+        Obtiene el patient_key principal o crea uno nuevo para la primera prescripción.
+        
+        Args:
+            session_context: Contexto de la sesión
+            prescription_data: Datos de la prescripción
+            
+        Returns:
+            str: Patient key principal para toda la sesión
+        """
+        # Si ya existe un patient_key principal, reutilizarlo
+        existing_key = session_context.get(PrescriptionConstants.MAIN_PATIENT_KEY)
+        if existing_key:
+            self.logger.info(f"Reutilizando patient_key existente: {existing_key}")
+            return existing_key
+        
+        # Para la primera prescripción, usar el patient_key generado por PIPProcessor
+        new_key = prescription_data.get("patient_key")
+        if not new_key:
+            raise PrescriptionError("No se pudo obtener patient_key de la prescripción")
+        
+        self.logger.info(f"Creando nuevo patient_key principal: {new_key}")
+        return new_key
+
+    def _update_consolidated_medications(self, session_context: Dict[str, Any]) -> None:
+        """
+        Actualiza la lista consolidada de medicamentos de todas las prescripciones.
+        
+        Args:
+            session_context: Contexto de la sesión con prescripciones
+        """
+        try:
+            all_prescriptions = session_context.get(PrescriptionConstants.PRESCRIPTIONS_DATA, [])
+            consolidated_meds = []
+            seen_medications = set()
+            
+            for prescription in all_prescriptions:
+                prescription_index = prescription.get("prescription_index", 0)
+                medications = prescription.get("medicamentos", [])
+                
+                for med in medications:
+                    if isinstance(med, dict):
+                        med_name = med.get("nombre", "").strip().lower()
+                        med_key = f"{med_name}_{med.get('dosis', '').strip().lower()}"
+                    else:
+                        med_name = str(med).strip().lower()
+                        med_key = med_name
+                    
+                    # Evitar duplicados exactos
+                    if med_key not in seen_medications:
+                        med_copy = med.copy() if isinstance(med, dict) else {"nombre": str(med)}
+                        med_copy["prescription_source"] = prescription_index
+                        consolidated_meds.append(med_copy)
+                        seen_medications.add(med_key)
+            
+            session_context[PrescriptionConstants.CONSOLIDATED_MEDICATIONS] = consolidated_meds
+            
+            self.logger.info(f"Medicamentos consolidados: {len(consolidated_meds)} únicos "
+                            f"de {len(all_prescriptions)} prescripciones")
+            
+        except Exception as e:
+            self.logger.error(f"Error consolidando medicamentos: {e}")
+            # En caso de error, usar lista vacía pero no fallar
+            session_context[PrescriptionConstants.CONSOLIDATED_MEDICATIONS] = []
+
+    def _get_prescription_summary(self, session_context: Dict[str, Any]) -> str:
+        """
+        Genera un resumen de las prescripciones procesadas.
+        
+        Args:
+            session_context: Contexto de la sesión
+            
+        Returns:
+            str: Mensaje de resumen formateado
+        """
+        prescriptions = session_context.get(PrescriptionConstants.PRESCRIPTIONS_DATA, [])
+        total_meds = len(session_context.get(PrescriptionConstants.CONSOLIDATED_MEDICATIONS, []))
+        total_prescriptions = len(prescriptions)
+        
+        if total_prescriptions == 0:
+            return "No hay prescripciones procesadas."
+        
+        summary = f"📋 **Tienes{total_prescriptions} fórmula{'s' if total_prescriptions > 1 else ''} médica{'s' if total_prescriptions > 1 else ''}**\n\n"
+        summary += f"💊 **Total de medicamentos únicos encontrados: {total_meds}**\n\n"
+        
+        for i, prescription in enumerate(prescriptions, 1):
+            med_count = len(prescription.get("medicamentos", []))
+            patient_name = prescription.get("paciente", "N/A")
+            summary += f"🔸 Fórmula {i}: {med_count} medicamentos - {patient_name}\n"
+        
+        return summary
+
+    def _validate_prescription_limits(self, session_context: Dict[str, Any]) -> bool:
+        """
+        Valida que no se excedan los límites de prescripciones por sesión.
+        
+        Args:
+            session_context: Contexto de la sesión
+            
+        Returns:
+            bool: True si está dentro de límites, False si se excede
+        """
+        current_count = session_context.get(PrescriptionConstants.TOTAL_PRESCRIPTIONS, 0)
+        
+        if current_count >= PrescriptionConstants.MAX_PRESCRIPTIONS_PER_SESSION:
+            self.logger.warning(f"Límite de prescripciones alcanzado: {current_count}")
+            return False
+        
+        return True
+
+    def _cleanup_prescription_context(self, session_context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Limpia datos temporales de prescripciones después del procesamiento completo.
+        
+        Args:
+            session_context: Contexto de la sesión
+            
+        Returns:
+            Dict con contexto limpiado
+        """
+        try:
+            # Mantener datos esenciales pero limpiar temporales
+            keys_to_cleanup = [
+                PrescriptionConstants.EXPECTING_MORE_PRESCRIPTIONS,
+                "pending_medications",  # Datos temporales de selección
+                "selected_undelivered"  # Datos temporales de selección
+            ]
+            
+            for key in keys_to_cleanup:
+                session_context.pop(key, None)
+            
+            # Cambiar estado a completado
+            session_context[PrescriptionConstants.CURRENT_STATE] = SessionState.COMPLETING_FIELDS
+            
+            self.logger.info("Contexto de prescripciones limpiado después del procesamiento")
+            return session_context
+            
+        except Exception as e:
+            self.logger.error(f"Error limpiando contexto de prescripciones: {e}")
+            return session_context
+
+    async def _ask_for_more_prescriptions(self, phone_number: str, 
+                                         session_context: Dict[str, Any]) -> None:
+        """
+        Pregunta al usuario si tiene más prescripciones para procesar.
+        
+        Args:
+            phone_number: Número de teléfono del usuario
+            session_context: Contexto actual de la sesión
+        """
+        try:
+            total_prescriptions = session_context.get(PrescriptionConstants.TOTAL_PRESCRIPTIONS, 1)
+            
+            # Validar límite de prescripciones
+            if not self._validate_prescription_limits(session_context):
+                await self._send_text_message(
+                    phone_number,
+                    f"⚠️ Has alcanzado el límite máximo de {PrescriptionConstants.MAX_PRESCRIPTIONS_PER_SESSION} "
+                    f"fórmulas por conversación.\n\nProcederé con las {total_prescriptions} fórmulas procesadas."
+                )
+                await self._proceed_with_consolidated_medications(phone_number, session_context)
+                return
+            
+            # Actualizar estado
+            session_context[PrescriptionConstants.CURRENT_STATE] = SessionState.ASKING_MORE_PRESCRIPTIONS
+            session_context[PrescriptionConstants.EXPECTING_MORE_PRESCRIPTIONS] = True
+            
+            # Crear mensaje
+            message = f"✅ Fórmula {total_prescriptions} leída correctamente\n\n"
+            message += "¿Tienes más fórmulas médicas?"
+            
+            # Crear botones
+            buttons = [
+                {"text": "📸 Sí, tengo más", "callback_data": PrescriptionConstants.MORE_PRESCRIPTIONS_YES},
+                {"text": "✅ No, continuar", "callback_data": PrescriptionConstants.MORE_PRESCRIPTIONS_NO}
+            ]
+            
+            await self._send_interactive_message(phone_number, message, buttons)
+            
+            # Actualizar contexto en Firestore
+            self._update_session_context(phone_number, session_context)
+            
+            self.logger.info(f"Pregunta por más prescripciones enviada. Total actual: {total_prescriptions}")
+            
+        except Exception as e:
+            self.logger.error(f"Error preguntando por más prescripciones: {e}")
+            # Fallback: proceder con las prescripciones actuales
+            await self._proceed_with_consolidated_medications(phone_number, session_context)
+
+    async def _handle_more_prescriptions_response(self, phone_number: str, callback_data: str, 
+                                                session_context: Dict[str, Any]) -> None:
+        """
+        Maneja la respuesta del usuario sobre más prescripciones.
+        
+        Args:
+            phone_number: Número de teléfono del usuario
+            callback_data: Datos del callback del botón presionado
+            session_context: Contexto actual de la sesión
+        """
+        try:
+            if callback_data == PrescriptionConstants.MORE_PRESCRIPTIONS_YES:
+                await self._handle_wants_more_prescriptions(phone_number, session_context)
+            elif callback_data == PrescriptionConstants.MORE_PRESCRIPTIONS_NO:
+                await self._handle_no_more_prescriptions(phone_number, session_context)
+            else:
+                self.logger.warning(f"Callback no reconocido para más prescripciones: {callback_data}")
+                await self._send_text_message(phone_number, "Opción no válida. Continuando con el proceso...")
+                await self._proceed_with_consolidated_medications(phone_number, session_context)
+                
+        except Exception as e:
+            self.logger.error(f"Error manejando respuesta de más prescripciones: {e}")
+            await self._send_text_message(phone_number, "Error procesando tu respuesta. Continuando...")
+            await self._proceed_with_consolidated_medications(phone_number, session_context)
+
+    async def _handle_wants_more_prescriptions(self, phone_number: str, 
+                                             session_context: Dict[str, Any]) -> None:
+        """
+        Maneja cuando el usuario quiere enviar más prescripciones.
+        
+        Args:
+            phone_number: Número de teléfono del usuario
+            session_context: Contexto actual de la sesión
+        """
+        try:
+            total_current = session_context.get(PrescriptionConstants.TOTAL_PRESCRIPTIONS, 0)
+            
+            # Actualizar estado para esperar siguiente prescripción
+            session_context[PrescriptionConstants.CURRENT_STATE] = SessionState.WAITING_ADDITIONAL_PRESCRIPTION
+            session_context[PrescriptionConstants.EXPECTING_MORE_PRESCRIPTIONS] = False
+            
+            message = f"📸 **Perfecto!** Envía la siguiente fórmula médica.\n\n"
+            message += f"📊 Llevas {total_current} fórmula{'s' if total_current > 1 else ''} procesada{'s' if total_current > 1 else ''}."
+            
+            await self._send_text_message(phone_number, message)
+            
+            # Actualizar contexto
+            self._update_session_context(phone_number, session_context)
+            
+            self.logger.info(f"Usuario quiere más prescripciones. Total actual: {total_current}")
+            
+        except Exception as e:
+            self.logger.error(f"Error manejando solicitud de más prescripciones: {e}")
+            await self._send_text_message(phone_number, "Error preparando para siguiente fórmula. Intenta enviarla directamente.")
+
+    async def _handle_no_more_prescriptions(self, phone_number: str, 
+                                          session_context: Dict[str, Any]) -> None:
+        """
+        Maneja cuando el usuario no tiene más prescripciones.
+        
+        Args:
+            phone_number: Número de teléfono del usuario
+            session_context: Contexto actual de la sesión
+        """
+        try:
+            total_prescriptions = session_context.get(PrescriptionConstants.TOTAL_PRESCRIPTIONS, 0)
+            
+            # Actualizar estado
+            session_context[PrescriptionConstants.CURRENT_STATE] = SessionState.SELECTING_MEDICATIONS
+            session_context[PrescriptionConstants.EXPECTING_MORE_PRESCRIPTIONS] = False
+            
+            # Enviar resumen y proceder con medicamentos
+            summary = self._get_prescription_summary(session_context)
+            await self._send_text_message(phone_number, summary)
+            
+            await self._proceed_with_consolidated_medications(phone_number, session_context)
+            
+            self.logger.info(f"Usuario terminó con {total_prescriptions} prescripciones. Procediendo con medicamentos.")
+            
+        except Exception as e:
+            self.logger.error(f"Error manejando fin de prescripciones: {e}")
+            await self._send_text_message(phone_number, "Error procesando. Continuando con medicamentos encontrados...")
+            await self._proceed_with_consolidated_medications(phone_number, session_context)
+
+    async def _proceed_with_consolidated_medications(self, phone_number: str, 
+                                               session_context: Dict[str, Any]) -> None:
+        """
+        Procede con la selección de medicamentos consolidados de todas las prescripciones.
+        MEJORADO: Muestra medicamentos agrupados por fórmula para mayor claridad.
+        """
+        try:
+            consolidated_medications = session_context.get(PrescriptionConstants.CONSOLIDATED_MEDICATIONS, [])
+            all_prescriptions = session_context.get(PrescriptionConstants.PRESCRIPTIONS_DATA, [])
+            
+            if not consolidated_medications:
+                self.logger.warning("No hay medicamentos consolidados para mostrar")
+                await self._send_text_message(
+                    phone_number, 
+                    "No se encontraron medicamentos en las fórmulas procesadas. Continuando con datos personales..."
+                )
+                await self._continue_with_missing_fields(phone_number, {}, session_context)
+                return
+            
+            # 🎯 NUEVO: Crear mensaje detallado con medicamentos por fórmula
+            detailed_message = await self._create_detailed_medication_message(all_prescriptions)
+            
+            # Actualizar contexto para selección de medicamentos
+            session_context["pending_medications"] = consolidated_medications
+            session_context["selected_undelivered"] = []
+            session_context[PrescriptionConstants.CURRENT_STATE] = SessionState.SELECTING_MEDICATIONS
+            
+            # Enviar mensaje detallado
+            await self._send_text_message(phone_number, detailed_message)
+            
+            # Enviar pregunta de selección
+            selection_message = "👆 **¿Cuáles medicamentos NO recibiste?**"
+            await self._send_text_message(phone_number, selection_message)
+            
+            # Crear lista de medicamentos para selección
+            session_id = session_context.get("session_id")
+            await self._send_medication_list(phone_number, consolidated_medications, session_id)
+            
+            # Actualizar contexto
+            self._update_session_context(phone_number, session_context)
+            
+            self.logger.info(f"Iniciando selección de {len(consolidated_medications)} medicamentos consolidados")
+            
+        except Exception as e:
+            self.logger.error(f"Error procediendo con medicamentos consolidados: {e}")
+            await self._send_text_message(phone_number, "Error mostrando medicamentos. Continuando con el proceso...")
+            await self._continue_with_missing_fields(phone_number, {}, session_context)
+
+    async def _create_detailed_medication_message(self, all_prescriptions: List[Dict]) -> str:
+        """
+        Crea un mensaje detallado mostrando medicamentos agrupados por fórmula.
+        OPTIMIZADO para adultos mayores: claro, simple, bien estructurado.
+        """
+        try:
+            total_prescriptions = len(all_prescriptions)
+            
+            message = f"💊 **TUS MEDICAMENTOS: {total_prescriptions}**\n\n"
+            
+            for i, prescription in enumerate(all_prescriptions, 1):
+                medications = prescription.get("medicamentos", [])
+                
+                if medications:
+                    message += f"🔸 **De Fórmula {i}:**\n"
+                    
+                    for med in medications:
+                        if isinstance(med, dict):
+                            med_name = med.get("nombre", "Medicamento desconocido").strip()
+                            med_dosis = med.get("dosis", "").strip()
+                            
+                            # Formato claro: Nombre + dosis si existe
+                            if med_dosis:
+                                message += f"• {med_name} ({med_dosis})\n"
+                            else:
+                                message += f"• {med_name}\n"
+                        else:
+                            message += f"• {str(med).strip()}\n"
+                    
+                    message += "\n"  # Espacio entre fórmulas
+            
+            # Instrucción clara
+            message += "📋 **Revisa toda la lista** ☝️\n"
+
+            return message
+            
+        except Exception as e:
+            self.logger.error(f"Error creando mensaje detallado de medicamentos: {e}")
+            return "💊 **MEDICAMENTOS ENCONTRADOS:**\n\nRevisa tus fórmulas y selecciona los que NO recibiste.\n\n"
+    
     async def handle_text_message(self, webhook_data: Dict[str, Any]) -> None:
         """Maneja mensajes de texto de WhatsApp con flujo unificado:
         1) Saludo → 2) Consentimiento (nueva sesión) → 3) Resto del flujo."""
@@ -88,20 +557,27 @@ class WhatsAppMessageHandler:
             session_id = session_context.get("session_id")
 
             # 1) Si NO hay sesión iniciada → saludo + pedir consentimiento
-            if session_id is None:
-                # Saludo inicial
+            if (session_id is None and 
+                message_text.lower().strip() in ['hola', 'hi', 'hello', 'inicio'] or
+                len(message_text.strip()) < 10):  # Mensajes cortos típicos de saludo
+                
+                # MENSAJE 1: Solo saludo
                 await self._send_text_message(
                     phone_number,
-                    "👋 ¡Hola! Bienvenido a No Me Entregaron. Estamos aquí para ayudarte con la entrega de tus medicamentos."
+                    "👋 ¡Hola! Gracias por escribir a No Me Entregaron.\nEstoy aquí para ayudarte con el reclamo de tus medicamentos."
                 )
-                # Botones de consentimiento
+                
+                # Esperar 2 segundos
+                await asyncio.sleep(2)
+                
+                # MENSAJE 1B: Solo consentimiento + BOTONES
                 buttons = [
                     {"text": "✅ Sí, autorizo", "callback_data": "consent_yes"},
-                    {"text": "❌ No autorizo",   "callback_data": "consent_no"}
+                    {"text": "❌ No autorizo", "callback_data": "consent_no"}
                 ]
                 await self._send_interactive_message(
                     phone_number,
-                    "Antes de continuar, ¿autorizas el tratamiento de tus datos personales para este fin? 🙏",
+                    "Antes de empezar, necesito tu permiso para usar tus datos y ayudarte con este proceso.\n¿Me autorizas para hacerlo?",
                     buttons
                 )
                 return
@@ -196,6 +672,8 @@ class WhatsAppMessageHandler:
                 await self._handle_followup_response(phone_number, callback_data, session_context)
             elif callback_data.startswith("escalate_"):
                 await self._handle_escalate_response(phone_number, callback_data, session_context)
+            elif callback_data.startswith("more_prescriptions_"):
+                await self._handle_more_prescriptions_response(phone_number, callback_data, session_context)    
             else:
                 await self._send_text_message(phone_number, "Acción no reconocida. Por favor, intenta de nuevo.")
 
@@ -204,7 +682,7 @@ class WhatsAppMessageHandler:
             await self._send_text_message(phone_number, "Ocurrió un error procesando tu respuesta.")
 
     async def handle_image_message(self, webhook_data: Dict[str, Any]) -> None:
-        """Maneja imágenes de prescripciones médicas."""
+        """Maneja imágenes de prescripciones médicas con soporte para múltiples fórmulas."""
         try:
             message_data = self._extract_message_data(webhook_data)
             if not message_data:
@@ -244,13 +722,24 @@ class WhatsAppMessageHandler:
                 await self._send_text_message(phone_number, "No hay una sesión activa. Por favor, reinicia la conversación.")
                 return
 
+            # Inicializar contexto de múltiples prescripciones si es necesario
+            session_context = self._initialize_multiple_prescription_context(session_context)
+
+            # Verificar si estamos esperando una prescripción adicional
+            current_state = session_context.get(PrescriptionConstants.CURRENT_STATE, SessionState.WAITING_FIRST_PRESCRIPTION)
+            is_additional_prescription = current_state == SessionState.WAITING_ADDITIONAL_PRESCRIPTION
+
             # Enviar mensaje de procesamiento
-            await self._send_text_message(phone_number, "📸 En estos momentos estoy leyendo tu fórmula médica, por favor espera...")
+            prescription_number = session_context.get(PrescriptionConstants.TOTAL_PRESCRIPTIONS, 0) + 1
+            if is_additional_prescription:
+                await self._send_text_message(phone_number, f"📸 Leyendo fórmula #{prescription_number}... Un momento.")
+            else:
+                await self._send_text_message(phone_number, "📸 Leyendo tu fórmula médica... Un momento por favor.")
 
             # Descargar imagen
             temp_image_path = await self._download_image(media_id)
             if not temp_image_path:
-                await self._send_text_message(phone_number, "No pude descargar la imagen. Por favor, envíala nuevamente.")
+                await self._send_text_message(phone_number, "No pude recibir la imagen. Envíala de nuevo, por favor.")
                 return
 
             try:
@@ -258,38 +747,59 @@ class WhatsAppMessageHandler:
                 result = self.pip_processor.process_image(temp_image_path, session_id)
 
                 if isinstance(result, str):
+                    # Error en procesamiento
                     await self._send_text_message(phone_number, result)
                     return
 
                 if isinstance(result, dict):
-                    # Actualizar contexto base
-                    session_context["prescription_uploaded"] = True
-                    session_context["patient_key"] = result["patient_key"]
+                    # ✅ NUEVA LÓGICA: Añadir prescripción al contexto de múltiples
+                    try:
+                        session_context = self._add_prescription_to_context(session_context, result)
+                        
+                        # Para prescripciones adicionales, usar el patient_key principal
+                        if is_additional_prescription:
+                            main_patient_key = session_context.get(PrescriptionConstants.MAIN_PATIENT_KEY)
+                            if main_patient_key:
+                                # Actualizar PIPProcessor data con el patient_key principal
+                                result["patient_key"] = main_patient_key
+                                self.logger.info(f"Usando patient_key principal para prescripción adicional: {main_patient_key}")
+                        
+                        # Actualizar contexto base (mantener compatibilidad)
+                        session_context["prescription_uploaded"] = True
+                        session_context["patient_key"] = session_context.get(PrescriptionConstants.MAIN_PATIENT_KEY, result["patient_key"])
 
-                    await self._log_user_message(session_id, "He leído tu fórmula y he encontrado:", "prescription_processed")
+                        await self._log_user_message(session_id, f"Fórmula médica {prescription_number} procesada correctamente", "prescription_processed")
 
-                    if result.get("_requires_medication_selection"):
-                        medications = result.get("medicamentos", [])
-                        selection_msg = self.pip_processor.get_medication_selection_message(result)
-                        await self._send_text_message(phone_number, selection_msg)
-                        
-                        # Crear lista de medicamentos para WhatsApp
-                        await self._send_medication_list(phone_number, medications, session_id)
-                        
-                        # Actualizar contexto con medicamentos (consolidar todas las actualizaciones)
-                        session_context["pending_medications"] = medications
-                        session_context["selected_undelivered"] = []
-                        
-                        # Una sola actualización de contexto con todos los campos
+                        # Actualizar contexto en Firestore
                         self._update_session_context(phone_number, session_context)
+
+                        # ✅ NUEVA LÓGICA: Preguntar por más prescripciones
+                        await self._ask_for_more_prescriptions(phone_number, session_context)
+
+                    except PrescriptionError as pe:
+                        self.logger.error(f"Error añadiendo prescripción al contexto: {pe}")
+                        await self._send_text_message(phone_number, "Error procesando múltiples fórmulas. Continuando con fórmula actual...")
                         
-                        self.logger.info(f"Contexto completo actualizado después de procesar imagen: patient_key={result['patient_key']}, medications={len(medications)}")
-                    else:
-                        # Actualizar contexto sin medicamentos
-                        self._update_session_context(phone_number, session_context)
-                        await self._continue_with_missing_fields(phone_number, result, session_context)
+                        # Fallback al flujo original
+                        session_context["prescription_uploaded"] = True
+                        session_context["patient_key"] = result["patient_key"]
+                        
+                        if result.get("_requires_medication_selection"):
+                            medications = result.get("medicamentos", [])
+                            selection_msg = self.pip_processor.get_medication_selection_message(result)
+                            await self._send_text_message(phone_number, selection_msg)
+                            
+                            await self._send_medication_list(phone_number, medications, session_id)
+                            
+                            session_context["pending_medications"] = medications
+                            session_context["selected_undelivered"] = []
+                            self._update_session_context(phone_number, session_context)
+                        else:
+                            self._update_session_context(phone_number, session_context)
+                            await self._continue_with_missing_fields(phone_number, result, session_context)
+
                 else:
-                    await self._send_text_message(phone_number, "Hubo un problema procesando tu fórmula. Por favor envía la foto nuevamente.")
+                    await self._send_text_message(phone_number, "No pude leer tu fórmula. Envía la foto de nuevo, por favor.")
 
             finally:
                 # Limpiar archivo temporal
@@ -298,7 +808,8 @@ class WhatsAppMessageHandler:
 
         except Exception as e:
             self.logger.error(f"Error procesando imagen WhatsApp: {e}", exc_info=True)
-            await self._send_text_message(phone_number, "Ocurrió un error procesando tu imagen. Por favor envía la foto nuevamente.")
+            await self._send_text_message(phone_number, "Hubo un problema con la imagen. Envíala de nuevo, por favor.")
+
 
     # Métodos auxiliares privados
     async def _check_and_mark_processed(self, unique_id: str, ttl_minutes: int = 5) -> bool:
@@ -508,6 +1019,19 @@ class WhatsAppMessageHandler:
                     context["current_tutela_id"] = session_data["current_tutela_id"]
                     self.logger.info(f"🆔 Tutela ID incluido en contexto: {session_data['current_tutela_id']}")
 
+                if PrescriptionConstants.PRESCRIPTIONS_DATA in session_data:
+                    context[PrescriptionConstants.PRESCRIPTIONS_DATA] = session_data[PrescriptionConstants.PRESCRIPTIONS_DATA]
+                if PrescriptionConstants.CONSOLIDATED_MEDICATIONS in session_data:
+                    context[PrescriptionConstants.CONSOLIDATED_MEDICATIONS] = session_data[PrescriptionConstants.CONSOLIDATED_MEDICATIONS]
+                if PrescriptionConstants.CURRENT_STATE in session_data:
+                    context[PrescriptionConstants.CURRENT_STATE] = session_data[PrescriptionConstants.CURRENT_STATE]
+                if PrescriptionConstants.TOTAL_PRESCRIPTIONS in session_data:
+                    context[PrescriptionConstants.TOTAL_PRESCRIPTIONS] = session_data[PrescriptionConstants.TOTAL_PRESCRIPTIONS]
+                if PrescriptionConstants.MAIN_PATIENT_KEY in session_data:
+                    context[PrescriptionConstants.MAIN_PATIENT_KEY] = session_data[PrescriptionConstants.MAIN_PATIENT_KEY]
+                if PrescriptionConstants.EXPECTING_MORE_PRESCRIPTIONS in session_data:
+                    context[PrescriptionConstants.EXPECTING_MORE_PRESCRIPTIONS] = session_data[PrescriptionConstants.EXPECTING_MORE_PRESCRIPTIONS]
+
                 return context
                 
             except Exception as e:
@@ -556,6 +1080,19 @@ class WhatsAppMessageHandler:
             if "current_tutela_id" in context:
                 update_fields["current_tutela_id"] = context["current_tutela_id"]
                 self.logger.info(f"🆔 Guardando tutela_id en Firestore: {context['current_tutela_id']}")
+            
+            if PrescriptionConstants.PRESCRIPTIONS_DATA in context:
+                update_fields[PrescriptionConstants.PRESCRIPTIONS_DATA] = context[PrescriptionConstants.PRESCRIPTIONS_DATA]
+            if PrescriptionConstants.CONSOLIDATED_MEDICATIONS in context:
+                update_fields[PrescriptionConstants.CONSOLIDATED_MEDICATIONS] = context[PrescriptionConstants.CONSOLIDATED_MEDICATIONS]
+            if PrescriptionConstants.CURRENT_STATE in context:
+                update_fields[PrescriptionConstants.CURRENT_STATE] = context[PrescriptionConstants.CURRENT_STATE]
+            if PrescriptionConstants.TOTAL_PRESCRIPTIONS in context:
+                update_fields[PrescriptionConstants.TOTAL_PRESCRIPTIONS] = context[PrescriptionConstants.TOTAL_PRESCRIPTIONS]
+            if PrescriptionConstants.MAIN_PATIENT_KEY in context:
+                update_fields[PrescriptionConstants.MAIN_PATIENT_KEY] = context[PrescriptionConstants.MAIN_PATIENT_KEY]
+            if PrescriptionConstants.EXPECTING_MORE_PRESCRIPTIONS in context:
+                update_fields[PrescriptionConstants.EXPECTING_MORE_PRESCRIPTIONS] = context[PrescriptionConstants.EXPECTING_MORE_PRESCRIPTIONS]
                 
             if update_fields:
                 session_ref.update(update_fields)
@@ -1031,15 +1568,42 @@ class WhatsAppMessageHandler:
             
             # Manejo de "Ningún medicamento" - todos son no entregados
             if callback_data.startswith("med_none_"):
-                # Marcar todos los medicamentos como no entregados
-                undelivered_med_names = [med.get("nombre", "") for med in medications]
+                # ✅ EXTRAER TODOS LOS NOMBRES DE MEDICAMENTOS
+                undelivered_med_names = []
+                for med in medications:
+                    med_name = med.get("nombre", "")
+                    if med_name:
+                        undelivered_med_names.append(med_name)
                 
-                # Actualizar en BigQuery
-                success = self.claim_manager.update_undelivered_medicines(patient_key, session_id, undelivered_med_names)
+                self.logger.info(f"=== NINGÚN MEDICAMENTO ENTREGADO ===")
+                self.logger.info(f"Patient key: {patient_key}")
+                self.logger.info(f"Session ID: {session_id}")
+                self.logger.info(f"Total medicamentos: {len(undelivered_med_names)}")
+                self.logger.info(f"Medicamentos: {undelivered_med_names}")
+                
+                # ✅ ACTUALIZAR BIGQUERY UNA SOLA VEZ
+                success = self.claim_manager.update_undelivered_medicines(
+                    patient_key, 
+                    session_id,  # ✅ SESSION_ID PRINCIPAL
+                    undelivered_med_names
+                )
                 
                 if success:
-
-                    await self._log_user_message(session_id, f"Medicamentos no entregados: {', '.join(undelivered_med_names)}", "medication_selection")
+                    prescriptions_count = session_context.get(PrescriptionConstants.TOTAL_PRESCRIPTIONS, 0)
+                    
+                    await self._log_user_message(
+                        session_id, 
+                        f"NINGÚN medicamento entregado: {', '.join(undelivered_med_names)}", 
+                        "medication_selection"
+                    )
+                    
+                    await self._send_text_message(
+                        phone_number, 
+                        f"✅ **Registrado correctamente**\n\n"
+                        f"📋 **NINGÚN medicamento fue entregado**\n"
+                        f"Total: {len(undelivered_med_names)} medicamentos de {prescriptions_count} fórmulas\n\n"
+                        f"Continuemos con tu información personal..."
+                    )
                     
                     # Continuar con el siguiente paso del flujo
                     await self._continue_after_medication_selection(phone_number, session_context)
@@ -1362,53 +1926,71 @@ class WhatsAppMessageHandler:
             await self._send_text_message(phone_number, "Error procesando respuesta. Continuando...")
 
     async def _finish_medication_iteration(self, phone_number: str, session_context: Dict[str, Any]) -> None:
-        """Finaliza la iteración de medicamentos y actualiza BigQuery."""
+        """
+        Finaliza la iteración de medicamentos y actualiza BigQuery.
+        CORREGIDO: Usa el session_id principal para TODAS las prescripciones.
+        """
         try:
-            session_id = session_context.get("session_id")
+            main_session_id = session_context.get("session_id")  # ✅ USAR SIEMPRE EL PRINCIPAL
             medications = session_context.get("pending_medications", [])
             selected_undelivered = session_context.get("selected_undelivered", [])
             patient_key = session_context.get("patient_key")
             
-            # Extraer nombres de medicamentos no entregados
+            # ✅ EXTRAER NOMBRES DE MEDICAMENTOS NO ENTREGADOS (SIMPLE)
             undelivered_med_names = []
-            for index in selected_undelivered:
-                if index < len(medications):
-                    med_name = medications[index].get("nombre", "")
+            for med_index in selected_undelivered:
+                if med_index < len(medications):
+                    med = medications[med_index]
+                    med_name = med.get("nombre", "")
                     if med_name:
                         undelivered_med_names.append(med_name)
             
-            # Log detallado antes de actualizar BigQuery
-            self.logger.info(f"=== FINALIZANDO ITERACIÓN DE MEDICAMENTOS ===")
+            self.logger.info(f"=== FINALIZANDO MEDICAMENTOS CONSOLIDADOS ===")
             self.logger.info(f"Patient key: {patient_key}")
-            self.logger.info(f"Session ID: {session_id}")
-            self.logger.info(f"Selected undelivered indices: {selected_undelivered}")
-            self.logger.info(f"Total medications: {len(medications)}")
-            self.logger.info(f"Undelivered medicine names: {undelivered_med_names}")
+            self.logger.info(f"Session ID principal: {main_session_id}")
+            self.logger.info(f"Total medicamentos no entregados: {len(undelivered_med_names)}")
+            self.logger.info(f"Medicamentos: {undelivered_med_names}")
             
-            # Actualizar en BigQuery
-            success = self.claim_manager.update_undelivered_medicines(patient_key, session_id, undelivered_med_names)
+            # ✅ ACTUALIZAR BIGQUERY UNA SOLA VEZ CON TODOS LOS MEDICAMENTOS
+            success = self.claim_manager.update_undelivered_medicines(
+                patient_key, 
+                main_session_id,  # ✅ USAR SIEMPRE EL SESSION_ID PRINCIPAL
+                undelivered_med_names
+            )
             
             self.logger.info(f"BigQuery update result: {success}")
             
             if success:
                 if undelivered_med_names:
-                    await self._send_text_message(phone_number, f"✅ Proceso completado. Medicamentos no entregados registrados: {', '.join(undelivered_med_names)}")
+                    prescriptions_count = session_context.get(PrescriptionConstants.TOTAL_PRESCRIPTIONS, 0)
+                    await self._send_text_message(
+                        phone_number, 
+                        f"✅ **Proceso completado**\n\n"
+                        f"📋 **Medicamentos no entregados registrados:**\n"
+                        f"{', '.join(undelivered_med_names[:5])}"  # Mostrar máximo 5
+                        f"{'...' if len(undelivered_med_names) > 5 else ''}\n\n"
+                        f"**Total:** {len(undelivered_med_names)} medicamentos de tus {prescriptions_count} fórmulas"
+                    )
                 else:
                     await self._send_text_message(phone_number, "✅ Proceso completado. Todos los medicamentos fueron entregados.")
                 
-                await self._log_user_message(session_id, f"Medicamentos no entregados: {', '.join(undelivered_med_names)}", "medication_selection")
-                
-                # Limpiar contexto de iteración
-                session_context["medication_iteration_mode"] = False
-                session_context["current_medication_index"] = 0
-                session_context["selected_undelivered"] = []
-                self._update_session_context(phone_number, session_context)
-                
-                # Continuar con el siguiente paso del flujo
-                await self._continue_after_medication_selection(phone_number, session_context)
+                await self._log_user_message(
+                    main_session_id, 
+                    f"Medicamentos no entregados: {', '.join(undelivered_med_names)}", 
+                    "medication_selection"
+                )
             else:
                 await self._send_text_message(phone_number, "❌ Hubo un error registrando los medicamentos. Intenta nuevamente.")
-                
+            
+            # Limpiar contexto de iteración
+            session_context["medication_iteration_mode"] = False
+            session_context["current_medication_index"] = 0
+            session_context["selected_undelivered"] = []
+            self._update_session_context(phone_number, session_context)
+            
+            # Continuar con el siguiente paso del flujo
+            await self._continue_after_medication_selection(phone_number, session_context)
+            
         except Exception as e:
             self.logger.error(f"Error finalizando iteración de medicamentos: {e}")
             await self._send_text_message(phone_number, "Error completando el proceso. Intenta nuevamente.")

@@ -208,13 +208,7 @@ def update_single_field_safe(patient_key: str, field_name: str, field_value: Any
         return False
 
 
-# Reemplazar la función add_reclamacion_safe en bigquery_pip.py:
-
 def add_reclamacion_safe(patient_key: str, nueva_reclamacion: Dict[str, Any]) -> bool:
-    """
-    Agrega una nueva reclamación usando solo los campos que existen en el esquema.
-    VERSIÓN CORREGIDA basada en el esquema real de la tabla.
-    """
     if not all((PROJECT_ID, DATASET_ID, TABLE_ID)):
         raise BigQueryServiceError("Variables de entorno de BigQuery incompletas.")
 
@@ -222,58 +216,47 @@ def add_reclamacion_safe(patient_key: str, nueva_reclamacion: Dict[str, Any]) ->
     table_reference = f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}"
 
     try:
-        # ✅ USAR solo los campos que existen en el esquema real
         update_query = f"""
             UPDATE `{table_reference}`
-            SET reclamaciones = (
-                SELECT ARRAY_CONCAT(
-                    IFNULL(reclamaciones, []),
-                    [STRUCT(
-                        @med_no_entregados AS med_no_entregados,
-                        @tipo_accion AS tipo_accion,
-                        @texto_reclamacion AS texto_reclamacion,
-                        @estado_reclamacion AS estado_reclamacion,
-                        @nivel_escalamiento AS nivel_escalamiento,
-                        @url_documento AS url_documento,
-                        @numero_radicado AS numero_radicado,
-                        @fecha_radicacion AS fecha_radicacion,
-                        @fecha_revision AS fecha_revision,
-                        @id_session AS id_session
-                    )]
-                )
-                FROM UNNEST([1])
+            SET reclamaciones = ARRAY_CONCAT(
+                IFNULL(reclamaciones, []),
+                [STRUCT(
+                    @med_no_entregados AS med_no_entregados,
+                    @tipo_accion AS tipo_accion,
+                    @texto_reclamacion AS texto_reclamacion,
+                    @estado_reclamacion AS estado_reclamacion,
+                    @nivel_escalamiento AS nivel_escalamiento,
+                    @url_documento AS url_documento,
+                    @numero_radicado AS numero_radicado,
+                    @fecha_radicacion AS fecha_radicacion,
+                    @fecha_revision AS fecha_revision,
+                    @id_session AS id_session
+                )]
             )
             WHERE paciente_clave = @patient_key
-            """
+        """
+
+        med_list = nueva_reclamacion.get('med_no_entregados', [])
+        if isinstance(med_list, list):
+            med_list_str = json.dumps(med_list, ensure_ascii=False)
+        else:
+            med_list_str = str(med_list)
 
         query_parameters = [
             bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key),
-            bigquery.ScalarQueryParameter("med_no_entregados", "STRING", 
-                str(nueva_reclamacion.get('med_no_entregados', ''))),
-            bigquery.ScalarQueryParameter("tipo_accion", "STRING", 
-                str(nueva_reclamacion.get('tipo_accion', ''))),
-            bigquery.ScalarQueryParameter("texto_reclamacion", "STRING", 
-                str(nueva_reclamacion.get('texto_reclamacion', ''))),
-            bigquery.ScalarQueryParameter("estado_reclamacion", "STRING", 
-                str(nueva_reclamacion.get('estado_reclamacion', 'pendiente_radicacion'))),
-            bigquery.ScalarQueryParameter("nivel_escalamiento", "INTEGER", 
-                int(nueva_reclamacion.get('nivel_escalamiento', 1))),
-            bigquery.ScalarQueryParameter("url_documento", "STRING", 
-                str(nueva_reclamacion.get('url_documento', ''))),
-            bigquery.ScalarQueryParameter("numero_radicado", "STRING", 
-                str(nueva_reclamacion.get('numero_radicado', ''))),
-            bigquery.ScalarQueryParameter("fecha_radicacion", "DATE", 
-                nueva_reclamacion.get('fecha_radicacion')),
-            bigquery.ScalarQueryParameter("fecha_revision", "DATE", 
-                nueva_reclamacion.get('fecha_revision')),
-            bigquery.ScalarQueryParameter("id_session", "STRING", 
-                str(nueva_reclamacion.get('id_session', '')))
+            bigquery.ScalarQueryParameter("med_no_entregados", "STRING", med_list_str),
+            bigquery.ScalarQueryParameter("tipo_accion", "STRING", str(nueva_reclamacion.get('tipo_accion', ''))),
+            bigquery.ScalarQueryParameter("texto_reclamacion", "STRING", str(nueva_reclamacion.get('texto_reclamacion', ''))),
+            bigquery.ScalarQueryParameter("estado_reclamacion", "STRING", str(nueva_reclamacion.get('estado_reclamacion', 'pendiente_radicacion'))),
+            bigquery.ScalarQueryParameter("nivel_escalamiento", "INTEGER", int(nueva_reclamacion.get('nivel_escalamiento', 1))),
+            bigquery.ScalarQueryParameter("url_documento", "STRING", str(nueva_reclamacion.get('url_documento', ''))),
+            bigquery.ScalarQueryParameter("numero_radicado", "STRING", str(nueva_reclamacion.get('numero_radicado', ''))),
+            bigquery.ScalarQueryParameter("fecha_radicacion", "DATE", nueva_reclamacion.get('fecha_radicacion')),
+            bigquery.ScalarQueryParameter("fecha_revision", "DATE", nueva_reclamacion.get('fecha_revision')),
+            bigquery.ScalarQueryParameter("id_session", "STRING", str(nueva_reclamacion.get('id_session', '')))
         ]
 
         job_config = bigquery.QueryJobConfig(query_parameters=query_parameters)
-
-        logger.info(f"➕ Agregando reclamación {nueva_reclamacion.get('tipo_accion')} para paciente {patient_key}")
-        
         query_job = client.query(update_query, job_config=job_config)
         query_job.result()
 
@@ -292,6 +275,7 @@ def add_reclamacion_safe(patient_key: str, nueva_reclamacion: Dict[str, Any]) ->
     except Exception as e:
         logger.error(f"❌ Error agregando reclamación: {e}")
         return False
+
     
 def update_reclamacion_by_level_safe(patient_key: str, nivel_escalamiento: int, 
                                    updates: Dict[str, Any]) -> bool:
