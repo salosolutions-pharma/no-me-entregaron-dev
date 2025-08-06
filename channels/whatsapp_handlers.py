@@ -487,37 +487,35 @@ class WhatsAppMessageHandler:
 
     async def _create_detailed_medication_message(self, all_prescriptions: List[Dict]) -> str:
         """
-        Crea un mensaje detallado mostrando medicamentos agrupados por fórmula.
-        OPTIMIZADO para adultos mayores: claro, simple, bien estructurado.
+        Crea un mensaje detallado mostrando todos los medicamentos consolidados.
+        MODIFICADO: Muestra todos los medicamentos juntos sin separación por fórmula.
         """
         try:
             total_prescriptions = len(all_prescriptions)
             
-            message = f"💊 **TUS MEDICAMENTOS: {total_prescriptions}**\n\n"
+            message = f"💊 **TUS MEDICAMENTOS: {total_prescriptions} fórmula{'s' if total_prescriptions > 1 else ''}**\n\n"
             
-            for i, prescription in enumerate(all_prescriptions, 1):
+            # Recopilar todos los medicamentos de todas las fórmulas
+            all_medications = []
+            for prescription in all_prescriptions:
                 medications = prescription.get("medicamentos", [])
-                
-                if medications:
-                    message += f"🔸 **De Fórmula {i}:**\n"
-                    
-                    for med in medications:
-                        if isinstance(med, dict):
-                            med_name = med.get("nombre", "Medicamento desconocido").strip()
-                            med_dosis = med.get("dosis", "").strip()
-                            
-                            # Formato claro: Nombre + dosis si existe
-                            if med_dosis:
-                                message += f"• {med_name} ({med_dosis})\n"
-                            else:
-                                message += f"• {med_name}\n"
-                        else:
-                            message += f"• {str(med).strip()}\n"
-                    
-                    message += "\n"  # Espacio entre fórmulas
+                all_medications.extend(medications)
             
-            # Instrucción clara
-            message += "📋 **Revisa toda la lista** ☝️\n"
+            # Mostrar todos los medicamentos juntos
+            for med in all_medications:
+                if isinstance(med, dict):
+                    med_name = med.get("nombre", "Medicamento desconocido").strip()
+                    med_dosis = med.get("dosis", "").strip()
+                    
+                    # Formato claro: Nombre + dosis si existe
+                    if med_dosis:
+                        message += f"• {med_name} ({med_dosis})\n"
+                    else:
+                        message += f"• {med_name}\n"
+                else:
+                    message += f"• {str(med).strip()}\n"
+            
+            message += "\n"  # Un solo salto de línea al final
 
             return message
             
