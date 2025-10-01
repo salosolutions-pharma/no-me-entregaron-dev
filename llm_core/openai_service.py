@@ -97,7 +97,7 @@ class OpenAIClient:
                 }
             ],
             "max_tokens": 1500,
-            "temperature": 0.3,
+            "temperature": 0.15,
         }
 
         logger.info("Enviando imagen a OpenAI Vision (modelo: %s)", current_model)

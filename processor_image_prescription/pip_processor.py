@@ -275,11 +275,15 @@ class PIPProcessor:
                     "entregado": "pendiente",
                 })
 
+        # Determinar la categoría de riesgo más alta si hay múltiples prescripciones
+        categoria_actual = data.get("categoria_riesgo", "simple").lower()
+        categoria_final = self._get_highest_risk_category(patient_key, categoria_actual)
+
         prescription_bq = {
             "id_session": session_id,
             "user_id": str(telegram_user_id) if telegram_user_id else "unknown",
             "url_prescripcion": data.get("url_prescripcion_subida", ""),
-            "categoria_riesgo": data.get("categoria_riesgo", "No clasificado"),
+            "categoria_riesgo": categoria_final,  # ← CATEGORÍA MÁS ALTA
             "justificacion_riesgo": data.get("justificacion_riesgo", ""),
             "fecha_atencion": data.get("fecha_atencion", ""),
             "diagnostico": data.get("diagnostico", ""),
@@ -369,6 +373,69 @@ class PIPProcessor:
             elif not value or (isinstance(value, str) and not value.strip()):
                 missing_fields[field] = True
         return missing_fields
+    
+    def _get_highest_risk_category(self, patient_key: str, nueva_categoria: str) -> str:
+        """
+        Determina la categoría de riesgo más alta entre las existentes y la nueva.
+        
+        Args:
+            patient_key: Clave del paciente
+            nueva_categoria: Nueva categoría detectada
+            
+        Returns:
+            str: Categoría de riesgo más alta
+        """
+        try:
+            # Jerarquía de riesgo (mayor a menor)
+            risk_hierarchy = {
+                "vital": 3,
+                "priorizado": 2, 
+                "simple": 1,
+                "no clasificado": 0
+            }
+            
+            nueva_categoria = (nueva_categoria or "simple").lower()  # ✅ VALIDACIÓN SEGURA
+            max_risk_level = risk_hierarchy.get(nueva_categoria, 1)
+            max_category = nueva_categoria
+            
+            # Buscar categorías existentes en BigQuery
+            try:
+                from processor_image_prescription.bigquery_pip import get_bigquery_client, PROJECT_ID, DATASET_ID, TABLE_ID
+                from google.cloud import bigquery
+                
+                client = get_bigquery_client()
+                query = f"""
+                SELECT presc.categoria_riesgo
+                FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}` AS t,
+                UNNEST(t.prescripciones) AS presc
+                WHERE t.paciente_clave = @patient_key
+                """
+                
+                job_config = bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ScalarQueryParameter("patient_key", "STRING", patient_key)
+                    ]
+                )
+                
+                results = client.query(query, job_config=job_config).result()
+                
+                for row in results:
+                    existing_category = (row.categoria_riesgo or "simple").lower()
+                    existing_level = risk_hierarchy.get(existing_category, 1)
+                    
+                    if existing_level > max_risk_level:
+                        max_risk_level = existing_level
+                        max_category = existing_category
+                        
+            except Exception as e:
+                logger.warning(f"Error consultando categorías existentes: {e}")
+            
+            logger.info(f"🔍 Categoría final determinada: {max_category} (nueva: {nueva_categoria})")
+            return max_category or "simple"  # ✅ FALLBACK SEGURO
+            
+        except Exception as e:
+            logger.error(f"Error determinando categoría de riesgo más alta: {e}")
+            return "simple"  # ✅ FALLBACK SEGURO A SIMPLE
 
     def get_medication_selection_message(self, extracted_data: Dict[str, Any]) -> str:
         """Genera el mensaje completo de confirmación con todos los datos extraídos."""
@@ -415,3 +482,5 @@ class PIPProcessor:
 💊 **Medicamentos encontrados:**
 {medicamentos_display}
 """
+    
+    

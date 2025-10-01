@@ -132,11 +132,16 @@ class ClaimGenerator:
             logger.error(f"Error al obtener datos del paciente {patient_key}: {e}")
             raise ClaimGeneratorError(f"Error de base de datos: {e}")
 
-    def _formatear_datos_paciente(self, patient_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _formatear_datos_paciente(self, patient_data: Dict[str, Any], med_no_entregados_list: Optional[List[str]] = None) -> Dict[str, Any]:
+
         """Formatea los datos del paciente para uso en prompts."""
         diagnostico, categoria_riesgo = self._extraer_datos_prescripcion(patient_data)
-        med_no_entregados = self._obtener_medicamentos_no_entregados(patient_data)
         
+        if med_no_entregados_list is None:
+            med_no_entregados = self._obtener_medicamentos_no_entregados(patient_data)
+        else:
+            med_no_entregados = ", ".join(med_no_entregados_list)
+
         diagnostico_texto = diagnostico if diagnostico and diagnostico.strip() else "No especificado en la prescripción"
 
         return {
@@ -173,23 +178,29 @@ class ClaimGenerator:
         
         return diagnostico, categoria_riesgo
 
-    def _obtener_medicamentos_no_entregados(self, patient_data: Dict[str, Any]) -> str:
-        """Obtiene la lista de medicamentos no entregados de la prescripción más reciente."""
+    def _obtener_medicamentos_no_entregados(self, patient_data: Dict[str, Any], meds_list: Optional[List[str]] = None) -> str:
+        """
+        Obtiene la lista de medicamentos no entregados.
+        Prioriza una lista proporcionada, si no, busca en la prescripción más reciente.
+        """
+        if meds_list:
+            return ", ".join(meds_list)
+            
         prescripciones = patient_data.get("prescripciones")
         if not prescripciones:
             return ""
         
         ultima_prescripcion = prescripciones[-1]
         medicamentos = ultima_prescripcion.get("medicamentos", [])
-        
+
         meds_no_entregados = [
             med.get("nombre", "")
             for med in medicamentos
-            if isinstance(med, dict) 
+            if isinstance(med, dict)
             and med.get("entregado") == "no entregado"
             and med.get("nombre", "")
         ]
-        
+
         return ", ".join(meds_no_entregados)
 
     def _obtener_plazo_respuesta(self, categoria_riesgo: str) -> str:
@@ -426,8 +437,9 @@ class ClaimGenerator:
             }
 
     def _generar_documento_legal(self, patient_key: str, tipo_documento: str,
-                           gestiones_previas: Optional[List[str]] = None,
-                           tutela_id: Optional[str] = None) -> Dict[str, Any]:
+                                gestiones_previas: Optional[List[str]] = None,
+                                tutela_id: Optional[str] = None,
+                                med_no_entregados: Optional[List[str]] = None) -> Dict[str, Any]:
         """Método genérico para generar documentos legales."""
         try:
             logger.info(f"Iniciando generación de {tipo_documento} para paciente: {patient_key}")

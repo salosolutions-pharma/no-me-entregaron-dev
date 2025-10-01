@@ -58,7 +58,6 @@ class ClaimManager:
         "ciudad": "ciudad de residencia",
         "direccion": "dirección de residencia",
         "eps_estandarizada": "EPS",
-        "eps_confirmacion": "confirmación de tu EPS",
         "farmacia": "farmacia donde recoges medicamentos",
         "sede_farmacia": "sede o punto de entrega específico",
         "informante": "información sobre quién está haciendo esta solicitud",
@@ -149,25 +148,19 @@ class ClaimManager:
                     if value and str(value).strip():
                         datos_confirmados.append(f"- EPS: {value}")
                     else:
-                        eps_cruda = patient_record.get("eps_cruda")
-                        if eps_cruda and str(eps_cruda).strip():
-                            campo_faltante = "eps_confirmacion"
-                        else:
-                            campo_faltante = "eps_estandarizada"
+                        campo_faltante = "eps_estandarizada"
                         break
-                elif value and str(value).strip():
+                elif value and str(value).strip() and str(value).lower() != "null":
                     datos_confirmados.append(f"- {self._get_field_display_name(field)}: {value}")
                 else:
                     campo_faltante = field
                     break
             else:
-                # ✅ TODOS LOS CAMPOS COMPLETOS
                 return {
                     "field_name": None,
                     "prompt_text": "✅ Ya hemos recopilado toda la información necesaria para tu reclamación. ¡Gracias por tu colaboración!",
                 }
 
-            # ✅ USAR PROMPTS ESTÁTICOS (sin LLM) para campos comunes
             STATIC_PROMPTS = {
                 "correo": "📧 Para continuar con tu reclamación, necesito tu **correo electrónico**. ¿Me lo puedes compartir, por favor?",
                 "telefono_contacto": "📱 ¿Cuál es tu **número de teléfono** de contacto?",

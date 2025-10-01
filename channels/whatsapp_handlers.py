@@ -22,6 +22,7 @@ try:
 except ImportError as e:
     print(f"Error al importar módulos: {e}")
 
+
 if not logging.getLogger().hasHandlers():
     setup_structured_logging()
 
@@ -48,6 +49,141 @@ def format_whatsapp_text(message: str) -> str:
     message = re.sub(r'\*\*\*(.*?)\*\*\*', r'*\1*', message)
     
     return message
+
+class WhatsAppBatchHandler:
+    """Maneja el procesamiento por lotes de múltiples prescripciones."""
+    
+    def __init__(self, message_handler):
+        self.message_handler = message_handler
+        self.pending_batches: Dict[str, Dict] = {}  # phone_number -> batch_info
+        self.BATCH_TIMEOUT = 8  # segundos
+        
+    async def should_use_batch(self, session_context: Dict[str, Any]) -> bool:
+        """Determina si usar batch processing basado en el contexto."""
+        # Solo usar batch si:
+        # 1. Hay consentimiento y sesión válida
+        # 2. NO estamos esperando campos adicionales
+        # 3. NO estamos en proceso de medicamentos
+        
+        if not (session_context.get("consent_given", False) and 
+                session_context.get("session_id") is not None):
+            return False
+        
+        # No usar batch si estamos esperando campos
+        if session_context.get("waiting_for_field"):
+            return False
+            
+        # No usar batch si ya terminamos con medicamentos
+        current_state = session_context.get("current_state")
+        if current_state in ["completing_fields", "generating_claim"]:
+            return False
+        
+        return True
+    
+    async def handle_image(self, webhook_data: Dict[str, Any], phone_number: str, 
+                          session_context: Dict[str, Any]) -> None:
+        """Punto de entrada principal para manejo de imágenes."""
+        
+        # Si no debe usar batch, procesar individualmente
+        if not await self.should_use_batch(session_context):
+            await self.message_handler._process_single_image(webhook_data)
+            return
+            
+        # Usar batch processing
+        await self._add_to_batch(webhook_data, phone_number, session_context)
+    
+    async def _add_to_batch(self, webhook_data: Dict[str, Any], phone_number: str,
+                           session_context: Dict[str, Any]) -> None:
+        """Añade imagen al batch actual."""
+        from datetime import datetime
+        
+        current_time = datetime.now()
+        
+        # Inicializar batch si no existe
+        if phone_number not in self.pending_batches:
+            self.pending_batches[phone_number] = {
+                'images': [],
+                'start_time': current_time,
+                'processing_task': None,
+                'session_context': session_context
+            }
+        
+        # Añadir imagen
+        batch_info = self.pending_batches[phone_number]
+        batch_info['images'].append(webhook_data)
+        batch_info['session_context'] = session_context  # Actualizar contexto
+        
+        # Cancelar tarea anterior y crear nueva
+        if batch_info['processing_task']:
+            batch_info['processing_task'].cancel()
+        
+        batch_info['processing_task'] = asyncio.create_task(
+            self._process_batch_after_delay(phone_number)
+        )
+    
+    async def _process_batch_after_delay(self, phone_number: str) -> None:
+        """Procesa el batch después del timeout."""
+        try:
+            await asyncio.sleep(self.BATCH_TIMEOUT)
+            
+            if phone_number not in self.pending_batches:
+                return
+                
+            batch_info = self.pending_batches[phone_number]
+            images = batch_info['images']
+            session_context = batch_info['session_context']
+            
+            if not images:
+                return
+            
+            total_images = len(images)
+            processed_count = 0
+            
+            # Procesar cada imagen
+            for i, webhook_data in enumerate(images, 1):
+                try:
+                    success = await self.message_handler._process_single_image(
+                        webhook_data, image_number=i
+                    )
+                    if success:
+                        processed_count += 1
+                except Exception as e:
+                    self.message_handler.logger.error(f"Error procesando imagen {i}: {e}")
+            
+            # Enviar resumen y preguntar por más
+            await self._send_batch_summary(phone_number, processed_count, total_images)
+            
+            # Limpiar batch
+            del self.pending_batches[phone_number]
+            
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self.message_handler.logger.error(f"Error en batch processing: {e}")
+    
+    async def _send_batch_summary(self, phone_number: str, processed_count: int, total_images: int) -> None:
+        """Envía resumen del batch y pregunta por más."""
+        if processed_count == 0:
+            await self.message_handler._send_text_message(
+                phone_number,
+                "❌ No pude procesar ninguna fórmula. Envía las fotos nuevamente."
+            )
+            return
+        
+        # Mensaje resumen
+        if processed_count == total_images and total_images == 1:
+            summary = "✅ Fórmula leída"
+        elif processed_count == total_images:
+            summary = f"✅ {processed_count} fórmulas leídas"
+        else:
+            summary = f"⚠️ {processed_count} de {total_images} fórmulas leídas"
+        
+        await self.message_handler._send_text_message(phone_number, summary)
+        
+        # Preguntar por más (una sola vez)
+        if processed_count > 0:
+            updated_context = self.message_handler._get_session_context(phone_number)
+            await self.message_handler._ask_for_more_prescriptions(phone_number, updated_context)
 
 class SessionState:
     """Estados de sesión para manejo de múltiples prescripciones."""
@@ -93,6 +229,7 @@ class WhatsAppMessageHandler:
         self.pip_processor = pip_processor
         self.claim_manager = claim_manager
         self.logger = logger
+        self.batch_handler = WhatsAppBatchHandler(self)
 
     def _initialize_multiple_prescription_context(self, session_context: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -332,8 +469,7 @@ class WhatsAppMessageHandler:
             session_context[PrescriptionConstants.EXPECTING_MORE_PRESCRIPTIONS] = True
             
             # Crear mensaje
-            message = f"✅ Fórmula {total_prescriptions} leída correctamente\n\n"
-            message += "¿Tienes más fórmulas médicas?"
+            message = "¿Tienes más fórmulas médicas?"
             
             # Crear botones
             buttons = [
@@ -424,10 +560,6 @@ class WhatsAppMessageHandler:
             session_context[PrescriptionConstants.CURRENT_STATE] = SessionState.SELECTING_MEDICATIONS
             session_context[PrescriptionConstants.EXPECTING_MORE_PRESCRIPTIONS] = False
             
-            # Enviar resumen y proceder con medicamentos
-            summary = self._get_prescription_summary(session_context)
-            await self._send_text_message(phone_number, summary)
-            
             await self._proceed_with_consolidated_medications(phone_number, session_context)
             
             self.logger.info(f"Usuario terminó con {total_prescriptions} prescripciones. Procediendo con medicamentos.")
@@ -438,62 +570,97 @@ class WhatsAppMessageHandler:
             await self._proceed_with_consolidated_medications(phone_number, session_context)
 
     async def _proceed_with_consolidated_medications(self, phone_number: str, 
-                                               session_context: Dict[str, Any]) -> None:
+                                           session_context: Dict[str, Any]) -> None:
         """
-        Procede con la selección de medicamentos consolidados de todas las prescripciones.
-        MEJORADO: Muestra medicamentos agrupados por fórmula para mayor claridad.
+        VERSIÓN OPTIMIZADA para adultos mayores: mensajes cortos y directos.
         """
         try:
             consolidated_medications = session_context.get(PrescriptionConstants.CONSOLIDATED_MEDICATIONS, [])
             all_prescriptions = session_context.get(PrescriptionConstants.PRESCRIPTIONS_DATA, [])
             
+            # ✅ ASEGURAR PATIENT_KEY EN CONTEXTO
+            patient_key = session_context.get(PrescriptionConstants.MAIN_PATIENT_KEY) or session_context.get("patient_key")
+            
+            self.logger.info(f"=== PROCEDIENDO CON MEDICAMENTOS CONSOLIDADOS ===")
+            self.logger.info(f"Patient key: {patient_key}")
+            self.logger.info(f"Medicamentos consolidados: {len(consolidated_medications)}")
+            self.logger.info(f"Prescripciones: {len(all_prescriptions)}")
+            
             if not consolidated_medications:
                 self.logger.warning("No hay medicamentos consolidados para mostrar")
+                
+                # ✅ ASEGURAR PATIENT_KEY ANTES DE CONTINUAR
+                if not patient_key and all_prescriptions:
+                    patient_key = all_prescriptions[0].get("patient_key")
+                    if patient_key:
+                        session_context["patient_key"] = patient_key
+                        session_context[PrescriptionConstants.MAIN_PATIENT_KEY] = patient_key
+                        self._update_session_context(phone_number, session_context)
+                        self.logger.info(f"✅ Patient key recuperado de prescripciones: {patient_key}")
+                
                 await self._send_text_message(
                     phone_number, 
-                    "No se encontraron medicamentos en las fórmulas procesadas. Continuando con datos personales..."
+                    "No encontré medicamentos en las fórmulas. Continuando con datos personales..."
                 )
-                await self._continue_with_missing_fields(phone_number, {}, session_context)
+                await self._continue_with_missing_fields(phone_number, {"patient_key": patient_key}, session_context)
                 return
             
-            # 🎯 NUEVO: Crear mensaje detallado con medicamentos por fórmula
-            detailed_message = await self._create_detailed_medication_message(all_prescriptions)
+            # ✅ ASEGURAR PATIENT_KEY EN CONTEXTO
+            if not patient_key and all_prescriptions:
+                patient_key = all_prescriptions[0].get("patient_key")
+                if patient_key:
+                    session_context["patient_key"] = patient_key
+                    session_context[PrescriptionConstants.MAIN_PATIENT_KEY] = patient_key
+                    self.logger.info(f"✅ Patient key añadido al contexto: {patient_key}")
+            
+            # ✅ MENSAJE 1: Lista corta de medicamentos
+            short_message = await self._create_detailed_medication_message(all_prescriptions)
+            await self._send_text_message(phone_number, short_message)
+            
+            # ✅ PAUSA BREVE para mejor lectura
+            await asyncio.sleep(1)
             
             # Actualizar contexto para selección de medicamentos
             session_context["pending_medications"] = consolidated_medications
             session_context["selected_undelivered"] = []
             session_context[PrescriptionConstants.CURRENT_STATE] = SessionState.SELECTING_MEDICATIONS
             
-            # Enviar mensaje detallado
-            await self._send_text_message(phone_number, detailed_message)
+            # ✅ ASEGURAR PATIENT_KEY EN CONTEXTO FINAL
+            if patient_key:
+                session_context["patient_key"] = patient_key
             
-            # Enviar pregunta de selección
-            selection_message = "👆 **¿Cuáles medicamentos NO recibiste?**"
-            await self._send_text_message(phone_number, selection_message)
-            
-            # Crear lista de medicamentos para selección
+            # Crear lista de medicamentos para selección (botones)
             session_id = session_context.get("session_id")
             await self._send_medication_list(phone_number, consolidated_medications, session_id)
             
             # Actualizar contexto
             self._update_session_context(phone_number, session_context)
             
-            self.logger.info(f"Iniciando selección de {len(consolidated_medications)} medicamentos consolidados")
+            self.logger.info(f"✅ Versión corta enviada: {len(consolidated_medications)} medicamentos consolidados")
             
         except Exception as e:
-            self.logger.error(f"Error procediendo con medicamentos consolidados: {e}")
+            self.logger.error(f"Error procediendo con medicamentos consolidados (versión corta): {e}", exc_info=True)
+            
+            # ✅ RECUPERAR PATIENT_KEY COMO FALLBACK
+            patient_key = session_context.get(PrescriptionConstants.MAIN_PATIENT_KEY) or session_context.get("patient_key")
+            if not patient_key:
+                prescriptions = session_context.get(PrescriptionConstants.PRESCRIPTIONS_DATA, [])
+                if prescriptions:
+                    patient_key = prescriptions[0].get("patient_key")
+            
             await self._send_text_message(phone_number, "Error mostrando medicamentos. Continuando con el proceso...")
-            await self._continue_with_missing_fields(phone_number, {}, session_context)
+            await self._continue_with_missing_fields(phone_number, {"patient_key": patient_key}, session_context)
 
     async def _create_detailed_medication_message(self, all_prescriptions: List[Dict]) -> str:
         """
-        Crea un mensaje detallado mostrando todos los medicamentos consolidados.
-        MODIFICADO: Muestra todos los medicamentos juntos sin separación por fórmula.
+        VERSIÓN CORTA para adultos mayores: mensaje simple y directo.
+        Muestra solo nombres de medicamentos sin dosis complejas.
         """
         try:
             total_prescriptions = len(all_prescriptions)
             
-            message = f"💊 **TUS MEDICAMENTOS: {total_prescriptions} fórmula{'s' if total_prescriptions > 1 else ''}**\n\n"
+            # ✅ MENSAJE CORTO Y CLARO
+            message = f"💊 **Encontré estos medicamentos:**\n"
             
             # Recopilar todos los medicamentos de todas las fórmulas
             all_medications = []
@@ -501,27 +668,20 @@ class WhatsAppMessageHandler:
                 medications = prescription.get("medicamentos", [])
                 all_medications.extend(medications)
             
-            # Mostrar todos los medicamentos juntos
-            for med in all_medications:
+            # ✅ MOSTRAR SOLO NOMBRES (sin dosis extensas)
+            for i, med in enumerate(all_medications, 1):
                 if isinstance(med, dict):
                     med_name = med.get("nombre", "Medicamento desconocido").strip()
-                    med_dosis = med.get("dosis", "").strip()
-                    
-                    # Formato claro: Nombre + dosis si existe
-                    if med_dosis:
-                        message += f"• {med_name} ({med_dosis})\n"
-                    else:
-                        message += f"• {med_name}\n"
+                    # Solo mostrar nombre limpio, sin dosis
+                    message += f"{i}. {med_name}\n"
                 else:
-                    message += f"• {str(med).strip()}\n"
+                    message += f"{i}. {str(med).strip()}\n"
             
-            message += "\n"  # Un solo salto de línea al final
-
             return message
             
         except Exception as e:
-            self.logger.error(f"Error creando mensaje detallado de medicamentos: {e}")
-            return "💊 **MEDICAMENTOS ENCONTRADOS:**\n\nRevisa tus fórmulas y selecciona los que NO recibiste.\n\n"
+            self.logger.error(f"Error creando mensaje corto de medicamentos: {e}")
+            return "💊 **Medicamentos encontrados en tus fórmulas**\n\n"
     
     async def handle_text_message(self, webhook_data: Dict[str, Any]) -> None:
         """Maneja mensajes de texto de WhatsApp con flujo unificado:
@@ -554,30 +714,39 @@ class WhatsAppMessageHandler:
             session_context = self._get_session_context(phone_number)
             session_id = session_context.get("session_id")
 
-            # 1) Si NO hay sesión iniciada → saludo + pedir consentimiento
-            if (session_id is None and 
-                message_text.lower().strip() in ['hola', 'hi', 'hello', 'inicio'] or
-                len(message_text.strip()) < 10):  # Mensajes cortos típicos de saludo
+            # 1) Si aún no he preguntado por consentimiento y es un saludo…
+            if (not session_context.get("consent_asked") and
+                (message_text.lower().strip() in ['hola', 'hi', 'hello', 'inicio'] or
+                (len(message_text.strip()) < 10 and any(
+                    w in message_text.lower() for w in ['hola', 'hi', 'hello', 'buenas', 'saludos']
+                )))):
                 
                 # MENSAJE 1: Solo saludo
                 await self._send_text_message(
                     phone_number,
-                    "👋 ¡Hola! Gracias por escribir a No Me Entregaron.\nEstoy aquí para ayudarte con el reclamo de tus medicamentos."
+                    "👋 ¡Hola! Gracias por escribir a No Me Entregaron.\n"
+                    "Estoy aquí para ayudarte con el reclamo de tus medicamentos."
                 )
                 
-                # Esperar 2 segundos
+                # Pausa breve para separar mensajes
                 await asyncio.sleep(2)
                 
-                # MENSAJE 1B: Solo consentimiento + BOTONES
+                # MENSAJE 2: Solicitar consentimiento con botones
                 buttons = [
                     {"text": "✅ Sí, autorizo", "callback_data": "consent_yes"},
-                    {"text": "❌ No autorizo", "callback_data": "consent_no"}
+                    {"text": "❌ No autorizo",   "callback_data": "consent_no"}
                 ]
                 await self._send_interactive_message(
                     phone_number,
-                    "Antes de empezar, necesito tu permiso para usar tus datos y ayudarte con este proceso.\n¿Me autorizas para hacerlo?",
+                    "Antes de empezar, necesito tu permiso para usar tus datos y ayudarte con este proceso.\n"
+                    "¿Me autorizas para hacerlo?",
                     buttons
                 )
+                
+                # Marcar que ya pregunté por el consentimiento y persistirlo
+                session_context["consent_asked"] = True
+                self._update_session_context(phone_number, session_context)
+                
                 return
 
             # 3) Manejo de despedida
@@ -678,14 +847,36 @@ class WhatsAppMessageHandler:
         except Exception as e:
             self.logger.error(f"Error manejando mensaje interactivo WhatsApp: {e}", exc_info=True)
             await self._send_text_message(phone_number, "Ocurrió un error procesando tu respuesta.")
+            
 
     async def handle_image_message(self, webhook_data: Dict[str, Any]) -> None:
-        """Maneja imágenes de prescripciones médicas con soporte para múltiples fórmulas."""
+        """Maneja imágenes usando batch processing inteligente."""
         try:
             message_data = self._extract_message_data(webhook_data)
             if not message_data:
                 self.logger.warning("No se pudo extraer datos del mensaje de imagen")
                 return
+
+            phone_number = message_data["from"]
+            session_context = self._get_session_context(phone_number)
+            
+            # Usar batch handler para procesamiento inteligente
+            await self.batch_handler.handle_image(webhook_data, phone_number, session_context)
+            
+        except Exception as e:
+            self.logger.error(f"Error procesando imagen WhatsApp: {e}", exc_info=True)
+            await self._send_text_message(
+                phone_number if 'phone_number' in locals() else "unknown", 
+                "Hubo un problema con la imagen. Envíala de nuevo, por favor."
+            )
+
+    async def _process_single_image(self, webhook_data: Dict[str, Any], image_number: int = 1) -> bool:
+        """Procesa una sola imagen (usado por batch handler y como fallback)."""
+        try:
+            message_data = self._extract_message_data(webhook_data)
+            if not message_data:
+                self.logger.warning("No se pudo extraer datos del mensaje de imagen")
+                return False
 
             phone_number = message_data["from"]
             image_data = message_data.get("image", {})
@@ -695,13 +886,22 @@ class WhatsAppMessageHandler:
             # ✅ DEDUPLICACIÓN: Verificar si ya procesamos esta imagen
             if not await self._check_and_mark_processed(f"img_{media_id}_{message_id}"):
                 self.logger.warning(f"⚠️ Imagen duplicada ignorada: {media_id}")
-                return
+                return False
 
             self.logger.info(f"Procesando imagen de {phone_number}, media_id: {media_id}")
+            session_context = self._get_session_context(phone_number)
+            total_prescriptions = session_context.get(PrescriptionConstants.TOTAL_PRESCRIPTIONS, 0)
+            prescription_number = total_prescriptions + 1
+
+            if prescription_number == 1:
+                processing_message = "📸 Leyendo tu fórmula médica... Un momento por favor."
+            else:
+                processing_message = f"📸 Leyendo fórmula #{prescription_number}... Un momento."
+
+            await self._send_text_message(phone_number, processing_message)
 
             # Verificar consentimiento
             session_context = self._get_session_context(phone_number)
-            self.logger.info(f"Contexto de sesión: {session_context}")
             
             if not session_context.get("consent_given"):
                 buttons = [
@@ -713,12 +913,12 @@ class WhatsAppMessageHandler:
                     "Primero necesito tu autorización para procesar tus datos.",
                     buttons
                 )
-                return
+                return False
 
             session_id = session_context.get("session_id")
             if not session_id:
                 await self._send_text_message(phone_number, "No hay una sesión activa. Por favor, reinicia la conversación.")
-                return
+                return False
 
             # Inicializar contexto de múltiples prescripciones si es necesario
             session_context = self._initialize_multiple_prescription_context(session_context)
@@ -727,18 +927,11 @@ class WhatsAppMessageHandler:
             current_state = session_context.get(PrescriptionConstants.CURRENT_STATE, SessionState.WAITING_FIRST_PRESCRIPTION)
             is_additional_prescription = current_state == SessionState.WAITING_ADDITIONAL_PRESCRIPTION
 
-            # Enviar mensaje de procesamiento
-            prescription_number = session_context.get(PrescriptionConstants.TOTAL_PRESCRIPTIONS, 0) + 1
-            if is_additional_prescription:
-                await self._send_text_message(phone_number, f"📸 Leyendo fórmula #{prescription_number}... Un momento.")
-            else:
-                await self._send_text_message(phone_number, "📸 Leyendo tu fórmula médica... Un momento por favor.")
-
             # Descargar imagen
             temp_image_path = await self._download_image(media_id)
             if not temp_image_path:
                 await self._send_text_message(phone_number, "No pude recibir la imagen. Envíala de nuevo, por favor.")
-                return
+                return False
 
             try:
                 # Procesar imagen con PIP
@@ -747,7 +940,7 @@ class WhatsAppMessageHandler:
                 if isinstance(result, str):
                     # Error en procesamiento
                     await self._send_text_message(phone_number, result)
-                    return
+                    return False
 
                 if isinstance(result, dict):
                     # ✅ NUEVA LÓGICA: Añadir prescripción al contexto de múltiples
@@ -766,38 +959,21 @@ class WhatsAppMessageHandler:
                         session_context["prescription_uploaded"] = True
                         session_context["patient_key"] = session_context.get(PrescriptionConstants.MAIN_PATIENT_KEY, result["patient_key"])
 
-                        await self._log_user_message(session_id, f"Fórmula médica {prescription_number} procesada correctamente", "prescription_processed")
+                        await self._log_user_message(session_id, f"Fórmula médica {image_number} procesada correctamente", "prescription_processed")
 
                         # Actualizar contexto en Firestore
                         self._update_session_context(phone_number, session_context)
-
-                        # ✅ NUEVA LÓGICA: Preguntar por más prescripciones
-                        await self._ask_for_more_prescriptions(phone_number, session_context)
+                        
+                        return True
 
                     except PrescriptionError as pe:
                         self.logger.error(f"Error añadiendo prescripción al contexto: {pe}")
                         await self._send_text_message(phone_number, "Error procesando múltiples fórmulas. Continuando con fórmula actual...")
-                        
-                        # Fallback al flujo original
-                        session_context["prescription_uploaded"] = True
-                        session_context["patient_key"] = result["patient_key"]
-                        
-                        if result.get("_requires_medication_selection"):
-                            medications = result.get("medicamentos", [])
-                            selection_msg = self.pip_processor.get_medication_selection_message(result)
-                            await self._send_text_message(phone_number, selection_msg)
-                            
-                            await self._send_medication_list(phone_number, medications, session_id)
-                            
-                            session_context["pending_medications"] = medications
-                            session_context["selected_undelivered"] = []
-                            self._update_session_context(phone_number, session_context)
-                        else:
-                            self._update_session_context(phone_number, session_context)
-                            await self._continue_with_missing_fields(phone_number, result, session_context)
+                        return False
 
                 else:
                     await self._send_text_message(phone_number, "No pude leer tu fórmula. Envía la foto de nuevo, por favor.")
+                    return False
 
             finally:
                 # Limpiar archivo temporal
@@ -805,9 +981,9 @@ class WhatsAppMessageHandler:
                     temp_image_path.unlink()
 
         except Exception as e:
-            self.logger.error(f"Error procesando imagen WhatsApp: {e}", exc_info=True)
-            await self._send_text_message(phone_number, "Hubo un problema con la imagen. Envíala de nuevo, por favor.")
-
+            self.logger.error(f"Error procesando imagen individual: {e}", exc_info=True)
+            return False
+    
 
     # Métodos auxiliares privados
     async def _check_and_mark_processed(self, unique_id: str, ttl_minutes: int = 5) -> bool:
@@ -1345,9 +1521,7 @@ class WhatsAppMessageHandler:
             await self._log_user_message(session_id, log_message, "consent_response")
 
             if granted:
-                response_text = ("👩‍⚕️ Por favor, envíame una foto clara y legible de tu *fórmula médica* 📝\n\n"
-                               "Es muy importante que la foto se vea bien para poder procesarla correctamente "
-                               "y ayudarte con tu reclamación.\n\n⚠️ No podremos continuar si no recibimos una fórmula médica válida.")
+                response_text = ("👩‍⚕️ ¡Gracias! Por favor, envíame una foto de tu fórmula médica. Debe verse clara y completa.")
             else:
                 response_text = ("Entiendo tu decisión. Sin tu autorización no podemos continuar con el proceso. "
                                "Si cambias de opinión, solo escríbeme.")
@@ -1580,15 +1754,9 @@ class WhatsAppMessageHandler:
                 self.logger.info(f"Medicamentos: {undelivered_med_names}")
                 
                 # ✅ ACTUALIZAR BIGQUERY UNA SOLA VEZ
-                success = self.claim_manager.update_undelivered_medicines(
-                    patient_key, 
-                    session_id,  # ✅ SESSION_ID PRINCIPAL
-                    undelivered_med_names
-                )
+                success = self.claim_manager.update_undelivered_medicines(patient_key, session_id, undelivered_med_names)
                 
-                if success:
-                    prescriptions_count = session_context.get(PrescriptionConstants.TOTAL_PRESCRIPTIONS, 0)
-                    
+                if success:                    
                     await self._log_user_message(
                         session_id, 
                         f"NINGÚN medicamento entregado: {', '.join(undelivered_med_names)}", 
@@ -1596,12 +1764,9 @@ class WhatsAppMessageHandler:
                     )
                     
                     await self._send_text_message(
-                        phone_number, 
-                        f"✅ **Registrado correctamente**\n\n"
-                        f"📋 **NINGÚN medicamento fue entregado**\n"
-                        f"Total: {len(undelivered_med_names)} medicamentos de {prescriptions_count} fórmulas\n\n"
-                        f"Continuemos con tu información personal..."
-                    )
+                        phone_number,
+                        "✅ Continuemos con tus datos personales."
+                     )
                     
                     # Continuar con el siguiente paso del flujo
                     await self._continue_after_medication_selection(phone_number, session_context)
@@ -1907,10 +2072,9 @@ class WhatsAppMessageHandler:
             # Si respondió "No" (no se lo entregaron), agregarlo a la lista
             if response == "no":
                 selected_undelivered.append(med_index)
-                await self._send_text_message(phone_number, f"✅ Registrado: {med_name} - NO entregado")
+                
             else:
-                await self._send_text_message(phone_number, f"✅ Registrado: {med_name} - Entregado")
-            
+                pass
             # Actualizar contexto
             session_context["selected_undelivered"] = selected_undelivered
             session_context["current_medication_index"] = med_index + 1
@@ -1960,17 +2124,13 @@ class WhatsAppMessageHandler:
             
             if success:
                 if undelivered_med_names:
-                    prescriptions_count = session_context.get(PrescriptionConstants.TOTAL_PRESCRIPTIONS, 0)
                     await self._send_text_message(
-                        phone_number, 
-                        f"✅ **Proceso completado**\n\n"
-                        f"📋 **Medicamentos no entregados registrados:**\n"
-                        f"{', '.join(undelivered_med_names[:5])}"  # Mostrar máximo 5
-                        f"{'...' if len(undelivered_med_names) > 5 else ''}\n\n"
-                        f"**Total:** {len(undelivered_med_names)} medicamentos de tus {prescriptions_count} fórmulas"
+                        phone_number,
+                        f"✅ Continuemos con tus datos personales."  # ✅ MÁS SIMPLE
                     )
+                    
                 else:
-                    await self._send_text_message(phone_number, "✅ Proceso completado. Todos los medicamentos fueron entregados.")
+                    await self._send_text_message(phone_number, "✅ Continuemos con tus datos personales.")  # ✅ MÁS SIMPLE
                 
                 await self._log_user_message(
                     main_session_id, 
